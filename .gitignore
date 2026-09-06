@@ -1,0 +1,24 @@
+# secrets & 本地配置（绝不提交）
+.env
+config/settings.yaml
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+build/
+dist/
+
+# 运行时数据（SQLite/日志/下载）
+data/
+
+# 大体积演示视频（>10MB 不进 git，README 放链接）
+assets/demo/*.mp4
+
+# os
+.DS_Store
+Thumbs.db

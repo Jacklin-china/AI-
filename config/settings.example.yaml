@@ -1,0 +1,29 @@
+# kantoku-agent 配置模板 —— 复制为 settings.yaml 后使用（settings.yaml 已被 git 忽略）
+# 真实密钥只放 .env，绝不写进本文件；本文件是配置结构的唯一事实来源。
+# 规则：换模型/调参数只改这里，禁止改代码。
+
+app:
+  name: kantoku-agent
+  log_level: INFO              # DEBUG / INFO / WARNING
+
+llm:
+  # OpenAI 兼容协议；主力智谱，换 DeepSeek/Qwen 只改 base_url 与模型名
+  base_url: https://open.bigmodel.cn/api/paas/v4
+  model_chat: glm-4.7          # 对话模型（以控制台实际可用型号为准）
+  model_vision: glm-4v-plus    # 视觉质检模型（M3 用）
+  api_key_env: BIGMODEL_API_KEY  # 密钥的环境变量名（值在 .env）
+  temperature: 0.7             # 自由对话
+  structured_temperature: 0.2  # 分镜 JSON 等结构化输出
+  max_tokens: 2048
+  timeout_s: 30
+  retry: 2
+
+budget:                        # 成本红线：任何付费调用前必须检查（docs/01 §5）
+  image_daily_cny: 5.0         # 生图单日上限（元）；接单期可上调，须记台账
+  token_daily_limit: 200000    # token 单日上限，防跑飞
+
+storage:
+  sqlite_path: data/kantoku.db # 项目库/台账/素材索引同一个库
+
+vtuber:
+  base_url: ws://localhost:12393  # Open-LLM-VTuber 后端地址，以底座实际为准
