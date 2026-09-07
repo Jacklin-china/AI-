@@ -22,3 +22,6 @@ assets/demo/*.mp4
 # os
 .DS_Store
 Thumbs.db
+
+# IDE（PyCharm 本地配置，不进 git）
+.idea/
