@@ -1,78 +1,198 @@
+"""读取并校验 YAML 配置，在调用时从环境或 .env 获取密钥。"""
+
 from __future__ import annotations
 
 import os
+from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
+from typing import Any
 
 import yaml
-from pydantic import BaseModel
+from dotenv import dotenv_values
+from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from kantoku.config.errors import ConfigError
+from .errors import ConfigError
 
 ROOT = Path(__file__).resolve().parents[3]
 CONFIG_PATH = ROOT / "config" / "settings.yaml"
 EXAMPLE_PATH = ROOT / "config" / "settings.example.yaml"
+ENV_PATH = ROOT / ".env"
 
 
 class AppSettings(BaseModel):
-    name: str = "kantoku-agent"
-    log_level: str = "INFO"
+    """应用自身的基础配置。"""
+
+    name: str
+    log_level: str
 
 
 class LlmSettings(BaseModel):
-    """LLM 相关配置。字段名必须与 config/settings.yaml 的 llm 段一一对应。"""
+    """LLM 配置；字段名与 YAML 中的 ``llm`` 段保持一致。"""
 
-    # 主力（文本 / 工具调用）
-    base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
-    model_chat: str = "doubao-seed-2-1-turbo-260628"
-    api_key_env: str = "ARK_API_KEY"
+    base_url: str
+    model_chat: str
+    api_key_env: str
+    chat_extra_body: dict[str, Any]
 
-    # 视觉位
-    vision_base_url: str = "https://ark.cn-beijing.volces.com/api/v3"
-    model_vision: str = "doubao-seed-2-1-turbo-260628"
-    vision_api_key_env: str = "ARK_API_KEY"
+    vision_base_url: str
+    model_vision: str
+    vision_api_key_env: str
+    vision_extra_body: dict[str, Any]
+    vision_max_tokens: int = Field(gt=0, strict=True)
+    vision_max_image_bytes: int = Field(gt=0, strict=True)
 
-    # 降级位
-    fallback_base_url: str = "https://open.bigmodel.cn/api/paas/v4"
-    fallback_model_chat: str = "glm-4.6"
-    fallback_api_key_env: str = "BIGMODEL_API_KEY"
+    fallback_base_url: str
+    fallback_model_chat: str
+    fallback_api_key_env: str
+    fallback_extra_body: dict[str, Any]
 
-    # 调用参数
-    temperature: float = 0.7
-    structured_temperature: float = 0.2
-    max_tokens: int = 2048
-    timeout_s: int = 60
-    retry: int = 2
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    temperature: float = Field(ge=0, le=2)
+    structured_temperature: float = Field(ge=0, le=2)
+    max_tokens: int = Field(gt=0, strict=True)
+    timeout_s: float = Field(gt=0)
+    retry: int = Field(ge=0, strict=True)
 
     def chat_api_key(self) -> str:
+        """读取主聊天模型的密钥。"""
         return _require_env(self.api_key_env)
+
+    def vision_api_key(self) -> str:
+        """读取视觉模型的密钥。"""
+        return _require_env(self.vision_api_key_env)
+
+    def fallback_api_key(self) -> str:
+        """读取备用聊天模型的密钥。"""
+        return _require_env(self.fallback_api_key_env)
+
+
+class BudgetSettings(BaseModel):
+    """付费调用的预算和并发上限。"""
+
+    accounting_utc_offset_hours: int = Field(ge=-12, le=14, strict=True)
+    image_credit_cny: Decimal = Field(gt=0, allow_inf_nan=False)
+    image_estimated_credits_per_call: int = Field(gt=0, strict=True)
+    image_daily_cny: Decimal = Field(ge=0, allow_inf_nan=False)
+    image_project_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
+    image_episode_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
+    image_shot_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
+    image_max_concurrency: int = Field(gt=0, strict=True)
+    token_daily_limit: int = Field(gt=0, strict=True)
+
+
+class ImageSettings(BaseModel):
+    """官方生图供应商参数；提交动作与查询动作分开配置。"""
+
+    provider: str
+    base_url: str
+    model: str
+    region: str
+    service: str
+    api_version: str
+    submit_action: str
+    query_action: str
+    access_key_env: str
+    secret_key_env: str
+    width: int = Field(gt=0, strict=True)
+    height: int = Field(gt=0, strict=True)
+    force_single: bool = Field(strict=True)
+    prompt_max_chars: int = Field(gt=0, strict=True)
+    timeout_s: float = Field(gt=0, allow_inf_nan=False)
+    query_retry: int = Field(ge=0, strict=True)
+    query_backoff_s: float = Field(gt=0, allow_inf_nan=False)
+    output_dir: Path
+
+    def access_key(self) -> str:
+        """仅在真实生图时读取 Access Key。"""
+        return _require_compact_credential(self.access_key_env, "Access Key ID")
+
+    def secret_key(self) -> str:
+        """仅在真实生图时读取 Secret Key。"""
+        return _require_compact_credential(self.secret_key_env, "Secret Access Key")
+
+
+class StorageSettings(BaseModel):
+    """项目数据的存储位置。"""
+
+    sqlite_path: Path
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_prefix="KANTOKU_",extra="ignore")
-    app: AppSettings = AppSettings()
-    llm: LlmSettings = LlmSettings()
-def _require_env(name: str):
+    """项目配置总入口；业务代码只通过 ``get_settings`` 获取配置。"""
+
+    model_config = SettingsConfigDict(env_prefix="KANTOKU_", extra="ignore")
+
+    app: AppSettings
+    llm: LlmSettings
+    image: ImageSettings
+    budget: BudgetSettings
+    storage: StorageSettings
+
+
+def _require_env(name: str) -> str:
+    """读取必需的环境变量；缺失时转换为项目配置异常。"""
     value = os.environ.get(name)
-    if not value:
+    if value is None:
+        try:
+            value = dotenv_values(ENV_PATH, encoding="utf-8", interpolate=False).get(name)
+        except (OSError, UnicodeError):
+            raise ConfigError("无法读取 .env 文件") from None
+    if not value or not value.strip():
         raise ConfigError(
             f"环境变量 {name} 未设置",
-            detail="请在项目根目录的 .env 里配置，或先执行："
-                   f'$env:{name}="你的密钥"（PowerShell）',
+            detail=(
+                f'请在项目根目录的 .env 里配置，或先执行：$env:{name}="你的密钥"（PowerShell）'
+            ),
         )
-        return value
-def _read_yaml():
-    path=CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
+    return value
+
+
+def _require_compact_credential(name: str, label: str) -> str:
+    """读取签名凭据并拒绝复制时混入的空格或换行。"""
+    value = _require_env(name)
+    if any(character.isspace() for character in value):
+        raise ConfigError(
+            f"{label} 格式不合法",
+            detail=f"{name} 含有空白字符；请只复制密钥值，不要复制字段名称",
+        )
+    return value
+
+
+def _read_yaml() -> dict[str, Any]:
+    """优先读取本地配置，不存在时回退到可提交的示例配置。"""
+    path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
     if not path.exists():
-        raise ConfigError("找不到配置文件", detail=f"期望路径：{CONFIG_PATH}")
-    with path.open(encoding="utf-8") as f:
-        return yaml.safe_load(f) or {}
+        raise ConfigError(
+            "找不到配置文件",
+            detail=f"期望路径：{CONFIG_PATH}；回退路径：{EXAMPLE_PATH}",
+        )
+
+    try:
+        with path.open(encoding="utf-8") as file:
+            raw = yaml.safe_load(file)
+    except (OSError, UnicodeError, yaml.YAMLError) as exc:
+        raise ConfigError(
+            "读取配置文件失败", detail=f"文件：{path}；类型：{type(exc).__name__}"
+        ) from None
+
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError("配置文件格式错误", detail=f"{path} 的顶层必须是键值映射")
+    return raw
+
 
 @lru_cache(maxsize=1)
-def get_Settings():
-    raw = _read_yaml()
-    return Settings(
-        app=AppSettings(**raw.get("app",{})),
-        lmm=LlmSettings(**raw.get("lmm",{}))
-    )
+def get_settings() -> Settings:
+    """读取、校验并缓存整份项目配置。"""
+    try:
+        return Settings.model_validate(_read_yaml())
+    except ValidationError as exc:
+        locations = "; ".join(
+            f"{'.'.join(map(str, item['loc']))}: {item['type']}"
+            for item in exc.errors(include_input=False, include_context=False, include_url=False)
+        )
+        raise ConfigError("配置内容不合法", detail=locations) from None

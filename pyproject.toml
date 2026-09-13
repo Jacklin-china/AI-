@@ -11,6 +11,8 @@ dependencies = [
     "pydantic-settings>=2.3",
     "loguru>=0.7",
     "PyYAML>=6.0",
+    "python-dotenv>=1.0",
+    "volcengine>=1.0.222,<2",
 ]
 
 [dependency-groups]

@@ -14,6 +14,7 @@ llm:
   base_url: https://ark.cn-beijing.volces.com/api/v3
   model_chat: doubao-seed-2-1-turbo-260628
   api_key_env: ARK_API_KEY
+  chat_extra_body: {}          # 供应商专用请求体；真实值只在本地 settings.yaml 配置
 
   # ── 视觉位：豆包 turbo 支持多模态理解，同一模型即可看图 ──────────────
   # W5 的 VLM 质检（看图判定崩手 / 水印 / 构图）依赖它
@@ -21,13 +22,22 @@ llm:
   vision_base_url: https://ark.cn-beijing.volces.com/api/v3
   model_vision: doubao-seed-2-1-turbo-260628
   vision_api_key_env: ARK_API_KEY
+  vision_extra_body: {}
+  vision_max_tokens: 512       # 质检只返回短 JSON，限制输出成本
+  vision_max_image_bytes: 10485760
 
   # ── 降级位：跨供应商才是真降级（08 风险登记册 R4）──────────────────
   fallback_base_url: https://open.bigmodel.cn/api/paas/v4
   fallback_model_chat: glm-4.6
   fallback_api_key_env: BIGMODEL_API_KEY
+  fallback_extra_body: {}
 
   # 备选速查（改上面几行即可切换，代码一行不动）：
+  #   DeepSeek → base_url: https://api.deepseek.com
+  #               model_chat: deepseek-flash
+  #               api_key_env: DEEPSEEK_API_KEY
+  #               chat_extra_body: {thinking: {type: disabled}}
+  #               小额验收前先核对官方型号/价格，限制输出；不要覆盖原配置。
   #   混元 Hy4  → base_url: https://api.hunyuan.tencent.com/v1
   #               model_chat: hunyuan-hy4-preview（1M 上下文 / 慢思考，无视觉）
   #   OpenRouter→ base_url: https://openrouter.ai/api/v1
@@ -48,8 +58,35 @@ llm:
   timeout_s: 60                # Hy4 默认慢思考（reasoning high），超时给足
   retry: 2
 
+image:                         # W4 官方火山引擎即梦 API；凭据仍只放根目录 .env
+  provider: volcengine-jimeng
+  base_url: https://visual.volcengineapi.com
+  model: t2i_v40_jimeng
+  region: cn-north-1
+  service: cv
+  api_version: "2022-08-31"
+  submit_action: CVSync2AsyncSubmitTask
+  query_action: CVSync2AsyncGetResult
+  access_key_env: VOLC_ACCESSKEY
+  secret_key_env: VOLC_SECRETKEY
+  width: 2560                   # 官方推荐的 2K 16:9 尺寸
+  height: 1440
+  force_single: true            # 防止一次返回多张而扩大账单
+  prompt_max_chars: 800         # 即梦 4.0 官方当前建议上限
+  timeout_s: 60
+  query_retry: 2                # 只重试查询；付费提交永不自动重提
+  query_backoff_s: 2
+  output_dir: data/images
+
 budget:                        # 成本红线：任何付费调用前必须检查（docs/01 §5）
-  image_daily_cny: 5.0         # 生图单日上限（元）；接单期可上调，须记台账
+  accounting_utc_offset_hours: 8  # 单日预算按北京时间自然日计算
+  image_credit_cny: 0.10       # 即梦估算口径；价格变动时只改配置并以实际扣分结算
+  image_estimated_credits_per_call: 3  # 普通图按截图区间上限预占；高质量模式须传真实估算
+  image_daily_cny: 20.0        # 当前单条视频硬上限；同日只跑一条时等于视频上限
+  image_project_cny: 20.0      # 单视频项目上限
+  image_episode_cny: 20.0      # 当前一条视频按一集核算
+  image_shot_cny: 1.0          # 普通图约可尝试 3 次；付费重做仍需人工确认
+  image_max_concurrency: 1     # W4 先串行；确认限流与整批预占正确后才调高
   token_daily_limit: 200000    # token 单日上限，防跑飞
 
 storage:

@@ -13,10 +13,10 @@ from .errors import (
     KantokuError,
     LLMError,
     SchemaError,
+    ToolError,
+    TracingError,
 )
-
-# TODO(settings.py 写完 get_settings 后取消下面两处注释)：
-# from .settings import get_settings
+from .settings import get_settings
 
 __all__ = [
     "KantokuError",
@@ -24,5 +24,7 @@ __all__ = [
     "LLMError",
     "SchemaError",
     "BudgetError",
-    # "get_settings",
+    "TracingError",
+    "ToolError",
+    "get_settings",
 ]
