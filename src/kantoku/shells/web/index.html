@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="studio-token" content="__TOKEN__"><title>监督酱 / 创作中枢</title><link rel="stylesheet" href="/style.css"><script src="/app.js" defer></script></head>
+<body>
+<aside class="rail"><a class="brand" href="/" aria-label="监督酱首页">K<span>+</span></a><div class="rail-label">KANTOKU<br>INDUSTRIES</div><button class="nav active" data-view="create">◈<span>创作</span></button><button class="nav" data-view="archive">▤<span>档案</span></button><button class="nav" id="settings">⚙<span>配置</span></button><div class="rail-bottom">LOCAL<br><i></i> ONLINE</div></aside>
+<div class="shell"><header><div class="wordmark">监督酱<span> / 视觉创作中枢</span></div><div class="header-meta"><span class="signal">● 本机运行</span><span>CREATIVE OPERATIONS / 01</span></div></header>
+<main><section class="page-heading"><div><div class="eyebrow">KANTOKU / CREATIVE TERMINAL</div><h1>让想法，成为画面<span>。</span></h1><p>设计意图 · 画面生成 · 人工审片</p></div><div class="budget-tile"><span>单作品生图上限</span><strong id="limit">—</strong><small>文本与视觉费用另计</small></div></section>
+<div class="steps"><span class="current">01 <b>创作设定</b></span><span>02 <b>画面生成</b></span><span>03 <b>审片与交付</b></span><i>每次一张 / 每次由你确认</i></div>
+<section id="create-view" class="workspace"><section class="brief panel"><div class="section-title"><h2>创作设定</h2><span>INPUT / 01</span></div>
+<div class="field-row"><label>作品名称<input id="project" value="我的第一份作品" maxlength="160"></label><label class="shot-field">画面编号<input id="shot" type="number" value="1" min="1" step="1"></label></div>
+<label>作品用途<select id="purpose"><option>叙事静帧</option><option>宣传海报底图</option><option>产品图片</option><option>动漫分镜</option><option>宣传片关键帧</option></select></label>
+<label>你想拍到怎样的画面？<textarea id="subject" rows="4" placeholder="主体在做什么？发生在哪里？让观众感受到什么？"></textarea></label>
+<div class="section-title mini"><span>画面方向</span><span>ART DIRECTION</span></div><div class="presets"><button data-style="纪实摄影，现场抓拍，人物注意力在行动上，自然曝光，细节服从真实物理关系" class="selected">纪实自然</button><button data-style="电影叙事，光源有动机，情绪通过视线和身体动作表达，克制的色彩">电影叙事</button><button data-style="二维插画，明确轮廓，统一造型语言，适度简化材质和光影">插画风格</button></div>
+<label>美术 / 摄影要求<input id="style" value="纪实摄影，现场抓拍，自然曝光，避免摆拍和过度美化"></label><label>目标受众<input id="audience" value="喜欢有生活气息、情绪真实画面的观众"></label>
+<div class="button-row"><button id="compose" class="secondary">整理提示词 <small>免费</small></button><button id="refine" class="dark">AI 设计优化 ↗</button></div>
+<details open><summary>最终提示词 <span>可编辑</span></summary><textarea id="prompt" rows="6" placeholder="在这里检查和修改最终送入生图模型的提示词。"></textarea></details>
+<div class="generation-control"><label>核实的 API 单次费用上界 / 元<input id="price" type="number" min="0.01" step="0.01" placeholder="例如 0.30，请按实际 API 核价"></label><button id="generate" class="primary">生成一张画面 <span>↗</span></button><small>同一画面返工请沿用作品名与编号，预算会累计。</small></div>
+</section>
+<section class="visual-column"><div class="canvas-panel panel"><div class="section-title"><h2>画面监看</h2><span id="image-size">OUTPUT / 02</span></div><div class="canvas" id="canvas"><div class="empty" id="empty"><div class="crosshair">+</div><strong>等待你的第一帧</strong><p>从左侧描述画面开始<br>或在下方选取已有作品</p><span>VISUAL OUTPUT / STANDBY</span></div><img id="artwork" alt="当前任务生成的图片" hidden></div><div class="canvas-footer"><span id="task-caption">尚未选择任务</span><span id="task-status">待机</span></div></div>
+<div class="output-toolbar"><button id="download">↓ 下载原图</button><button id="recover">↻ 查询进度</button><button id="resume">继续原任务</button><button id="bill">账单 / 预算</button></div>
+<section class="review panel"><div class="section-title"><h2>审片意见</h2><button id="qc" class="text-button">视觉预筛 ↗</button></div><div class="review-tags"><span>动作与表情</span><span>环境与材质</span><span>叙事与氛围</span></div><p id="review-text">先问自己：人物真的在做这件事，还是在为镜头摆姿势？模型意见仅作预筛，你的判断决定是否交付。</p><div class="review-note">生成成功 ≠ 作品通过 · 返工由你确认</div></section>
+<section class="history-panel"><div class="section-title"><h2>最近画面</h2><span id="count">0 RECORDS</span></div><div id="history" class="history"></div></section>
+</section></section>
+<section id="archive-view" hidden><div class="section-title"><h2>作品档案</h2><span>LOCAL ARCHIVE</span></div><p>选取任务返回创作区。所有历史任务继续使用原来的预算与生成记录。</p><div id="archive" class="archive"></div></section>
+<div id="notice" role="status" aria-live="polite">工作台已就绪。打开页面不会调用模型。</div>
+</main><footer><span>KANTOKU / PERSONAL CREATIVE SYSTEM</span><span>想法由你定义 · 成本由你掌握</span></footer></div>
+<dialog id="dialog"><form method="dialog"><div class="eyebrow">OPERATION CONFIRMATION</div><h2 id="dialog-title"></h2><p id="dialog-message"></p><label id="dialog-field" hidden>平台确认的最终实扣 / 元<input id="bill-price" type="number" min="0" step="0.01"></label><div class="button-row"><button value="cancel" class="secondary">返回</button><button value="confirm" id="dialog-confirm" class="primary">确认继续</button></div></form></dialog>
+</body></html>
