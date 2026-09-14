@@ -79,6 +79,21 @@ def test_approved_review_does_not_create_rework(database: Path) -> None:
     assert review.list_rework_queue() == []
 
 
+def test_visual_prediction_survives_restart_and_is_immutable(database: Path) -> None:
+    image = database.parent / "prediction.png"
+    image.write_bytes(b"\x89PNG\r\n\x1a\n")
+    _save_success(image)
+    prediction = _label(image, approved=True).result
+
+    review.record_qc_prediction("request-001", prediction)
+    review.record_qc_prediction("request-001", prediction)
+
+    assert review.load_qc_prediction("request-001") == prediction
+    changed = prediction.model_copy(update={"confidence": 0.5})
+    with pytest.raises(ToolError, match="禁止静默覆盖"):
+        review.record_qc_prediction("request-001", changed)
+
+
 def test_rejected_review_creates_idempotent_reasoned_rework(database: Path) -> None:
     image = database.parent / "rejected.png"
     image.write_bytes(b"\x89PNG\r\n\x1a\n")

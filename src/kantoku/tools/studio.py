@@ -87,11 +87,18 @@ def refine_prompt(brief: str, *, confirmed: bool = False) -> str:
     return result
 
 
-def create_task(project: str, prompt: str, shot_no: int, estimate_fen: int) -> StudioTask:
+def create_task(
+    project: str,
+    prompt: str,
+    shot_no: int,
+    estimate_fen: int,
+    *,
+    request_id: str | None = None,
+) -> StudioTask:
     """先落盘再付费；独占创建避免覆盖历史任务。"""
     try:
         task = StudioTask(
-            request_id=f"studio-{uuid4().hex}",
+            request_id=request_id or f"studio-{uuid4().hex}",
             project=project,
             prompt=prompt,
             shot_no=shot_no,

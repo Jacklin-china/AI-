@@ -13,11 +13,25 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote, urlsplit
 
+from pydantic import ValidationError
+
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.settings import ROOT
 from kantoku.core import budget
 from kantoku.perception.qc import qc_image
+from kantoku.perception.report import calculate_qc_economics
+from kantoku.perception.review import (
+    build_rework_plan,
+    decide_rework,
+    get_rework_item,
+    load_human_review,
+    load_qc_prediction,
+    record_human_review,
+    record_qc_prediction,
+)
+from kantoku.schemas.qc import HumanQcLabel, QcResult
 from kantoku.shells.image_cli import _money_fen, _provider
+from kantoku.tools.archive import archive_reviewed_image, search_archived_images
 from kantoku.tools.studio import (
     StudioTask,
     compose_prompt,
@@ -48,9 +62,15 @@ class StudioApplication:
     def state(self) -> dict[str, Any]:
         settings = get_settings()
         tasks = []
+        archived_ids = {
+            item.source_request_id for item in search_archived_images(episode="studio")
+        }
         for task in list_tasks():
             result = budget.load_generation_result(task.request_id)
             record = budget.get_reservation(task.request_id)
+            prediction = load_qc_prediction(task.request_id)
+            review = load_human_review(task.request_id)
+            rework = get_rework_item(task.request_id)
             tasks.append(
                 {
                     **task.model_dump(),
@@ -60,6 +80,10 @@ class StudioApplication:
                     "ledger_status": record.status if record else "not_submitted",
                     "error": result.error if result else None,
                     "created_at": record.created_at if record else "",
+                    "qc": prediction.model_dump() if prediction else None,
+                    "review": review.model_dump(mode="json") if review else None,
+                    "rework": rework.model_dump(mode="json") if rework else None,
+                    "archived": task.request_id in archived_ids,
                 }
             )
         tasks.sort(key=lambda item: item["created_at"], reverse=True)
@@ -89,6 +113,13 @@ class StudioApplication:
             }
         if action == "budget":
             return budget.summarize_budget(data["project"]).model_dump()
+        if action == "report":
+            report = calculate_qc_economics(
+                data["project"],
+                "studio",
+                expected_shots=data.get("expected_shots", 10),
+            )
+            return {"report": report.model_dump(mode="json")}
         if data.get("confirmed") is not True:
             raise ToolError("此操作需要在页面中明确确认")
         if action == "refine":
@@ -128,7 +159,110 @@ class StudioApplication:
                 key_message=task.prompt,
                 confirm_paid=True,
             )
+            record_qc_prediction(task.request_id, report)
             return {"request_id": task.request_id, "qc": report.model_dump()}
+        if action == "review":
+            generation = budget.load_generation_result(task.request_id)
+            if generation is None or generation.path is None:
+                raise ToolError("任务尚未取得图片")
+            raw_result = data.get("result")
+            prediction = load_qc_prediction(task.request_id)
+            if raw_result is None and prediction is None:
+                raise ToolError("请先完成视觉预筛，或提交人工检查结果")
+            try:
+                review_result = (
+                    QcResult.model_validate(raw_result)
+                    if raw_result is not None
+                    else prediction
+                )
+                if review_result is None:
+                    raise ToolError("人工检查结果不能为空")
+                label = HumanQcLabel.model_validate(
+                    {
+                        "id": f"review-{task.request_id}",
+                        "image_path": generation.path,
+                        "deliverable_type": data.get("deliverable_type", "still_image"),
+                        "target_platform": data["purpose"],
+                        "genre": data.get("genre", data["purpose"]),
+                        "target_audience": data["audience"],
+                        "business_goal": data.get("business_goal"),
+                        "key_message": data.get("key_message", task.prompt),
+                        "first_glance_goal": data.get("first_glance_goal"),
+                        "visual_style": data.get("style"),
+                        "style_reference": data.get("style_reference"),
+                        "persona_reference": data.get("persona_reference"),
+                        "cinematography_requirements": data["cinematography_requirements"],
+                        "cinematography_notes": data["cinematography_notes"],
+                        "review_seconds": data.get("review_seconds"),
+                        "result": review_result,
+                        "approved": data["approved"],
+                        "failure_reasons": data.get("failure_reasons", []),
+                    }
+                )
+            except (KeyError, ValidationError) as error:
+                raise ToolError("人工终审信息不完整或互相矛盾") from error
+            record_human_review(task.request_id, label)
+            return {
+                "request_id": task.request_id,
+                "approved": label.approved,
+                "rework_created": not label.approved,
+            }
+        if action == "archive":
+            archived = archive_reviewed_image(task.request_id)
+            return {
+                "request_id": task.request_id,
+                "approved": archived.approved,
+                "image_path": str(archived.image_path),
+                "metadata_path": str(archived.metadata_path),
+            }
+        if action == "prepare_rework":
+            item = get_rework_item(task.request_id)
+            if item is None:
+                raise ToolError("该任务没有待处理的返工项")
+            if item.status == "approved" and item.target_request_id is not None:
+                target = self.task(item.target_request_id)
+                return {
+                    "source_request_id": task.request_id,
+                    "request_id": target.request_id,
+                    "prompt": target.prompt,
+                    "status": item.status,
+                    "paid": False,
+                }
+            if item.status != "pending":
+                raise ToolError("返工项已经取消，不能再创建任务")
+            plan = build_rework_plan(item)
+            corrected_prompt = "\n".join(
+                [
+                    task.prompt,
+                    "定向返工（只修改已确认的问题）：",
+                    *plan.correction_directives,
+                    "必须保留：",
+                    *plan.preserve_constraints,
+                ]
+            )
+            target_id = f"studio-{secrets.token_hex(16)}"
+            target = create_task(
+                task.project,
+                corrected_prompt,
+                task.shot_no,
+                task.estimate_fen,
+                request_id=target_id,
+            )
+            decided = decide_rework(
+                task.request_id,
+                "approved",
+                target_request_id=target.request_id,
+            )
+            return {
+                "source_request_id": task.request_id,
+                "request_id": target.request_id,
+                "prompt": target.prompt,
+                "status": decided.status,
+                "paid": False,
+            }
+        if action == "cancel_rework":
+            item = decide_rework(task.request_id, "cancelled")
+            return {"request_id": task.request_id, "status": item.status}
         raise ToolError("不支持的操作")
 
     def start(self, action: str, data: dict[str, Any]) -> None:
@@ -141,6 +275,11 @@ class StudioApplication:
             "resume",
             "settle",
             "qc",
+            "review",
+            "archive",
+            "prepare_rework",
+            "cancel_rework",
+            "report",
         }:
             raise ToolError("不支持的操作")
         with self.lock:

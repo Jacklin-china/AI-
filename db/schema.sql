@@ -86,6 +86,13 @@ CREATE TABLE IF NOT EXISTS image_result (
     updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
 );
 
+-- 视觉模型只负责预筛；结果持久化后仍必须由人工作最终决定。
+CREATE TABLE IF NOT EXISTS qc_prediction (
+    source_request_id TEXT PRIMARY KEY CHECK (length(trim(source_request_id)) > 0),
+    result_json TEXT NOT NULL CHECK (length(trim(result_json)) > 0),
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 -- 人工终审不可静默覆盖；被拒绝的画面进入带原因的返工队列。
 CREATE TABLE IF NOT EXISTS qc_review (
     source_request_id TEXT PRIMARY KEY CHECK (length(trim(source_request_id)) > 0),

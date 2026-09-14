@@ -12,7 +12,13 @@ from pydantic import ValidationError
 from kantoku.config import ToolError, get_settings
 from kantoku.config.settings import ROOT
 from kantoku.core.budget import load_generation_result
-from kantoku.schemas.qc import HumanQcLabel, QcFailureReason, ReworkItem, ReworkPlan
+from kantoku.schemas.qc import (
+    HumanQcLabel,
+    QcFailureReason,
+    QcResult,
+    ReworkItem,
+    ReworkPlan,
+)
 
 SCHEMA_PATH = ROOT / "db" / "schema.sql"
 
@@ -117,6 +123,58 @@ def record_human_review(source_request_id: str, label: HumanQcLabel) -> None:
                 )
     except sqlite3.Error as error:
         raise ToolError("人工终审写入失败", detail=type(error).__name__) from error
+    finally:
+        connection.close()
+
+
+def record_qc_prediction(source_request_id: str, result: QcResult) -> None:
+    """保存一次视觉预筛；同一图片禁止被不同结果静默覆盖。"""
+    if not isinstance(source_request_id, str) or not source_request_id.strip():
+        raise ToolError("原生图请求 ID 不能为空")
+    request_id = source_request_id.strip()
+    generation = load_generation_result(request_id)
+    if generation is None or generation.status != "succeeded" or generation.path is None:
+        raise ToolError("只有成功生成的图片才能保存视觉预筛")
+    result_json = result.model_dump_json()
+    connection = _connect()
+    try:
+        with connection:
+            existing = connection.execute(
+                "SELECT result_json FROM qc_prediction WHERE source_request_id = ?",
+                (request_id,),
+            ).fetchone()
+            if existing is not None:
+                if existing["result_json"] != result_json:
+                    raise ToolError("视觉预筛已经记录，禁止静默覆盖")
+                return
+            connection.execute(
+                "INSERT INTO qc_prediction (source_request_id, result_json) VALUES (?, ?)",
+                (request_id, result_json),
+            )
+    except sqlite3.Error as error:
+        raise ToolError("视觉预筛写入失败", detail=type(error).__name__) from error
+    finally:
+        connection.close()
+
+
+def load_qc_prediction(source_request_id: str) -> QcResult | None:
+    """读取视觉预筛，供重启后的人工终审继续使用。"""
+    if not isinstance(source_request_id, str) or not source_request_id.strip():
+        raise ToolError("原生图请求 ID 不能为空")
+    connection = _connect()
+    try:
+        row = connection.execute(
+            "SELECT result_json FROM qc_prediction WHERE source_request_id = ?",
+            (source_request_id.strip(),),
+        ).fetchone()
+        if row is None:
+            return None
+        try:
+            return QcResult.model_validate_json(row["result_json"])
+        except ValidationError as error:
+            raise ToolError("视觉预筛记录无效", detail=type(error).__name__) from error
+    except sqlite3.Error as error:
+        raise ToolError("视觉预筛读取失败", detail=type(error).__name__) from error
     finally:
         connection.close()
 

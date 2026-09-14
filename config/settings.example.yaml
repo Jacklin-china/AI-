@@ -76,7 +76,7 @@ image:
   width: 2560                   # 官方推荐的 2K 16:9 尺寸
   height: 1440
   force_single: true            # 防止一次返回多张而扩大账单
-  prompt_max_chars: 800         # 即梦 4.0 官方当前建议上限
+  prompt_max_chars: 4000        # 长提示词需为定向返工保留上下文，由具体供应商最终校验
   timeout_s: 60
   query_retry: 2                # 只重试查询；付费提交永不自动重提
   query_backoff_s: 2

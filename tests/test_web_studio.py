@@ -13,8 +13,10 @@ from test_image_gen import _settings
 
 from kantoku.config import ToolError
 from kantoku.core import budget
+from kantoku.perception import report, review
+from kantoku.schemas.qc import QcResult
 from kantoku.shells import web_studio
-from kantoku.tools import studio
+from kantoku.tools import archive, studio
 from kantoku.tools.image_gen import LocalFakeImageProvider
 
 
@@ -27,6 +29,9 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
     settings.llm = SimpleNamespace(model_chat="text-test", model_vision="vision-test")
     for module in (web_studio, studio, budget):
         monkeypatch.setattr(module, "get_settings", lambda: settings)
+    for module in (review, report, archive):
+        monkeypatch.setattr(module, "_database_path", lambda: settings.storage.sqlite_path)
+    monkeypatch.setattr(archive, "_archive_root", lambda: tmp_path / "archive")
     provider = LocalFakeImageProvider(tmp_path / "output", model_id="test", actual_fen=30)
     monkeypatch.setattr(web_studio, "_provider", lambda: provider)
     return web_studio.StudioApplication()
@@ -180,3 +185,78 @@ def test_narrative_prompt_does_not_insert_poster_layout() -> None:
     assert "海报要求" not in narrative
     assert "支撑关系" in narrative
     assert "海报要求" in studio.compose_prompt("咖啡", "宣传海报", "客人", "插画")
+
+
+def test_quality_review_rework_archive_and_report_backend(
+    app: web_studio.StudioApplication,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generated = app.perform(
+        "generate",
+        {
+            "project": "p",
+            "prompt": "雨夜便利店中的克制情绪",
+            "shot_no": 1,
+            "price": "0.30",
+            "confirmed": True,
+        },
+    )
+    prediction = QcResult(
+        broken_hands=False,
+        watermark=False,
+        composition_ok=False,
+        persona_consistency=4,
+        confidence=0.9,
+        reason="主体层级不清楚",
+    )
+    monkeypatch.setattr(web_studio, "qc_image", lambda *args, **kwargs: prediction)
+    request_id = generated["request_id"]
+    app.perform(
+        "qc",
+        {
+            "request_id": request_id,
+            "purpose": "宣传图片",
+            "audience": "普通观众",
+            "style": "纪实摄影",
+            "confirmed": True,
+        },
+    )
+    reviewed = app.perform(
+        "review",
+        {
+            "request_id": request_id,
+            "purpose": "宣传图片",
+            "audience": "普通观众",
+            "cinematography_requirements": "主体明确，光源合理",
+            "cinematography_notes": "人物和环境争抢注意力",
+            "review_seconds": 20,
+            "approved": False,
+            "failure_reasons": ["composition"],
+            "confirmed": True,
+        },
+    )
+    assert reviewed["rework_created"] is True
+    archived = app.perform(
+        "archive", {"request_id": request_id, "confirmed": True}
+    )
+    assert archived["approved"] is False
+    prepared = app.perform(
+        "prepare_rework", {"request_id": request_id, "confirmed": True}
+    )
+    assert prepared["paid"] is False
+    assert app.perform(
+        "prepare_rework", {"request_id": request_id, "confirmed": True}
+    )["request_id"] == prepared["request_id"]
+    state = app.state()
+    source = next(item for item in state["tasks"] if item["request_id"] == request_id)
+    target = next(
+        item for item in state["tasks"] if item["request_id"] == prepared["request_id"]
+    )
+    assert source["qc"] == prediction.model_dump()
+    assert source["review"]["approved"] is False
+    assert source["archived"] is True
+    assert source["rework"]["status"] == "approved"
+    assert target["status"] == "draft"
+    assert app.perform("report", {"project": "p", "expected_shots": 1})[
+        "report"
+    ]["rework_count"] == 1
