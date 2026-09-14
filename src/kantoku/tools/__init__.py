@@ -9,6 +9,7 @@ from .image_gen import (
     release_failed_image,
 )
 from .jimeng import VolcengineJimengProvider
+from .openai_image import OpenAIImageProvider
 from .prompt_factory import (
     PROMPT_VERSION,
     PromptRecipe,
@@ -26,6 +27,7 @@ __all__ = [
     "PROMPT_VERSION",
     "ImageProvider",
     "LocalFakeImageProvider",
+    "OpenAIImageProvider",
     "PromptRecipe",
     "VolcengineJimengProvider",
     "build_prompt",

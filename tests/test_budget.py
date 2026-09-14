@@ -62,6 +62,17 @@ def test_estimate_image_cost_uses_conservative_config_rounding() -> None:
         budget.estimate_image_fen(True)
 
 
+def test_direct_provider_estimate_takes_priority_for_default_call(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path / "direct.db")
+    settings.budget.image_estimated_cny_per_call = Decimal("1.234")
+    monkeypatch.setattr(budget, "get_settings", lambda: settings)
+
+    assert budget.estimate_image_fen() == 124
+    assert budget.estimate_image_fen(1) == 10
+
+
 def test_reserve_is_idempotent_and_rejects_request_id_collision() -> None:
     first = _reserve("same")
     second = _reserve("same")

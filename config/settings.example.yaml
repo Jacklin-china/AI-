@@ -7,22 +7,17 @@ app:
   log_level: INFO              # DEBUG / INFO / WARNING
 
 llm:
-  # ── 主力：火山方舟 豆包 Seed 2.1 Turbo（OpenAI 兼容）──────────────
-  # 选它的理由：官方支持 工具调用 + 结构化输出(json_schema) + 多模态理解，
-  # 一家供应商覆盖 文本/视觉质检/生图，成本台账只需对一个平台；Turbo 低时延。
-  # ⚠️ W1 步骤 6 必做：去控制台开通模型并核对 Model ID（预览/版本号会变）
-  base_url: https://ark.cn-beijing.volces.com/api/v3
-  model_chat: doubao-seed-2-1-turbo-260628
-  api_key_env: ARK_API_KEY
-  chat_extra_body: {}          # 供应商专用请求体；真实值只在本地 settings.yaml 配置
+  base_url: https://api.openai.com/v1
+  model_chat: gpt-5.6-sol
+  api_key_env: OPENAI_API_KEY
+  chat_extra_body:
+    reasoning_effort: low
 
-  # ── 视觉位：豆包 turbo 支持多模态理解，同一模型即可看图 ──────────────
-  # W5 的 VLM 质检（看图判定崩手 / 水印 / 构图）依赖它
-  # 若控制台视觉能力需单独型号，只改这一行即可
-  vision_base_url: https://ark.cn-beijing.volces.com/api/v3
-  model_vision: doubao-seed-2-1-turbo-260628
-  vision_api_key_env: ARK_API_KEY
-  vision_extra_body: {}
+  vision_base_url: https://api.openai.com/v1
+  model_vision: gpt-5.6-sol
+  vision_api_key_env: OPENAI_API_KEY
+  vision_extra_body:
+    reasoning_effort: low
   vision_max_tokens: 512       # 质检只返回短 JSON，限制输出成本
   vision_max_image_bytes: 10485760
 
@@ -52,16 +47,22 @@ llm:
   #   智谱       → base_url: https://open.bigmodel.cn/api/paas/v4
   #                model_chat: glm-4.6
 
-  temperature: 0.7             # 自由对话
-  structured_temperature: 0.2  # 分镜 JSON 等结构化输出
-  max_tokens: 2048
-  timeout_s: 60                # Hy4 默认慢思考（reasoning high），超时给足
-  retry: 2
+  temperature: 1.0
+  structured_temperature: 1.0
+  max_tokens: 4096
+  timeout_s: 60
+  retry: 1
+  chat_use_temperature: false
+  chat_max_tokens_parameter: max_completion_tokens
+  vision_use_temperature: false
+  vision_max_tokens_parameter: max_completion_tokens
+  fallback_use_temperature: true
+  fallback_max_tokens_parameter: max_tokens
 
-image:                         # W4 官方火山引擎即梦 API；凭据仍只放根目录 .env
-  provider: volcengine-jimeng
-  base_url: https://visual.volcengineapi.com
-  model: t2i_v40_jimeng
+image:
+  provider: openai-gpt-image
+  base_url: https://api.openai.com/v1
+  model: gpt-image-2.5-flare
   region: cn-north-1
   service: cv
   api_version: "2022-08-31"
@@ -69,6 +70,9 @@ image:                         # W4 官方火山引擎即梦 API；凭据仍只�
   query_action: CVSync2AsyncGetResult
   access_key_env: VOLC_ACCESSKEY
   secret_key_env: VOLC_SECRETKEY
+  api_key_env: OPENAI_API_KEY
+  quality: medium
+  output_format: png
   width: 2560                   # 官方推荐的 2K 16:9 尺寸
   height: 1440
   force_single: true            # 防止一次返回多张而扩大账单
@@ -82,10 +86,11 @@ budget:                        # 成本红线：任何付费调用前必须检�
   accounting_utc_offset_hours: 8  # 单日预算按北京时间自然日计算
   image_credit_cny: 0.10       # 即梦估算口径；价格变动时只改配置并以实际扣分结算
   image_estimated_credits_per_call: 3  # 普通图按截图区间上限预占；高质量模式须传真实估算
+  image_estimated_cny_per_call: 3.00  # 上线前按控制台实价调整；真实调用仍要求人工确认上界
   image_daily_cny: 20.0        # 当前单条视频硬上限；同日只跑一条时等于视频上限
   image_project_cny: 20.0      # 单视频项目上限
   image_episode_cny: 20.0      # 当前一条视频按一集核算
-  image_shot_cny: 1.0          # 普通图约可尝试 3 次；付费重做仍需人工确认
+  image_shot_cny: 3.0          # 单次保守上界；项目总预算仍限制为 20 元
   image_max_concurrency: 1     # W4 先串行；确认限流与整批预占正确后才调高
   token_daily_limit: 200000    # token 单日上限，防跑飞
 

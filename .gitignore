@@ -13,6 +13,9 @@ __pycache__/
 build/
 dist/
 
+# frontend
+node_modules/
+
 # 运行时数据（SQLite/日志/下载）
 data/
 

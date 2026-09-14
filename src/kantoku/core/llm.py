@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from datetime import UTC, datetime
 from time import perf_counter, sleep
-from typing import Any
+from typing import Any, Literal
 
 from loguru import logger
 from openai import APIConnectionError, APIStatusError, OpenAI
@@ -39,8 +39,9 @@ def _request_once(
     *,
     messages: Sequence[ChatCompletionMessageParam],
     model: str,
-    temperature: float,
+    temperature: float | None,
     max_tokens: int,
+    max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"],
     response_format: ResponseFormat | None,
     tools: Sequence[ChatCompletionToolUnionParam] | None,
     extra_body: Mapping[str, Any] | None,
@@ -49,9 +50,13 @@ def _request_once(
     request: CompletionCreateParamsNonStreaming = {
         "messages": messages,
         "model": model,
-        "temperature": temperature,
-        "max_tokens": max_tokens,
     }
+    if temperature is not None:
+        request["temperature"] = temperature
+    if max_tokens_parameter == "max_completion_tokens":
+        request["max_completion_tokens"] = max_tokens
+    else:
+        request["max_tokens"] = max_tokens
     if response_format is not None:
         request["response_format"] = response_format
     if tools is not None:
@@ -140,8 +145,9 @@ def _request_with_retry(
     retry: int,
     messages: Sequence[ChatCompletionMessageParam],
     model: str,
-    temperature: float,
+    temperature: float | None,
     max_tokens: int,
+    max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"],
     response_format: ResponseFormat | None,
     tools: Sequence[ChatCompletionToolUnionParam] | None,
     extra_body: Mapping[str, Any] | None,
@@ -155,6 +161,7 @@ def _request_with_retry(
                 model=model,
                 temperature=temperature,
                 max_tokens=max_tokens,
+                max_tokens_parameter=max_tokens_parameter,
                 response_format=response_format,
                 tools=tools,
                 extra_body=extra_body,
@@ -218,8 +225,9 @@ def _call_provider(
     retry: int,
     messages: Sequence[ChatCompletionMessageParam],
     model: str,
-    temperature: float,
+    temperature: float | None,
     max_tokens: int,
+    max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"],
     response_format: ResponseFormat | None,
     tools: Sequence[ChatCompletionToolUnionParam] | None,
     extra_body: Mapping[str, Any] | None,
@@ -236,6 +244,7 @@ def _call_provider(
             model=model,
             temperature=temperature,
             max_tokens=max_tokens,
+            max_tokens_parameter=max_tokens_parameter,
             response_format=response_format,
             tools=tools,
             extra_body=extra_body,
@@ -274,8 +283,9 @@ def chat(
             retry=settings.llm.retry,
             messages=messages,
             model=selected_model,
-            temperature=selected_temperature,
+            temperature=(selected_temperature if settings.llm.chat_use_temperature else None),
             max_tokens=settings.llm.max_tokens,
+            max_tokens_parameter=settings.llm.chat_max_tokens_parameter,
             response_format=response_format,
             tools=tools,
             extra_body=settings.llm.chat_extra_body,
@@ -303,8 +313,11 @@ def chat(
                 retry=settings.llm.retry,
                 messages=messages,
                 model=settings.llm.fallback_model_chat,
-                temperature=selected_temperature,
+                temperature=(
+                    selected_temperature if settings.llm.fallback_use_temperature else None
+                ),
                 max_tokens=settings.llm.max_tokens,
+                max_tokens_parameter=settings.llm.fallback_max_tokens_parameter,
                 response_format=response_format,
                 tools=tools,
                 extra_body=settings.llm.fallback_extra_body,
@@ -343,8 +356,9 @@ def vision_chat(
             retry=settings.llm.retry,
             messages=messages,
             model=settings.llm.model_vision,
-            temperature=selected_temperature,
+            temperature=(selected_temperature if settings.llm.vision_use_temperature else None),
             max_tokens=settings.llm.vision_max_tokens,
+            max_tokens_parameter=settings.llm.vision_max_tokens_parameter,
             response_format=response_format,
             tools=None,
             extra_body=settings.llm.vision_extra_body,

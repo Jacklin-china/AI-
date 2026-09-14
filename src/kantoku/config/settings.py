@@ -6,7 +6,7 @@ import os
 from decimal import Decimal
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 import yaml
 from dotenv import dotenv_values
@@ -55,6 +55,12 @@ class LlmSettings(BaseModel):
     max_tokens: int = Field(gt=0, strict=True)
     timeout_s: float = Field(gt=0)
     retry: int = Field(ge=0, strict=True)
+    chat_use_temperature: bool = True
+    chat_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    vision_use_temperature: bool = True
+    vision_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    fallback_use_temperature: bool = True
+    fallback_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
 
     def chat_api_key(self) -> str:
         """读取主聊天模型的密钥。"""
@@ -75,6 +81,9 @@ class BudgetSettings(BaseModel):
     accounting_utc_offset_hours: int = Field(ge=-12, le=14, strict=True)
     image_credit_cny: Decimal = Field(gt=0, allow_inf_nan=False)
     image_estimated_credits_per_call: int = Field(gt=0, strict=True)
+    image_estimated_cny_per_call: Decimal | None = Field(
+        default=None, gt=0, allow_inf_nan=False
+    )
     image_daily_cny: Decimal = Field(ge=0, allow_inf_nan=False)
     image_project_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
     image_episode_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
@@ -96,6 +105,9 @@ class ImageSettings(BaseModel):
     query_action: str
     access_key_env: str
     secret_key_env: str
+    api_key_env: str = "OPENAI_API_KEY"
+    quality: str = "medium"
+    output_format: str = "png"
     width: int = Field(gt=0, strict=True)
     height: int = Field(gt=0, strict=True)
     force_single: bool = Field(strict=True)
@@ -112,6 +124,10 @@ class ImageSettings(BaseModel):
     def secret_key(self) -> str:
         """仅在真实生图时读取 Secret Key。"""
         return _require_compact_credential(self.secret_key_env, "Secret Access Key")
+
+    def api_key(self) -> str:
+        """仅在 OpenAI 生图时读取 API Key。"""
+        return _require_compact_credential(self.api_key_env, "API Key")
 
 
 class StorageSettings(BaseModel):

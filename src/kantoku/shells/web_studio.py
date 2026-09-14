@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import argparse
 import json
+import mimetypes
 import secrets
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+from urllib.parse import unquote, urlsplit
 
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.settings import ROOT
@@ -208,30 +210,36 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
             )
 
         def do_GET(self) -> None:
-            if not self.allowed(session=self.path.startswith(("/api/", "/media/"))):
+            request_path = urlsplit(self.path).path
+            if not self.allowed(session=request_path.startswith(("/api/", "/media/"))):
                 self.json_reply(403, {"error": "请从本机工作台入口访问"})
                 return
             try:
-                if self.path == "/":
+                if request_path == "/":
                     html = (STATIC / "index.html").read_text(encoding="utf-8")
                     self.reply(
                         200,
                         html.replace("__TOKEN__", app.token).encode(),
                         "text/html; charset=utf-8",
                     )
-                elif self.path in {"/app.js", "/style.css"}:
-                    media = "text/javascript" if self.path.endswith(".js") else "text/css"
-                    self.reply(
-                        200, (STATIC / self.path[1:]).read_bytes(), media + "; charset=utf-8"
-                    )
-                elif self.path == "/api/state":
+                elif request_path == "/api/state":
                     self.json_reply(200, app.state())
-                elif self.path.startswith("/media/"):
-                    task = app.task(self.path.removeprefix("/media/"))
+                elif request_path.startswith("/media/"):
+                    task = app.task(request_path.removeprefix("/media/"))
                     result = budget.load_generation_result(task.request_id)
                     if result is None or result.path is None or not result.path.is_file():
                         raise ToolError("原图片不可用")
                     self.reply(200, result.path.read_bytes(), "image/png")
+                elif request_path.startswith("/assets/"):
+                    static_root = STATIC.resolve()
+                    candidate = (STATIC / unquote(request_path).removeprefix("/")).resolve()
+                    if not candidate.is_relative_to(static_root) or not candidate.is_file():
+                        self.json_reply(404, {"error": "页面资源不存在"})
+                        return
+                    media_type = (
+                        mimetypes.guess_type(candidate.name)[0] or "application/octet-stream"
+                    )
+                    self.reply(200, candidate.read_bytes(), media_type)
                 else:
                     self.json_reply(404, {"error": "页面不存在"})
             except (KantokuError, OSError):

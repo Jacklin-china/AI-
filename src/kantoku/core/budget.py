@@ -134,8 +134,11 @@ def _accounting_day_bounds_utc() -> tuple[str, str]:
 
 
 def estimate_image_fen(credits: int | None = None) -> int:
-    """按配置中的积分单价向上估算一次生图需要预占的整数分。"""
+    """按供应商配置向上估算一次生图需要预占的整数分。"""
     settings = get_settings().budget
+    direct_cny = getattr(settings, "image_estimated_cny_per_call", None)
+    if credits is None and direct_cny is not None:
+        return int((direct_cny * 100).to_integral_value(rounding=ROUND_CEILING))
     used_credits = settings.image_estimated_credits_per_call if credits is None else credits
     if type(used_credits) is not int or used_credits <= 0:
         raise BudgetError("生图积分估算必须是正整数")

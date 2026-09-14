@@ -1,6 +1,7 @@
 """浏览器工作台：HTTP 会话边界、付费确认、历史记录与恢复。"""
 
 import json
+import re
 import threading
 from collections.abc import Iterator
 from http.client import HTTPConnection
@@ -77,6 +78,34 @@ def test_http_root_and_session_boundary(server: int, app: web_studio.StudioAppli
         response = connection.getresponse()
         assert response.status == 200
         assert json.loads(response.read())["tasks"] == []
+    finally:
+        connection.close()
+
+
+def test_vue_bundle_is_served_without_exposing_session_token(
+    server: int, app: web_studio.StudioApplication
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    try:
+        connection.request("GET", "/")
+        response = connection.getresponse()
+        html = response.read().decode("utf-8")
+        asset = re.search(r'src="(/assets/[^"]+\.js)"', html)
+        assert response.status == 200
+        assert asset is not None
+        assert "__TOKEN__" not in html
+
+        connection.request("GET", asset.group(1))
+        response = connection.getresponse()
+        bundle = response.read()
+        assert response.status == 200
+        assert response.getheader("Content-Type") == "text/javascript"
+        assert app.token.encode() not in bundle
+
+        connection.request("GET", "/assets/%2e%2e/%2e%2e/.env")
+        response = connection.getresponse()
+        assert response.status == 404
+        response.read()
     finally:
         connection.close()
 

@@ -22,6 +22,7 @@ from kantoku.tools.image_batch import (
 )
 from kantoku.tools.image_gen import ImageProvider, gen_image, reconcile_image
 from kantoku.tools.jimeng import VolcengineJimengProvider
+from kantoku.tools.openai_image import OpenAIImageProvider
 
 
 def _positive_int(text: str) -> int:
@@ -49,9 +50,12 @@ def _money_fen(text: str) -> int:
 
 
 def _provider() -> ImageProvider:
-    if get_settings().image.provider != "volcengine-jimeng":
-        raise ConfigError("当前生图供应商没有可用适配器")
-    return VolcengineJimengProvider()
+    provider = get_settings().image.provider
+    if provider == "volcengine-jimeng":
+        return VolcengineJimengProvider()
+    if provider == "openai-gpt-image":
+        return OpenAIImageProvider()
+    raise ConfigError("当前生图供应商没有可用适配器", detail=provider)
 
 
 def _preflight() -> int:
@@ -85,15 +89,16 @@ def _doctor() -> int:
     """查询一个不存在的任务以验证签名和服务权限，不提交或预占。"""
     provider = _provider()
     result = provider.check_access()
+    label = "即梦签名" if get_settings().image.provider == "volcengine-jimeng" else "模型访问"
     if result.authenticated is False:
         detail = "; ".join(
             str(value) for value in (result.code, result.message, result.request_id) if value
         )
-        raise ConfigError("即梦签名鉴权失败", detail=detail or None)
+        raise ConfigError(f"{label}鉴权失败", detail=detail or None)
     if result.authenticated is None:
-        print("即梦签名未被明确拒绝，但仍无法确认成功；没有创建任务、没有预占预算。")
+        print(f"{label}未被明确拒绝，但仍无法确认成功；没有创建任务、没有预占预算。")
     else:
-        print("即梦签名鉴权通过；没有创建任务、没有预占预算。")
+        print(f"{label}鉴权通过；没有创建任务、没有预占预算。")
     if result.request_id:
         print(f"供应商诊断请求：{result.request_id}")
     if not result.service_ready:

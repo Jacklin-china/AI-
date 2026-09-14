@@ -50,6 +50,9 @@ image:
   query_action: GetResult
   access_key_env: TEST_IMAGE_ACCESS_KEY
   secret_key_env: TEST_IMAGE_SECRET_KEY
+  api_key_env: TEST_OPENAI_KEY
+  quality: medium
+  output_format: png
   width: 2560
   height: 1440
   force_single: true
@@ -129,6 +132,8 @@ def test_get_settings_validates_all_sections_and_caches(
     assert first.llm.timeout_s == 0.001
     assert first.image.model == "image-model"
     assert first.image.force_single is True
+    assert first.image.api_key_env == "TEST_OPENAI_KEY"
+    assert first.image.quality == "medium"
     assert first.image.output_dir == Path("data/images")
     assert first.budget.image_daily_cny == Decimal("5.0")
     assert first.budget.accounting_utc_offset_hours == 8

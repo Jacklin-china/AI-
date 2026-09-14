@@ -148,6 +148,25 @@ def test_vision_chat_uses_isolated_model_endpoint_and_output_limit(
     assert request["extra_body"] == {"enable_thinking": False}
 
 
+def test_reasoning_model_can_omit_temperature_and_use_completion_token_limit(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = _settings()
+    settings.llm.chat_use_temperature = False
+    settings.llm.chat_max_tokens_parameter = "max_completion_tokens"
+    monkeypatch.setattr(llm_module, "get_settings", lambda: settings)
+    client = MagicMock()
+    client.chat.completions.create.return_value = _response()
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+
+    llm_module.chat([{"role": "user", "content": "测试推理模型参数"}])
+
+    request = client.chat.completions.create.call_args.kwargs
+    assert "temperature" not in request
+    assert "max_tokens" not in request
+    assert request["max_completion_tokens"] == 2048
+
+
 def test_chat_retries_connection_error_with_increasing_delay(
     monkeypatch: pytest.MonkeyPatch,
     llm_environment: MagicMock,
