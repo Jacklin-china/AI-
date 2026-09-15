@@ -61,13 +61,6 @@ const promptLength = computed(() => form.prompt.length)
 const statusLabel = (status: StudioTask['status']): string =>
   ({ succeeded: '已生成', failed: '失败', unknown: '待核对', draft: '草稿' })[status]
 
-function moveSpotlight(event: PointerEvent): void {
-  const card = event.currentTarget as HTMLElement
-  const bounds = card.getBoundingClientRect()
-  card.style.setProperty('--spot-x', `${event.clientX - bounds.left}px`)
-  card.style.setProperty('--spot-y', `${event.clientY - bounds.top}px`)
-}
-
 function setNotice(text: string, tone: NoticeTone = 'normal'): void {
   noticeText.value = text
   noticeTone.value = tone
@@ -349,11 +342,10 @@ onBeforeUnmount(() => {
 
 <template>
   <div class="app-shell">
-    <div class="ambient-grid" aria-hidden="true"></div>
-    <div class="ambient-glow" aria-hidden="true"></div>
     <aside class="rail" aria-label="主导航">
       <button class="brand" title="监督酱" @click="activeView = 'create'">
-        <span>K</span><i></i>
+        <span class="brand-mark">K</span>
+        <span class="brand-copy"><strong>监督酱</strong><small>个人创作工作台</small></span>
       </button>
       <nav>
         <button :class="{ active: activeView === 'create' }" @click="activeView = 'create'">
@@ -367,21 +359,21 @@ onBeforeUnmount(() => {
       </nav>
       <button class="rail-settings" title="模型配置" @click="showSettings">
         <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A8 8 0 0 0 15 6l-.3-2.6h-4L10.4 6a8 8 0 0 0-1.5.9l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2.2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.5.9l.3 2.6h4l.3-2.6a8 8 0 0 0 1.5-.9l2.4 1 2-3.4-2-1.5c.1-.3.1-.7.1-1Z" /></svg>
+        <span>模型配置</span>
       </button>
     </aside>
 
     <div class="stage">
       <header class="topbar">
-        <div class="wordmark">KANTOKU <span>CREATIVE CONTROL</span></div>
+        <div class="wordmark">创作工作台</div>
         <div class="system-state"><i :class="{ running: busy }"></i>{{ busy ? '任务执行中' : '本机系统就绪' }}</div>
       </header>
 
       <main v-if="activeView === 'create'">
-        <section class="hero entrance">
+        <section class="hero">
           <div>
-            <p class="kicker">PERSONAL VISUAL PRODUCTION / 01</p>
-            <h1>把模糊想法，变成<br /><em>可交付的画面。</em></h1>
-            <p class="hero-copy">先明确设计，再生成一张；每一次花费都有上限，每一张结果都能追溯。</p>
+            <h1>开始创作</h1>
+            <p class="hero-copy">把模糊想法整理成可交付画面。先明确设计，再生成一张。</p>
           </div>
           <div class="budget-block">
             <span>单项目生图上限</span>
@@ -390,7 +382,7 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section class="progress-strip entrance delay-1" aria-label="创作流程">
+        <section class="progress-strip" aria-label="创作流程">
           <div class="active"><b>01</b><span>定义画面</span></div><i></i>
           <div><b>02</b><span>完善提示词</span></div><i></i>
           <div><b>03</b><span>确认费用</span></div><i></i>
@@ -399,7 +391,7 @@ onBeforeUnmount(() => {
         </section>
 
         <section class="workspace">
-          <aside class="brief-panel panel spotlight-card entrance delay-2" @pointermove="moveSpotlight">
+          <aside class="brief-panel panel">
             <div class="panel-heading">
               <div><span>INPUT / BRIEF</span><h2>创作定义</h2></div>
               <b>01</b>
@@ -440,7 +432,7 @@ onBeforeUnmount(() => {
           </aside>
 
           <section class="output-column">
-            <article class="canvas-panel panel spotlight-card entrance delay-2" @pointermove="moveSpotlight">
+            <article class="canvas-panel panel">
               <div class="panel-heading compact">
                 <div><span>OUTPUT / FRAME</span><h2>{{ selected ? `${selected.project} · 画面 ${selected.shot_no}` : '等待第一张画面' }}</h2></div>
                 <span class="status" :data-status="selected?.status ?? 'draft'">{{ selected ? statusLabel(selected.status) : '未提交' }}</span>
@@ -463,7 +455,7 @@ onBeforeUnmount(() => {
             </article>
 
             <div class="insight-grid">
-              <article class="review-panel panel spotlight-card entrance delay-3" @pointermove="moveSpotlight">
+              <article class="review-panel panel">
                 <div class="panel-heading compact">
                   <div><span>QUALITY GATE</span><h2>审片判断</h2></div>
                   <button class="link-button" :disabled="busy || !selected?.has_image" @click="qualityCheck">视觉预筛 ↗</button>
@@ -472,14 +464,14 @@ onBeforeUnmount(() => {
                 <p>先看人物是否真的在做这件事，再看表情、接触点、衣物材质与环境因果。模型负责预筛，你负责最终通过。</p>
                 <footer>生成成功 ≠ 可交付</footer>
               </article>
-              <article class="model-panel panel spotlight-card entrance delay-3" @pointermove="moveSpotlight">
+              <article class="model-panel panel">
                 <div class="panel-heading compact"><div><span>MODEL ROUTE</span><h2>模型分工</h2></div></div>
                 <dl><div><dt>创意 / 视觉</dt><dd>{{ state.config.chat }}</dd></div><div><dt>图片生成</dt><dd>{{ state.config.image }}</dd></div></dl>
                 <button class="link-button" @click="showSettings">查看完整配置 ↗</button>
               </article>
             </div>
 
-            <article class="history-panel entrance delay-4">
+            <article class="history-panel">
               <div class="section-heading"><div><span>RECENT FRAMES</span><h2>任务轨道</h2></div><b>{{ state.tasks.length.toString().padStart(2, '0') }} RECORDS</b></div>
               <div v-if="state.tasks.length" class="task-track">
                 <button v-for="task in state.tasks" :key="task.request_id" :class="{ selected: task.request_id === selectedId }" @click="selectTask(task)">
@@ -498,7 +490,7 @@ onBeforeUnmount(() => {
           <div class="archive-stats"><div><strong>{{ state.tasks.length }}</strong><span>全部记录</span></div><div><strong>{{ completedCount }}</strong><span>已有画面</span></div><div><strong>{{ waitingCount }}</strong><span>待核对</span></div></div>
         </section>
         <section v-if="state.tasks.length" class="archive-grid">
-          <button v-for="(task, index) in state.tasks" :key="task.request_id" class="spotlight-card" @pointermove="moveSpotlight" @click="selectTask(task)">
+          <button v-for="(task, index) in state.tasks" :key="task.request_id" @click="selectTask(task)">
             <span class="index">{{ String(index + 1).padStart(2, '0') }}</span><div><small>{{ statusLabel(task.status) }} / {{ task.request_id.slice(-8) }}</small><h2>{{ task.project }}</h2><p>画面 {{ task.shot_no }} · 上界 ¥{{ (task.estimate_fen / 100).toFixed(2) }}</p></div><b>↗</b>
           </button>
         </section>
