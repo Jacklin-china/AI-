@@ -18,6 +18,18 @@ from pydantic import ValidationError
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.settings import ROOT
 from kantoku.core import budget
+from kantoku.core.approval import ApprovalService
+from kantoku.core.runtime.graph import GraphRuntime
+from kantoku.core.runtime.models import ApprovalDecision
+from kantoku.core.runtime.runner import TaskRunner
+from kantoku.core.runtime.store import RuntimeStore
+from kantoku.core.skills import SkillRegistry
+from kantoku.domains.comic import ComicState, build_comic_workflow
+from kantoku.domains.comic.services import StudioComicServices
+from kantoku.domains.comic.skills import comic_skills
+from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
+from kantoku.domains.commerce import CommerceState, build_commerce_workflow
+from kantoku.domains.commerce.workflow import WORKFLOW_ID as COMMERCE_WORKFLOW_ID
 from kantoku.perception.qc import qc_image
 from kantoku.perception.report import calculate_qc_economics
 from kantoku.perception.review import (
@@ -52,6 +64,18 @@ class StudioApplication:
         self.token = secrets.token_urlsafe(32)
         self.lock = threading.Lock()
         self.job: dict[str, Any] = {"state": "idle"}
+        configured = get_settings().storage.sqlite_path
+        database_path = configured if configured.is_absolute() else ROOT / configured
+        self.runtime_store = RuntimeStore(database_path)
+        self.runtime = GraphRuntime(self.runtime_store)
+        self.runtime.register(
+            build_comic_workflow(StudioComicServices(_provider()))
+        )
+        self.runtime.register(build_commerce_workflow())
+        self.approvals = ApprovalService(self.runtime_store)
+        self.skills = SkillRegistry()
+        self.skills.load(comic_skills())
+        self.runner = TaskRunner(max_workers=2)
 
     def task(self, request_id: str) -> StudioTask:
         for task in list_tasks():
@@ -87,10 +111,15 @@ class StudioApplication:
                 }
             )
         tasks.sort(key=lambda item: item["created_at"], reverse=True)
+        budgets = {
+            project: budget.summarize_budget(project).model_dump()
+            for project in sorted({item["project"] for item in tasks})
+        }
         with self.lock:
             job = dict(self.job)
         return {
             "tasks": tasks,
+            "budgets": budgets,
             "job": job,
             "config": {
                 "image": settings.image.model,
@@ -98,6 +127,7 @@ class StudioApplication:
                 "vision": settings.llm.model_vision,
                 "size": f"{settings.image.width} × {settings.image.height}",
                 "limit": str(settings.budget.image_project_cny),
+                "estimate_fen": budget.estimate_image_fen(),
             },
         }
 
@@ -169,6 +199,14 @@ class StudioApplication:
             prediction = load_qc_prediction(task.request_id)
             if raw_result is None and prediction is None:
                 raise ToolError("请先完成视觉预筛，或提交人工检查结果")
+            decision = data.get(
+                "decision",
+                "approve" if data.get("approved") else "request_revision",
+            )
+            if decision not in {"approve", "reject", "request_revision"}:
+                raise ToolError("人工审批决定无效")
+            if data.get("approved") is not (decision == "approve"):
+                raise ToolError("人工审批决定与通过状态不一致")
             try:
                 review_result = (
                     QcResult.model_validate(raw_result)
@@ -202,10 +240,18 @@ class StudioApplication:
             except (KeyError, ValidationError) as error:
                 raise ToolError("人工终审信息不完整或互相矛盾") from error
             record_human_review(task.request_id, label)
+            if decision == "reject":
+                decide_rework(task.request_id, "cancelled")
             return {
                 "request_id": task.request_id,
                 "approved": label.approved,
-                "rework_created": not label.approved,
+                "decision": decision,
+                "rework_created": decision == "request_revision",
+                "message": {
+                    "approve": "人工终审已通过，可以归档交付。",
+                    "reject": "作品已拒绝，不会进入付费返工。",
+                    "request_revision": "已进入定向返工队列，尚未产生新费用。",
+                }[decision],
             }
         if action == "archive":
             archived = archive_reviewed_image(task.request_id)
@@ -214,6 +260,7 @@ class StudioApplication:
                 "approved": archived.approved,
                 "image_path": str(archived.image_path),
                 "metadata_path": str(archived.metadata_path),
+                "message": "作品及质检元数据已归档。",
             }
         if action == "prepare_rework":
             item = get_rework_item(task.request_id)
@@ -265,6 +312,72 @@ class StudioApplication:
             return {"request_id": task.request_id, "status": item.status}
         raise ToolError("不支持的操作")
 
+    def list_core_runs(self) -> list[dict[str, Any]]:
+        """返回真实 Run 与 NodeExecution，供工作台渲染。"""
+        return [self._run_payload(record.id) for record in self.runtime_store.list_runs()]
+
+    def get_core_run(self, run_id: str) -> dict[str, Any]:
+        """返回单个真实 Run。"""
+        return self._run_payload(run_id)
+
+    def _run_payload(self, run_id: str) -> dict[str, Any]:
+        run = self.runtime_store.get_run(run_id)
+        payload = run.model_dump(mode="json")
+        payload["nodes"] = [
+            node.model_dump(mode="json") for node in self.runtime_store.list_nodes(run_id)
+        ]
+        return payload
+
+    def create_core_run(self, data: dict[str, Any]) -> dict[str, Any]:
+        """根据 shell 选择 Domain Pack；Core 本身没有领域分支。"""
+        domain = str(data.get("domain", "")).strip().lower()
+        if domain == "comic":
+            state = ComicState.model_validate(data.get("state", data))
+            run = self.runtime.start(COMIC_WORKFLOW_ID, state)
+        elif domain == "commerce":
+            state = CommerceState.model_validate(data.get("state", data))
+            run = self.runtime.start(COMMERCE_WORKFLOW_ID, state)
+        else:
+            raise ToolError("不支持的 Domain Pack", detail=domain)
+        return self._run_payload(run.id)
+
+    def resume_core_run(self, run_id: str) -> dict[str, Any]:
+        """从最后 checkpoint 恢复 Run。"""
+        run = self.runtime.resume(run_id)
+        return self._run_payload(run.id)
+
+    def list_core_artifacts(self, run_id: str) -> list[dict[str, Any]]:
+        """读取 Run 产物。"""
+        return [
+            item.model_dump(mode="json")
+            for item in self.runtime_store.list_artifacts(run_id)
+        ]
+
+    def list_core_approvals(self) -> list[dict[str, Any]]:
+        """读取全部通用审批，pending 排在调用方所需顺序。"""
+        return [
+            item.model_dump(mode="json")
+            for item in self.runtime_store.list_approvals()
+        ]
+
+    def decide_core_approval(
+        self, approval_id: str, action: str, data: dict[str, Any]
+    ) -> dict[str, Any]:
+        """提交审批决定；Run 由显式 resume 继续。"""
+        decisions = {
+            "approve": ApprovalDecision.APPROVE,
+            "reject": ApprovalDecision.REJECT,
+            "revise": ApprovalDecision.REQUEST_REVISION,
+        }
+        try:
+            decision = decisions[action]
+        except KeyError:
+            raise ToolError("审批操作无效", detail=action) from None
+        record = self.approvals.decide(
+            approval_id, decision, data.get("response", data)
+        )
+        return record.model_dump(mode="json")
+
     def start(self, action: str, data: dict[str, Any]) -> None:
         if action not in {
             "compose",
@@ -301,7 +414,7 @@ class StudioApplication:
             with self.lock:
                 self.job.update(update)
 
-        threading.Thread(target=worker, daemon=True).start()
+        self.runner.submit(worker)
 
 
 def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
@@ -354,7 +467,21 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 self.json_reply(403, {"error": "请从本机工作台入口访问"})
                 return
             try:
-                if request_path == "/":
+                app_routes = {
+                    "/",
+                    "/workspace",
+                    "/runs",
+                    "/assets",
+                    "/history",
+                    "/skills",
+                    "/settings",
+                }
+                is_app_route = (
+                    request_path in app_routes
+                    or request_path.startswith("/runs/")
+                    or request_path.startswith("/domain/")
+                )
+                if is_app_route:
                     html = (STATIC / "index.html").read_text(encoding="utf-8")
                     self.reply(
                         200,
@@ -363,6 +490,18 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     )
                 elif request_path == "/api/state":
                     self.json_reply(200, app.state())
+                elif request_path == "/api/runs":
+                    self.json_reply(200, {"runs": app.list_core_runs()})
+                elif request_path.startswith("/api/runs/"):
+                    parts = request_path.strip("/").split("/")
+                    if len(parts) == 4 and parts[3] == "artifacts":
+                        self.json_reply(200, {"artifacts": app.list_core_artifacts(parts[2])})
+                    elif len(parts) == 3:
+                        self.json_reply(200, app.get_core_run(parts[2]))
+                    else:
+                        self.json_reply(404, {"error": "Core API 路径不存在"})
+                elif request_path == "/api/approvals":
+                    self.json_reply(200, {"approvals": app.list_core_approvals()})
                 elif request_path.startswith("/media/"):
                     task = app.task(request_path.removeprefix("/media/"))
                     result = budget.load_generation_result(task.request_id)
@@ -395,9 +534,21 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict) or not self.path.startswith("/api/"):
                     raise ToolError("请求格式不合法")
-                app.start(self.path.removeprefix("/api/"), data)
-                self.json_reply(202, {"accepted": True})
-            except (ValueError, KantokuError) as error:
+                request_path = urlsplit(self.path).path
+                parts = request_path.strip("/").split("/")
+                if request_path == "/api/runs":
+                    self.json_reply(201, app.create_core_run(data))
+                elif len(parts) == 4 and parts[:2] == ["api", "runs"] \
+                        and parts[3] == "resume":
+                    self.json_reply(200, app.resume_core_run(parts[2]))
+                elif len(parts) == 4 and parts[:2] == ["api", "approvals"]:
+                    self.json_reply(
+                        200, app.decide_core_approval(parts[2], parts[3], data)
+                    )
+                else:
+                    app.start(request_path.removeprefix("/api/"), data)
+                    self.json_reply(202, {"accepted": True})
+            except (ValueError, ValidationError, KantokuError) as error:
                 self.json_reply(
                     400,
                     {"error": str(error) if isinstance(error, KantokuError) else "请求格式不合法"},

@@ -1,512 +1,120 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from 'vue'
-
 import { getState, loadArtwork, startAction } from './api'
-import type { StudioForm, StudioState, StudioTask } from './types'
+import ApprovalPanel from './components/ApprovalPanel.vue'
+import EmptyState from './components/EmptyState.vue'
+import QcPanel from './components/QcPanel.vue'
+import StatusBadge from './components/StatusBadge.vue'
+import WorkflowProgress, { type WorkflowStep } from './components/WorkflowProgress.vue'
+import CommandPalette from './components/layout/CommandPalette.vue'
+import SidebarNav from './components/layout/SidebarNav.vue'
+import TopBar from './components/layout/TopBar.vue'
+import { domainById, domains, type DomainDefinition } from './domains'
+import type { GenerationSettings, StudioForm, StudioState, StudioTask } from './types'
+import AssetsView from './views/AssetsView.vue'
+import HomeView from './views/HomeView.vue'
+import RunsView from './views/RunsView.vue'
+import WorkspaceView from './views/WorkspaceView.vue'
 
-type ViewName = 'create' | 'archive'
-type NoticeTone = 'normal' | 'error' | 'success'
-
-const emptyState: StudioState = {
-  tasks: [],
-  job: { state: 'idle' },
-  config: { image: '—', chat: '—', vision: '—', size: '—', limit: '20' },
-}
-const defaultForm: StudioForm = {
-  project: '我的第一份作品',
-  shot_no: 1,
-  purpose: '叙事静帧',
-  subject: '',
-  style: '自然光、克制色彩、纪实摄影',
-  audience: '喜欢自然、有生活气息画面的用户',
-  prompt: '',
-  price: '3.00',
-}
-
+type RouteName = 'dashboard' | 'workspace' | 'runs' | 'run_detail' | 'assets' | 'history' | 'skills' | 'settings' | 'domain'
+type NoticeTone = 'normal' | 'success' | 'error'
+interface RouteState { name: RouteName; param?: string }
+const emptyState: StudioState = { tasks: [], budgets: {}, job: { state: 'idle' }, config: { image: '—', chat: '—', vision: '—', size: '—', limit: '20', estimate_fen: 300 } }
+const defaultForm: StudioForm = { project: '未命名 Production', shot_no: 1, purpose: '叙事静帧', subject: '', style: '自然光、克制色彩、纪实摄影', audience: '普通观众', prompt: '', price: '3.00' }
 const state = ref<StudioState>(emptyState)
+const route = ref<RouteState>(parseRoute())
+const activeDomainId = ref('studio')
 const form = reactive<StudioForm>({ ...defaultForm })
-const activeView = ref<ViewName>('create')
+const generation = reactive<GenerationSettings>({ model: '', ratio: '3:4', resolution: '2K', quality: 'standard', quantity: 1 })
 const selectedId = ref<string | null>(null)
-const artworkUrl = ref<string | null>(null)
-const noticeText = ref('工作台已就绪。打开页面不会调用模型。')
-const noticeTone = ref<NoticeTone>('normal')
-const loadingImage = ref(false)
-const firstRefresh = ref(true)
-const lastJobId = ref('')
+const promptApproved = ref(false)
+const promptVersion = ref(1)
+const artworkUrls = reactive<Record<string, string>>({})
+const notice = reactive<{ text: string; tone: NoticeTone }>({ text: 'Kantoku Core 已连接本机工作区。', tone: 'normal' })
 const refreshing = ref(false)
+const lastJobId = ref('')
+const sidebarCollapsed = ref(false)
+const commandOpen = ref(false)
+const runDetailTab = ref<'overview' | 'workflow' | 'qc' | 'approval'>('overview')
+const modal = reactive({ open: false, title: '', message: '', confirmLabel: '确认', cancelLabel: '取消', input: false, value: '' })
 let timer: number | undefined
+let resolveModal: ((value: boolean) => void) | null = null
 
-const modal = reactive({
-  open: false,
-  title: '',
-  message: '',
-  confirmLabel: '确认继续',
-  showPrice: false,
-  price: '',
-  cancelLabel: '返回',
-})
-let resolveModal: ((result: boolean) => void) | null = null
-
-const selected = computed<StudioTask | null>(() =>
-  state.value.tasks.find((task) => task.request_id === selectedId.value) ?? null,
-)
+const selected = computed(() => state.value.tasks.find((task) => task.request_id === selectedId.value) ?? null)
 const busy = computed(() => state.value.job.state === 'running')
-const completedCount = computed(
-  () => state.value.tasks.filter((task) => task.status === 'succeeded').length,
-)
-const waitingCount = computed(
-  () => state.value.tasks.filter((task) => task.status === 'unknown').length,
-)
-const promptLength = computed(() => form.prompt.length)
-const statusLabel = (status: StudioTask['status']): string =>
-  ({ succeeded: '已生成', failed: '失败', unknown: '待核对', draft: '草稿' })[status]
-
-function setNotice(text: string, tone: NoticeTone = 'normal'): void {
-  noticeText.value = text
-  noticeTone.value = tone
-}
-
-function payload(): Record<string, unknown> {
-  return {
-    project: form.project.trim(),
-    shot_no: Number(form.shot_no),
-    purpose: form.purpose,
-    subject: form.subject,
-    style: form.style,
-    audience: form.audience,
-    prompt: form.prompt,
-    price: form.price,
-    request_id: selected.value?.request_id,
-    confirmed: true,
-  }
-}
-
-function saveDraft(): void {
-  try {
-    localStorage.setItem('kantoku-vue-draft', JSON.stringify(form))
-  } catch {
-    // 浏览器禁用本地存储时不影响主要创作流程。
-  }
-}
-
-function restoreDraft(): void {
-  try {
-    const saved = JSON.parse(localStorage.getItem('kantoku-vue-draft') ?? '{}') as Partial<StudioForm>
-    Object.assign(form, { ...defaultForm, ...saved })
-  } catch {
-    Object.assign(form, defaultForm)
-  }
-}
-
-function ask(
-  title: string,
-  message: string,
-  options: { showPrice?: boolean; confirmLabel?: string; cancelLabel?: string } = {},
-): Promise<boolean> {
-  modal.title = title
-  modal.message = message
-  modal.showPrice = options.showPrice ?? false
-  modal.confirmLabel = options.confirmLabel ?? '确认继续'
-  modal.cancelLabel = options.cancelLabel ?? '返回'
-  modal.price = ''
-  modal.open = true
-  return new Promise((resolve) => {
-    resolveModal = resolve
-  })
-}
-
-function closeModal(result: boolean): void {
-  modal.open = false
-  resolveModal?.(result)
-  resolveModal = null
-}
-
-async function run(action: string, body: Record<string, unknown> = payload()): Promise<void> {
-  if (busy.value) return
-  setNotice('正在处理。任务记录和预算保护会一直保留。')
-  try {
-    await startAction(action, body)
-    await refresh()
-  } catch (error) {
-    setNotice(error instanceof Error ? error.message : '操作没有完成', 'error')
-  }
-}
-
-async function selectTask(task: StudioTask): Promise<void> {
-  selectedId.value = task.request_id
-  form.project = task.project
-  form.shot_no = task.shot_no
-  form.prompt = task.prompt
-  activeView.value = 'create'
-  saveDraft()
-  if (artworkUrl.value) {
-    URL.revokeObjectURL(artworkUrl.value)
-    artworkUrl.value = null
-  }
-  if (task.has_image) {
-    loadingImage.value = true
-    try {
-      artworkUrl.value = await loadArtwork(task.request_id)
-    } catch (error) {
-      setNotice(error instanceof Error ? error.message : '图片读取失败', 'error')
-    } finally {
-      loadingImage.value = false
-    }
-  }
-  setNotice(task.error ?? '已载入历史画面；继续时会沿用原任务记录。')
-}
-
-async function handleCompletedJob(snapshot: StudioState): Promise<void> {
-  const job = snapshot.job
-  if (!job.id || job.id === lastJobId.value || job.state === 'running') return
-  lastJobId.value = job.id
-  if (job.state === 'error') {
-    setNotice(job.error ?? '操作没有完成', 'error')
-    return
-  }
-  const result = job.result ?? {}
-  if (result.prompt) {
-    form.prompt = result.prompt
-    saveDraft()
-    setNotice('提示词已更新。请检查主体、动作和光线后再生成。', 'success')
-  }
-  if (result.request_id) {
-    const task = snapshot.tasks.find((item) => item.request_id === result.request_id)
-    if (task) await selectTask(task)
-  }
-  if (result.qc) {
-    setNotice(
-      `${result.qc.reason} · 模型置信度 ${Math.round(result.qc.confidence * 100)}%，最终仍由你判断。`,
-      'success',
-    )
-  }
-  if (result.message) setNotice(result.message, 'success')
-  if (job.action === 'budget' && result.available_fen !== undefined) {
-    setNotice(
-      `已结算 ¥${((result.settled_fen ?? 0) / 100).toFixed(2)} · 预占 ¥${((result.held_fen ?? 0) / 100).toFixed(2)} · 可用 ¥${(result.available_fen / 100).toFixed(2)}`,
-      'success',
-    )
-  }
-}
-
-async function refresh(): Promise<void> {
-  if (refreshing.value) return
-  refreshing.value = true
-  try {
-    const snapshot = await getState()
-    state.value = snapshot
-    if (firstRefresh.value) {
-      lastJobId.value = snapshot.job.state === 'running' ? '' : snapshot.job.id ?? ''
-      firstRefresh.value = false
-    }
-    await handleCompletedJob(snapshot)
-  } catch (error) {
-    setNotice(
-      `连接暂不可用：${error instanceof Error ? error.message : '请确认启动窗口仍在运行'}`,
-      'error',
-    )
-  } finally {
-    refreshing.value = false
-  }
-}
-
-async function refine(): Promise<void> {
-  if (!form.prompt.trim()) {
-    setNotice('请先整理提示词或填写创作内容。', 'error')
-    return
-  }
-  if (
-    await ask(
-      '交给创意模型优化？',
-      '当前提示词将发送给已配置的文本模型。它只改写设计方案，不会生成图片，也不会动用生图预算。',
-    )
-  ) {
-    await run('refine')
-  }
-}
-
-async function generate(): Promise<void> {
-  if (
-    !form.project.trim() ||
-    !form.prompt.trim() ||
-    !Number.isInteger(Number(form.shot_no)) ||
-    Number(form.shot_no) < 1 ||
-    !(Number(form.price) > 0)
-  ) {
-    setNotice('请填写作品名、正整数画面编号、最终提示词和费用上界。', 'error')
-    return
-  }
-  const approved = await ask(
-    '确认生成一张画面',
-    `${form.project} / 画面 ${form.shot_no}\n本次最多预占 ¥${form.price}\n系统只生成一张。已有任务请使用“查询原任务”，避免重复收费。`,
-    { confirmLabel: '确认并生成' },
-  )
-  if (approved) await run('generate')
-}
-
-async function resume(): Promise<void> {
-  if (!selected.value) {
-    setNotice('请先从任务轨道选择一条记录。', 'error')
-    return
-  }
-  if (
-    await ask(
-      '继续原任务',
-      `沿用原提示词与 ¥${(selected.value.estimate_fen / 100).toFixed(2)} 费用上界。未提交任务只会执行一次；已提交任务不会重复提交。`,
-    )
-  ) {
-    await run('resume')
-  }
-}
-
-async function recover(): Promise<void> {
-  if (!selected.value) {
-    setNotice('请先选择要查询的任务。', 'error')
-    return
-  }
-  await run('recover')
-}
-
-async function qualityCheck(): Promise<void> {
-  if (!selected.value?.has_image) {
-    setNotice('请先选择一张已经生成的图片。', 'error')
-    return
-  }
-  if (
-    await ask(
-      '启动视觉预筛？',
-      '当前图片会发送给视觉模型，从动作、材质、构图与叙事四个方向给出辅助意见。结果不是最终裁决。',
-    )
-  ) {
-    await run('qc')
-  }
-}
-
-async function settleBill(): Promise<void> {
-  if (!selected.value) {
-    setNotice('请先选择需要对账的任务。', 'error')
-    return
-  }
-  const approved = await ask(
-    '回填供应商账单',
-    `任务 ${selected.value.request_id.slice(-8)}\n只填写平台已经确认的最终人民币实扣。`,
-    { showPrice: true, confirmLabel: '确认实扣' },
-  )
-  if (!approved) return
-  if (modal.price === '' || Number(modal.price) < 0) {
-    setNotice('请填写精确到分的非负金额。', 'error')
-    return
-  }
-  await run('settle', { ...payload(), price: modal.price })
-}
-
-function downloadArtwork(): void {
-  if (!artworkUrl.value || !selected.value) {
-    setNotice('当前没有可下载的图片。', 'error')
-    return
-  }
-  const link = document.createElement('a')
-  link.href = artworkUrl.value
-  link.download = `${selected.value.request_id}.png`
-  link.click()
-}
-
-async function showSettings(): Promise<void> {
-  const config = state.value.config
-  await ask(
-    '当前模型路由',
-    `文本设计　${config.chat}\n视觉质检　${config.vision}\n图片生成　${config.image}\n输出尺寸　${config.size}\n\n密钥始终只保存在本机，不会发送给这个页面。`,
-    { confirmLabel: '知道了', cancelLabel: '关闭' },
-  )
-}
-
-function formatTime(raw: string): string {
-  if (!raw) return '尚未提交'
-  const parsed = new Date(raw.replace(' ', 'T') + 'Z')
-  return Number.isNaN(parsed.valueOf())
-    ? raw.slice(0, 16)
-    : parsed.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' })
-}
-
-watch(form, saveDraft, { deep: true })
-onMounted(() => {
-  restoreDraft()
-  void refresh()
-  timer = window.setInterval(() => void refresh(), 1600)
+const activeDomain = computed(() => domainById(activeDomainId.value))
+const currentBudget = computed(() => state.value.budgets[form.project.trim()] ?? { project: form.project, task_count: 0, settled_fen: 0, held_fen: 0, unknown_count: 0, unbilled_count: 0, limit_fen: Math.round(Number(state.value.config.limit) * 100), available_fen: Math.round(Number(state.value.config.limit) * 100) })
+const estimatedFen = computed(() => state.value.config.estimate_fen ?? Math.max(1, Math.round(Number(form.price) * 100)))
+const allSkills = computed(() => domains.flatMap((domain) => domain.skills.map((skill) => ({ ...skill, domain }))))
+const runDetail = computed(() => state.value.tasks.find((task) => task.request_id === route.value.param) ?? null)
+/* 候选：同一项目 + 同一镜号下所有真实生成过的产物。每次「再次生成」都会产生一个新候选，
+   网格按真实候选数自适应 —— 不伪造到 4 张，因为当前接口 quantity 固定为 1。 */
+const candidates = computed(() => {
+  const current = selected.value
+  if (!current) return []
+  return state.value.tasks
+    .filter((task) => task.has_image && task.project === current.project && task.shot_no === current.shot_no)
+    .sort((a, b) => b.created_at.localeCompare(a.created_at))
+    .map((task) => ({ task, url: artworkUrls[task.request_id] as string | undefined }))
 })
-onBeforeUnmount(() => {
-  if (timer !== undefined) window.clearInterval(timer)
-  if (artworkUrl.value) URL.revokeObjectURL(artworkUrl.value)
-})
+const workflowSteps = computed<WorkflowStep[]>(() => buildWorkflow(selected.value))
+
+function parseRoute(): RouteState { const path = window.location.pathname.replace(/\/+$/, '') || '/'; if (path === '/') return { name: 'dashboard' }; if (path === '/workspace') return { name: 'workspace' }; if (path === '/runs') return { name: 'runs' }; if (path.startsWith('/runs/')) return { name: 'run_detail', param: decodeURIComponent(path.slice(6)) }; if (path === '/assets') return { name: 'assets' }; if (path === '/history') return { name: 'history' }; if (path === '/skills') return { name: 'skills' }; if (path === '/settings') return { name: 'settings' }; if (path.startsWith('/domain/')) return { name: 'domain', param: path.slice(8) }; return { name: 'dashboard' } }
+function navigate(path: string): void { if (window.location.pathname !== path) window.history.pushState({}, '', path); route.value = parseRoute(); if (route.value.name === 'domain' && route.value.param) activeDomainId.value = route.value.param; window.scrollTo({ top: 0, behavior: 'smooth' }) }
+function chooseDomain(domain: DomainDefinition): void { activeDomainId.value = domain.id; navigate(`/domain/${domain.id}`) }
+function openDomain(id: string): void { chooseDomain(domainById(id)) }
+function quickStart(domain: DomainDefinition): void { activeDomainId.value = domain.id; if (domain.status === 'available') { resetWorkspace(); navigate('/workspace') } else { navigate(`/domain/${domain.id}`); setNotice(`${domain.name} 当前为 ${domain.status === 'preview' ? 'Preview' : 'Coming Soon'}，不会伪造执行。`) } }
+function startCreation(requirementText: string): void { resetWorkspace(); form.subject = requirementText; activeDomainId.value = 'studio'; navigate('/workspace'); setNotice('需求已填入工作台，确认上下文后可生成 Prompt。') }
+function routeTitle(): string { return ({ dashboard: '首页', workspace: '工作台', runs: '任务与运行', run_detail: '运行详情', assets: '资产', history: '历史记录', skills: '技能', settings: '设置', domain: activeDomain.value.name } as Record<RouteName, string>)[route.value.name] }
+function setNotice(text: string, tone: NoticeTone = 'normal'): void { notice.text = text; notice.tone = tone }
+function formatFen(value: number | null): string { return value === null ? '—' : `¥${(value / 100).toFixed(2)}` }
+function formatTime(raw: string): string { if (!raw) return '—'; const value = new Date(raw.replace(' ', 'T') + 'Z'); return Number.isNaN(value.valueOf()) ? raw : value.toLocaleString('zh-CN', { month: '2-digit', day: '2-digit', hour: '2-digit', minute: '2-digit' }) }
+function taskStatus(task: StudioTask): string { if (task.status === 'failed') return 'failed'; if (task.archived) return 'completed'; if (task.status === 'unknown' || task.has_image || task.rework?.status === 'pending') return 'waiting'; if (task.status === 'succeeded') return 'running'; return 'pending' }
+function buildWorkflow(task: StudioTask | null): WorkflowStep[] { return [{ id: 'plan', name: '需求规划', status: task?.prompt || form.subject || form.prompt ? 'completed' : 'pending', detail: '需求与交付目标' }, { id: 'prompt', name: 'Prompt 构建', status: task?.prompt || form.prompt ? 'completed' : 'pending', detail: `Prompt v${promptVersion.value}` }, { id: 'generate', name: '图像生成', status: busy.value && state.value.job.action === 'generate' ? 'running' : task?.has_image ? 'completed' : task?.status === 'failed' ? 'failed' : 'pending', detail: task?.has_image ? 'Artifact 已生成' : '等待提交' }, { id: 'qc', name: '质量检查', status: task?.qc ? 'completed' : task?.has_image ? 'waiting' : 'pending', detail: task?.qc ? 'VLM 预筛完成' : '等待 Artifact' }, { id: 'review', name: '人工审批', status: task?.review ? 'completed' : task?.qc ? 'waiting' : 'pending', detail: task?.review ? (task.review.approved ? '已批准' : '未通过') : '等待人工决定' }, { id: 'delivery', name: '交付归档', status: task?.archived ? 'completed' : task?.review?.approved ? 'waiting' : 'pending', detail: task?.archived ? '已归档' : '等待归档' }] }
+function payload(): Record<string, unknown> { return { project: form.project.trim(), shot_no: Number(form.shot_no), purpose: form.purpose, subject: form.subject, style: form.style, audience: form.audience, prompt: form.prompt, price: (estimatedFen.value / 100).toFixed(2), request_id: selected.value?.request_id, confirmed: true, model: generation.model || state.value.config.image, ratio: generation.ratio, resolution: generation.resolution, quality: generation.quality, quantity: generation.quantity, prompt_version: promptVersion.value } }
+function ask(title: string, message: string, options: { confirmLabel?: string; cancelLabel?: string; input?: boolean } = {}): Promise<boolean> { Object.assign(modal, { open: true, title, message, confirmLabel: options.confirmLabel ?? '确认', cancelLabel: options.cancelLabel ?? '取消', input: options.input ?? false, value: '' }); return new Promise((resolve) => { resolveModal = resolve }) }
+function closeModal(value: boolean): void { modal.open = false; resolveModal?.(value); resolveModal = null }
+async function run(action: string, body: Record<string, unknown> = payload()): Promise<void> { if (busy.value) return; try { await startAction(action, body); setNotice(action === 'generate' ? '生成任务已提交，预算保护已生效。' : '操作已提交，正在等待结果。'); await refresh() } catch (error) { setNotice(error instanceof Error ? error.message : '操作没有完成', 'error') } }
+async function generate(): Promise<void> { if (activeDomain.value.id !== 'studio') { setNotice('该 Domain 尚未连接可执行 Workflow。', 'error'); return }; if (!form.prompt.trim() || !promptApproved.value) { setNotice('请先填写并批准 Prompt。', 'error'); return }; if (await ask('确认生成 Artifact？', `将通过 ${state.value.config.image} 生成 1 张图片，预计预占 ${formatFen(estimatedFen.value)}。`, { confirmLabel: '确认生成' })) await run('generate') }
+async function composePrompt(): Promise<void> { await run('compose') }
+async function refinePrompt(): Promise<void> { if (!form.prompt.trim()) { setNotice('请先填写 Prompt。', 'error'); return }; if (await ask('重新生成 Prompt？', '会调用已配置文本模型，不会生成图片。', { confirmLabel: '重新生成' })) await run('refine') }
+function approvePrompt(): void { promptApproved.value = true; promptVersion.value += 1; setNotice(`Prompt v${promptVersion.value} 已批准。`, 'success') }
+async function runQc(): Promise<void> { if (selected.value?.has_image && await ask('运行质量检查？', `将调用 ${state.value.config.vision}。VLM 只做预筛，最终决定仍由人工完成。`, { confirmLabel: '运行 QC' })) await run('qc') }
+async function decideReview(decision: 'approve' | 'reject' | 'request_revision', reason: string, notes: string): Promise<void> { if (!selected.value?.qc) return; const labels = { approve: '批准当前 Artifact', reject: '拒绝当前 Artifact', request_revision: '创建返修草稿' }; if (await ask(labels[decision], decision === 'request_revision' ? '不会自动提交新的付费生成。' : '该人工决定会持久化且不可静默覆盖。', { confirmLabel: labels[decision] })) await run('review', { ...payload(), decision, approved: decision === 'approve', failure_reasons: decision === 'approve' ? [] : [reason], cinematography_requirements: form.style, cinematography_notes: notes.trim() || selected.value.qc.reason }) }
+async function archiveSelected(): Promise<void> { if (selected.value?.review && await ask('归档 Artifact？', '将保存原图、来源与质量元数据。', { confirmLabel: '确认归档' })) await run('archive') }
+async function recoverSelected(): Promise<void> { if (selected.value) await run('recover') }
+async function resumeSelected(): Promise<void> { if (selected.value && await ask('继续原任务？', '只会恢复原请求，不会建立重复任务。', { confirmLabel: '继续' })) await run('resume') }
+async function settleSelected(): Promise<void> { if (!selected.value || !(await ask('回填平台实扣', '只填写平台已确认的最终金额。', { confirmLabel: '保存账单', input: true }))) return; if (modal.value === '' || Number(modal.value) < 0) { setNotice('请输入非负金额。', 'error'); return }; await run('settle', { ...payload(), price: modal.value }) }
+async function selectTask(task: StudioTask, destination = '/workspace'): Promise<void> { selectedId.value = task.request_id; form.project = task.project; form.shot_no = task.shot_no; form.prompt = task.prompt; promptApproved.value = true; activeDomainId.value = 'studio'; await ensurePreview(task); navigate(destination) }
+function resetWorkspace(): void { Object.assign(form, defaultForm); selectedId.value = null; promptApproved.value = false; promptVersion.value = 1 }
+async function ensurePreview(task: StudioTask): Promise<void> { if (!task.has_image || artworkUrls[task.request_id]) return; try { artworkUrls[task.request_id] = await loadArtwork(task.request_id) } catch { /* Run Detail 展示真实素材错误 */ } }
+async function handleCompletedJob(snapshot: StudioState): Promise<void> { const job = snapshot.job; if (!job.id || job.id === lastJobId.value || job.state === 'running') return; lastJobId.value = job.id; if (job.state === 'error') { setNotice(job.error ?? '操作没有完成', 'error'); return }; const result = job.result ?? {}; if (result.prompt) { form.prompt = result.prompt; promptApproved.value = false; promptVersion.value += 1; setNotice(`Prompt v${promptVersion.value} 已生成，等待人工批准。`, 'success') }; if (result.request_id) { const task = snapshot.tasks.find((item) => item.request_id === result.request_id); if (task) { selectedId.value = task.request_id; await ensurePreview(task) } }; if (result.qc) setNotice(`QC 完成：${result.qc.reason}`, 'success'); if (result.message) setNotice(result.message, 'success') }
+async function refresh(): Promise<void> { if (refreshing.value) return; refreshing.value = true; try { const snapshot = await getState(); state.value = snapshot; generation.model ||= snapshot.config.image; if (route.value.name === 'run_detail' && route.value.param && !selectedId.value) { const task = snapshot.tasks.find((item) => item.request_id === route.value.param); if (task) { selectedId.value = task.request_id; form.project = task.project; form.shot_no = task.shot_no; form.prompt = task.prompt; promptApproved.value = true } }; await handleCompletedJob(snapshot); await Promise.all(snapshot.tasks.filter((task) => task.has_image).slice(0, 12).map(ensurePreview)) } catch (error) { setNotice(`本机服务暂不可用：${error instanceof Error ? error.message : '未知错误'}`, 'error') } finally { refreshing.value = false } }
+function handleShortcut(event: KeyboardEvent): void { if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'k') { event.preventDefault(); commandOpen.value = !commandOpen.value } }
+function handlePopState(): void { route.value = parseRoute() }
+watch(() => form.prompt, () => { promptApproved.value = false })
+onMounted(() => { window.addEventListener('popstate', handlePopState); window.addEventListener('keydown', handleShortcut); if (route.value.name === 'domain' && route.value.param) activeDomainId.value = route.value.param; void refresh(); timer = window.setInterval(() => void refresh(), 1800) })
+onBeforeUnmount(() => { window.removeEventListener('popstate', handlePopState); window.removeEventListener('keydown', handleShortcut); if (timer !== undefined) window.clearInterval(timer); Object.values(artworkUrls).forEach((url) => URL.revokeObjectURL(url)) })
 </script>
 
 <template>
-  <div class="app-shell">
-    <aside class="rail" aria-label="主导航">
-      <button class="brand" title="监督酱" @click="activeView = 'create'">
-        <span class="brand-mark">K</span>
-        <span class="brand-copy"><strong>监督酱</strong><small>个人创作工作台</small></span>
-      </button>
-      <nav>
-        <button :class="{ active: activeView === 'create' }" @click="activeView = 'create'">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 17.5V20h2.5L18.4 8.1l-2.5-2.5L4 17.5ZM14.8 6.7l2.5 2.5M13 20h7" /></svg>
-          <span>创作</span>
-        </button>
-        <button :class="{ active: activeView === 'archive' }" @click="activeView = 'archive'">
-          <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 7h16v13H4zM3 4h18v3H3zM9 11h6" /></svg>
-          <span>档案</span>
-        </button>
-      </nav>
-      <button class="rail-settings" title="模型配置" @click="showSettings">
-        <svg viewBox="0 0 24 24" aria-hidden="true"><circle cx="12" cy="12" r="3"/><path d="M19 12a7 7 0 0 0-.1-1l2-1.5-2-3.4-2.4 1A8 8 0 0 0 15 6l-.3-2.6h-4L10.4 6a8 8 0 0 0-1.5.9l-2.4-1-2 3.4 2 1.5a7 7 0 0 0 0 2.2l-2 1.5 2 3.4 2.4-1a8 8 0 0 0 1.5.9l.3 2.6h4l.3-2.6a8 8 0 0 0 1.5-.9l2.4 1 2-3.4-2-1.5c.1-.3.1-.7.1-1Z" /></svg>
-        <span>模型配置</span>
-      </button>
-    </aside>
-
-    <div class="stage">
-      <header class="topbar">
-        <div class="wordmark">创作工作台</div>
-        <div class="system-state"><i :class="{ running: busy }"></i>{{ busy ? '任务执行中' : '本机系统就绪' }}</div>
-      </header>
-
-      <main v-if="activeView === 'create'">
-        <section class="hero">
-          <div>
-            <h1>开始创作</h1>
-            <p class="hero-copy">把模糊想法整理成可交付画面。先明确设计，再生成一张。</p>
-          </div>
-          <div class="budget-block">
-            <span>单项目生图上限</span>
-            <strong><small>¥</small>{{ state.config.limit }}</strong>
-            <b>01 IMAGE / REQUEST</b>
-          </div>
-        </section>
-
-        <section class="progress-strip" aria-label="创作流程">
-          <div class="active"><b>01</b><span>定义画面</span></div><i></i>
-          <div><b>02</b><span>完善提示词</span></div><i></i>
-          <div><b>03</b><span>确认费用</span></div><i></i>
-          <div><b>04</b><span>审片交付</span></div>
-          <small>单张优先 · 禁止自动返工</small>
-        </section>
-
-        <section class="workspace">
-          <aside class="brief-panel panel">
-            <div class="panel-heading">
-              <div><span>INPUT / BRIEF</span><h2>创作定义</h2></div>
-              <b>01</b>
-            </div>
-            <div class="form-grid">
-              <label class="wide">作品名称<input v-model.trim="form.project" :disabled="busy" /></label>
-              <label>画面编号<input v-model.number="form.shot_no" type="number" min="1" :disabled="busy" /></label>
-              <label>交付用途
-                <select v-model="form.purpose" :disabled="busy">
-                  <option>叙事静帧</option><option>宣传海报</option><option>产品主视觉</option><option>社交媒体配图</option>
-                </select>
-              </label>
-              <label class="full">想呈现什么
-                <textarea v-model="form.subject" rows="4" placeholder="先写主体、动作、环境和希望观众感受到什么。" :disabled="busy"></textarea>
-              </label>
-              <label class="full">目标受众<input v-model="form.audience" :disabled="busy" /></label>
-              <label class="full">视觉方向<input v-model="form.style" :disabled="busy" /></label>
-            </div>
-            <button class="action outline" :disabled="busy" @click="run('compose')">
-              <span>整理为提示词</span><b>FREE</b>
-            </button>
-
-            <div class="prompt-section">
-              <div class="subheading"><span>FINAL PROMPT</span><b>{{ promptLength }} CHARS</b></div>
-              <textarea v-model="form.prompt" rows="9" placeholder="整理后的提示词会出现在这里，你可以继续修改。" :disabled="busy"></textarea>
-              <button class="action dark" :disabled="busy" @click="refine">
-                <span>让创意模型优化</span><b>GPT‑5.6 →</b>
-              </button>
-            </div>
-
-            <div class="cost-control">
-              <label>本次费用上界 / 元<input v-model="form.price" type="number" min="0.01" step="0.01" :disabled="busy" /></label>
-              <p>输入你在平台核实的单次上界。系统会先预占，未知账单不会被当作免费。</p>
-            </div>
-            <button class="generate" :disabled="busy" @click="generate">
-              <span>{{ busy ? '任务处理中' : '确认费用并生成一张' }}</span><b>↗</b>
-            </button>
-          </aside>
-
-          <section class="output-column">
-            <article class="canvas-panel panel">
-              <div class="panel-heading compact">
-                <div><span>OUTPUT / FRAME</span><h2>{{ selected ? `${selected.project} · 画面 ${selected.shot_no}` : '等待第一张画面' }}</h2></div>
-                <span class="status" :data-status="selected?.status ?? 'draft'">{{ selected ? statusLabel(selected.status) : '未提交' }}</span>
-              </div>
-              <div class="canvas">
-                <img v-if="artworkUrl" :src="artworkUrl" alt="生成的画面" />
-                <div v-else class="canvas-empty">
-                  <div class="target-mark"><i></i><i></i></div>
-                  <b>{{ loadingImage ? '正在读取画面' : '画面将在这里出现' }}</b>
-                  <p>先把主体与动作说明白，再花第一次钱。</p>
-                </div>
-                <span class="coordinate top">KNT / VIEWPORT</span>
-                <span class="coordinate bottom">{{ state.config.size }}</span>
-              </div>
-              <div class="canvas-actions">
-                <button :disabled="busy || !selected" @click="recover">查询原任务</button>
-                <button :disabled="busy || !selected" @click="resume">继续未提交任务</button>
-                <button :disabled="!artworkUrl" @click="downloadArtwork">下载原图</button>
-              </div>
-            </article>
-
-            <div class="insight-grid">
-              <article class="review-panel panel">
-                <div class="panel-heading compact">
-                  <div><span>QUALITY GATE</span><h2>审片判断</h2></div>
-                  <button class="link-button" :disabled="busy || !selected?.has_image" @click="qualityCheck">视觉预筛 ↗</button>
-                </div>
-                <div class="criteria"><span>动作关系</span><span>人物情绪</span><span>材质光线</span><span>叙事焦点</span></div>
-                <p>先看人物是否真的在做这件事，再看表情、接触点、衣物材质与环境因果。模型负责预筛，你负责最终通过。</p>
-                <footer>生成成功 ≠ 可交付</footer>
-              </article>
-              <article class="model-panel panel">
-                <div class="panel-heading compact"><div><span>MODEL ROUTE</span><h2>模型分工</h2></div></div>
-                <dl><div><dt>创意 / 视觉</dt><dd>{{ state.config.chat }}</dd></div><div><dt>图片生成</dt><dd>{{ state.config.image }}</dd></div></dl>
-                <button class="link-button" @click="showSettings">查看完整配置 ↗</button>
-              </article>
-            </div>
-
-            <article class="history-panel">
-              <div class="section-heading"><div><span>RECENT FRAMES</span><h2>任务轨道</h2></div><b>{{ state.tasks.length.toString().padStart(2, '0') }} RECORDS</b></div>
-              <div v-if="state.tasks.length" class="task-track">
-                <button v-for="task in state.tasks" :key="task.request_id" :class="{ selected: task.request_id === selectedId }" @click="selectTask(task)">
-                  <i :data-status="task.status"></i><span>{{ task.project }}</span><strong>画面 {{ task.shot_no.toString().padStart(2, '0') }}</strong><small>{{ statusLabel(task.status) }} · {{ formatTime(task.created_at) }}</small>
-                </button>
-              </div>
-              <div v-else class="empty-track">没有历史任务。完成一次生成后，原任务会留在这里供查询与对账。</div>
-            </article>
-          </section>
-        </section>
-      </main>
-
-      <main v-else class="archive-view">
-        <section class="archive-header">
-          <div><p class="kicker">LOCAL PRODUCTION ARCHIVE</p><h1>作品档案。</h1><p>全部记录保存在本机；从这里回到原任务，不另建重复请求。</p></div>
-          <div class="archive-stats"><div><strong>{{ state.tasks.length }}</strong><span>全部记录</span></div><div><strong>{{ completedCount }}</strong><span>已有画面</span></div><div><strong>{{ waitingCount }}</strong><span>待核对</span></div></div>
-        </section>
-        <section v-if="state.tasks.length" class="archive-grid">
-          <button v-for="(task, index) in state.tasks" :key="task.request_id" @click="selectTask(task)">
-            <span class="index">{{ String(index + 1).padStart(2, '0') }}</span><div><small>{{ statusLabel(task.status) }} / {{ task.request_id.slice(-8) }}</small><h2>{{ task.project }}</h2><p>画面 {{ task.shot_no }} · 上界 ¥{{ (task.estimate_fen / 100).toFixed(2) }}</p></div><b>↗</b>
-          </button>
-        </section>
-        <div v-else class="archive-empty">当前还没有创作记录。</div>
-      </main>
-
-      <div class="notice" :data-tone="noticeTone" role="status" aria-live="polite"><i></i><span>{{ noticeText }}</span><button v-if="form.project" :disabled="busy" @click="run('budget')">预算概览</button><button v-if="selected" :disabled="busy" @click="settleBill">账单回填</button></div>
-      <footer class="global-footer"><span>KANTOKU / PERSONAL CREATIVE SYSTEM</span><span>LOCALHOST · PRIVATE WORKSPACE</span></footer>
-    </div>
-
-    <div v-if="modal.open" class="modal-backdrop" @click.self="closeModal(false)">
-      <section class="modal" role="dialog" aria-modal="true" :aria-label="modal.title">
-        <span>OPERATION CONFIRMATION</span><h2>{{ modal.title }}</h2><p>{{ modal.message }}</p>
-        <label v-if="modal.showPrice">平台最终实扣 / 元<input v-model="modal.price" type="number" min="0" step="0.01" autofocus /></label>
-        <div><button class="modal-cancel" @click="closeModal(false)">{{ modal.cancelLabel }}</button><button class="modal-confirm" @click="closeModal(true)">{{ modal.confirmLabel }}</button></div>
-      </section>
-    </div>
+  <div class="kantoku-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+    <SidebarNav :route-name="route.name" :active-domain-id="activeDomainId" :task-count="state.tasks.length" :collapsed="sidebarCollapsed" @navigate="navigate" @domain="chooseDomain" @toggle="sidebarCollapsed = !sidebarCollapsed" />
+    <section class="app-stage"><TopBar :title="routeTitle()" :busy="busy" @command="commandOpen = true" />
+      <Transition name="route" mode="out-in"><div :key="`${route.name}:${route.param ?? ''}`" class="route-stage">
+      <HomeView v-if="route.name === 'dashboard'" :tasks="state.tasks" :busy="busy" @navigate="navigate" @quick-start="quickStart" @open-task="selectTask" @create="startCreation" />
+      <WorkspaceView v-else-if="route.name === 'workspace'" :domain="activeDomain" :form="form" :generation="generation" :task="selected" :busy="busy" :approved="promptApproved" :version="promptVersion" :workflow="workflowSteps" :budget="currentBudget" :config="state.config" :estimated-fen="estimatedFen" :artwork-url="selected ? artworkUrls[selected.request_id] : undefined" :candidates="candidates" @open-candidate="(task) => void selectTask(task)" @reset="resetWorkspace" @switch-studio="activeDomainId = 'studio'" @compose="composePrompt" @refine="refinePrompt" @approve="approvePrompt" @generate="generate" @recover="recoverSelected" @resume="resumeSelected" @precheck="runQc" @decide="decideReview" @archive="archiveSelected" />
+      <RunsView v-else-if="route.name === 'runs'" :tasks="state.tasks" @open="selectTask" @create="navigate('/workspace')" />
+      <AssetsView v-else-if="route.name === 'assets'" :tasks="state.tasks" :artwork-urls="artworkUrls" @open="selectTask" />
+      <main v-else-if="route.name === 'run_detail'" class="page run-detail-page"><header class="page-header"><div><button class="back-link" @click="navigate('/runs')">← 任务与运行</button><h1>{{ runDetail?.project ?? '未找到运行' }}</h1><p v-if="runDetail">{{ runDetail.request_id }}</p></div><StatusBadge v-if="runDetail" :status="taskStatus(runDetail)" /></header><template v-if="runDetail"><nav class="detail-tabs"><button v-for="item in ([['overview','摘要'],['workflow','工作流'],['qc','质检'],['approval','审批']] as const)" :key="item[0]" :class="{ active: runDetailTab === item[0] }" @click="runDetailTab = item[0]">{{ item[1] }}</button></nav><section v-if="runDetailTab === 'overview'" class="surface detail-summary"><header class="panel-header"><div><span class="section-kicker">运行详情</span><h2>执行摘要</h2></div></header><dl><div><dt>创作域</dt><dd>Studio</dd></div><div><dt>工作流</dt><dd>图片生产</dd></div><div><dt>预估</dt><dd>{{ formatFen(runDetail.estimate_fen) }}</dd></div><div><dt>实扣</dt><dd>{{ formatFen(runDetail.actual_fen) }}</dd></div><div><dt>账本</dt><dd>{{ runDetail.ledger_status }}</dd></div><div><dt>产物</dt><dd>{{ runDetail.has_image ? 1 : 0 }}</dd></div></dl><div v-if="runDetail.error" class="error-box">{{ runDetail.error }}</div><div class="detail-actions"><button class="ui-button" @click="selectTask(runDetail)">打开 Workspace</button><button class="ui-button" @click="settleSelected">回填账单</button></div></section><section v-else-if="runDetailTab === 'workflow'" class="surface detail-tab-panel"><WorkflowProgress :steps="buildWorkflow(runDetail)" /></section><section v-else-if="runDetailTab === 'qc'" class="surface detail-tab-panel"><QcPanel :qc="runDetail.qc" /></section><section v-else class="surface detail-tab-panel"><ApprovalPanel :task="runDetail" :busy="busy" @precheck="runQc" @decide="decideReview" @archive="archiveSelected" /></section></template><EmptyState v-else title="未找到运行" description="该运行不存在或已经从本机记录中移除。" /></main>
+      <main v-else-if="route.name === 'history'" class="page"><header class="page-header"><div><span class="section-kicker">历史</span><h1>历史记录</h1><p>按时间查看真实 Production Run、费用与 Artifact 状态。</p></div></header><section class="timeline-history"><article v-for="task in state.tasks" :key="task.request_id"><span></span><div class="surface"><header><div><strong>{{ task.project }} · #{{ task.shot_no }}</strong><small>Studio · 图片生产</small></div><StatusBadge :status="taskStatus(task)" /></header><p>{{ task.prompt }}</p><footer><time>{{ formatTime(task.created_at) }}</time><b>{{ formatFen(task.actual_fen ?? task.estimate_fen) }}</b><button class="text-action" @click="selectTask(task, `/runs/${encodeURIComponent(task.request_id)}`)">查看 Trace →</button></footer></div></article><EmptyState v-if="!state.tasks.length" title="暂无历史" description="运行历史会来自真实任务记录。" /></section></main>
+      <main v-else-if="route.name === 'skills'" class="page"><header class="page-header"><div><span class="section-kicker">技能注册表</span><h1>技能</h1><p>Skill 描述如何完成任务；Tool 负责具体模型或 API 能力。</p></div><span class="count-chip">{{ allSkills.length }} 已注册</span></header><section class="skill-grid"><article v-for="item in allSkills" :key="`${item.domain.id}-${item.id}`" class="surface skill-card"><header><span class="domain-icon">{{ item.domain.icon }}</span><StatusBadge :status="item.status" /></header><span class="section-kicker">{{ item.domain.name }}</span><h2>{{ item.name }}</h2><p>{{ item.description }}</p><footer><span>所需工具</span><div><b v-for="tool in item.requiredTools" :key="tool">{{ tool }}</b></div></footer></article></section></main>
+      <main v-else-if="route.name === 'settings'" class="page"><header class="page-header"><div><span class="section-kicker">模型配置</span><h1>模型与供应商</h1><p>当前配置来自本机 settings；API Key 不在页面中显示。</p></div></header><section class="settings-grid"><article v-for="provider in [{ icon: 'LLM', label: '文本 / Prompt', name: state.config.chat, note: '统一文本模型出口' }, { icon: 'IMG', label: '图像生成', name: state.config.image, note: state.config.size }, { icon: 'VLM', label: '视觉 / 质检', name: state.config.vision, note: '质量预筛；人工终审保留' }]" :key="provider.icon" class="surface provider-card"><span class="provider-icon">{{ provider.icon }}</span><div><small>{{ provider.label }}</small><h2>{{ provider.name }}</h2><p>{{ provider.note }}</p></div><StatusBadge status="available" /></article></section><article class="surface security-note"><span>KEY</span><div><h2>凭据仅保存在本机</h2><p>密钥只从本机 `.env` 读取，本页面不会返回、显示或记录明文凭据。</p></div></article></main>
+      <main v-else class="page domain-page"><header class="page-header"><div><span class="section-kicker">创作域</span><h1>{{ activeDomain.name }} · {{ activeDomain.label }}</h1><p>{{ activeDomain.description }}</p></div><StatusBadge :status="activeDomain.status" /></header><div class="domain-detail-grid"><article class="surface"><header class="panel-header"><div><span class="section-kicker">工作流</span><h2>可用工作流</h2></div></header><ul class="definition-list"><li v-for="workflow in activeDomain.workflows" :key="workflow"><span>◇</span><strong>{{ workflow }}</strong></li><li v-if="!activeDomain.workflows.length"><span>—</span><strong>尚未登记 Workflow</strong></li></ul></article><article class="surface"><header class="panel-header"><div><span class="section-kicker">能力</span><h2>能力组合</h2></div></header><div class="capability-list"><span v-for="capability in activeDomain.capabilities" :key="capability">{{ capability }}</span><p v-if="!activeDomain.capabilities.length">待上线</p></div></article></div><section class="surface domain-action"><div><h2>{{ activeDomain.status === 'available' ? '开始使用当前 Domain' : '当前不提供伪执行' }}</h2><p>{{ activeDomain.status === 'available' ? '进入统一 Workspace 创建真实 Run。' : 'Domain 定义可见，但外部 Adapter 与 Workflow 尚未完成。' }}</p></div><button class="ui-button primary" :disabled="activeDomain.status !== 'available'" @click="quickStart(activeDomain)">进入 Workspace</button></section></main>
+      </div></Transition>
+      <div class="toast" :data-tone="notice.tone"><i></i><span>{{ notice.text }}</span></div><footer class="product-footer"><span>ONE CORE. UNLIMITED CREATIONS.</span><span>KANTOKU · LOCAL PRODUCTION SYSTEM</span></footer>
+    </section>
+    <CommandPalette :open="commandOpen" @close="commandOpen = false" @navigate="navigate" @domain="openDomain" />
+    <div v-if="modal.open" class="modal-backdrop" @click.self="closeModal(false)"><section class="modal"><span class="section-kicker">人工确认</span><h2>{{ modal.title }}</h2><p>{{ modal.message }}</p><label v-if="modal.input">平台最终实扣 / 元<input v-model="modal.value" class="ui-input" type="number" min="0" step="0.01" /></label><footer><button class="ui-button" @click="closeModal(false)">{{ modal.cancelLabel }}</button><button class="ui-button primary" @click="closeModal(true)">{{ modal.confirmLabel }}</button></footer></section></div>
   </div>
 </template>

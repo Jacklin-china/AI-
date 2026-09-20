@@ -21,6 +21,9 @@ dev = ["pytest>=8.0", "ruff>=0.5"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+# 排除 AI 协作工作目录：其中的 .py 是一次性取色/测量/截图脚本，
+# 不属于项目源码，不应进入 lint 门禁（详见 AGENTS.md 的完成标准）。
+exclude = [".workbuddy", "frontend"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "SIM"]

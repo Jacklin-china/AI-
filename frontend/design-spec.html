@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="zh-CN" data-page-node-id="vVULNrBeGJTh4zNIc2ldBx">
+<head data-page-node-id="RxLdZBC3z7mKbTGB1XjP9b">
+<meta charset="utf-8" data-page-node-id="j7kd7rK0rr0v8ULlivvo6q" />
+<meta name="viewport" content="width=device-width, initial-scale=1" data-page-node-id="LEl3Szogv3LBariApalB0p" />
+<title>监督酱 · 界面设计方案 v2</title>
+<style>
+  /* ==========================================================
+     本文件本身就是用「提案中的新规范」排的：所见即所得。
+     ========================================================== */
+  :root{
+    --canvas:#f6f7f8; --chrome:#f2f2f2; --surface:#ffffff; --subtle:#f8f9fa;
+    --ink:#171a1e; --ink-2:#5c646e; --ink-3:#8b9199;
+    --line:#e3e6ea; --line-strong:#c9cdd4;
+    --accent:#425cc7; --accent-hover:#374cae; --accent-active:#2f4198; --accent-soft:#eef1fb;
+    --danger:#c64444;
+    --r-control:8px; --r-card:16px; --r-composer:22px; --r-tile:4px; --r-pill:999px;
+    --font-ui:"PingFang SC","HarmonyOS Sans SC","MiSans","Source Han Sans SC","Noto Sans SC","Microsoft YaHei",Inter,-apple-system,"Segoe UI",sans-serif;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--canvas);color:var(--ink);font-family:var(--font-ui);font-size:14px;line-height:1.6;-webkit-font-smoothing:antialiased}
+  .wrap{max-width:1080px;margin:0 auto;padding:56px 32px 96px}
+  h1,h2,h3,p{margin-block-start:0}
+  a{color:var(--accent)}
+
+  /* ---- 页头 ---- */
+  .doc-head{margin-bottom:52px}
+  .doc-head .eyebrow{font-size:12px;color:var(--ink-3);letter-spacing:.02em}
+  .doc-head h1{margin:10px 0 0;font-size:34px;font-weight:600;letter-spacing:-.03em;line-height:1.2}
+  .doc-head p{margin:12px 0 0;max-width:62ch;color:var(--ink-2);font-size:15px}
+
+  section{margin-top:56px}
+  .sec-head{display:flex;align-items:baseline;gap:12px;padding-bottom:14px;border-bottom:1px solid var(--line);margin-bottom:26px}
+  .sec-head h2{font-size:19px;font-weight:600;letter-spacing:-.02em}
+  .sec-head span{font-size:12px;color:var(--ink-3)}
+  h3{font-size:14px;font-weight:600;margin:30px 0 12px}
+  p.note{margin:0 0 16px;max-width:70ch;color:var(--ink-2);font-size:13.5px}
+
+  /* ---- 卡片 ---- */
+  .card{padding:26px 28px;border:0;border-radius:var(--r-card);background:var(--surface);box-shadow:0 2px 8px rgba(20,24,31,.05),0 1px 2px rgba(20,24,31,.04)}
+  .card + .card{margin-top:16px}
+  .grid-2{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+  @media(max-width:820px){.grid-2{grid-template-columns:1fr}}
+
+  /* ---- 色板 ---- */
+  .swatches{display:grid;grid-template-columns:repeat(6,1fr);gap:10px}
+  .sw{overflow:hidden;border-radius:10px;border:1px solid var(--line)}
+  .sw i{display:block;height:62px}
+  .sw b{display:block;padding:8px 10px 2px;font-size:12px;font-weight:600}
+  .sw small{display:block;padding:0 10px 9px;color:var(--ink-3);font-size:11px;font-variant-numeric:tabular-nums}
+
+  /* ---- 字体阶梯 ---- */
+  .type-row{display:grid;grid-template-columns:96px 1fr auto;gap:18px;align-items:baseline;padding:13px 0;border-top:1px solid var(--line)}
+  .type-row:first-child{border-top:0}
+  .type-row em{color:var(--ink-3);font-size:11.5px;font-style:normal}
+  .type-row code{padding:2px 7px;border-radius:5px;background:var(--subtle);color:var(--ink-2);font-size:11px}
+
+  /* ===== 按钮系统（本方案核心） ===== */
+  .btn{display:inline-flex;align-items:center;justify-content:center;gap:7px;height:34px;padding:0 14px;border:1px solid transparent;border-radius:var(--r-control);background:transparent;color:var(--ink);font-family:inherit;font-size:13px;font-weight:500;cursor:pointer;
+       transition:background .12s ease,border-color .12s ease,color .12s ease,transform .08s ease,box-shadow .12s ease}
+  .btn:active:not(:disabled){transform:translateY(1px)}
+  .btn:disabled{opacity:.45;cursor:not-allowed}
+  .btn:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+
+  .btn-primary{background:var(--accent);color:#fff;box-shadow:0 1px 2px rgba(47,65,152,.24)}
+  .btn-primary:hover:not(:disabled){background:var(--accent-hover)}
+  .btn-primary:active:not(:disabled){background:var(--accent-active)}
+
+  .btn-secondary{background:var(--surface);border-color:var(--line-strong);color:var(--ink)}
+  .btn-secondary:hover:not(:disabled){background:var(--subtle);border-color:#b6bcc6}
+
+  .btn-quiet{color:var(--ink-2)}
+  .btn-quiet:hover:not(:disabled){background:var(--chrome);color:var(--ink)}
+
+  .btn-danger{background:var(--surface);border-color:#e3c4c4;color:var(--danger)}
+  .btn-danger:hover:not(:disabled){background:#fbf1f1}
+
+  .btn-lg{height:42px;padding:0 20px;font-size:14px}
+  .btn-sm{height:28px;padding:0 11px;font-size:12.5px}
+  .btn-icon{width:34px;padding:0}
+  .btn-icon.btn-lg{width:42px}
+  .btn-icon.btn-sm{width:28px}
+
+  .btn-row{display:flex;flex-wrap:wrap;gap:10px;align-items:center}
+  .demo{display:flex;flex-wrap:wrap;gap:10px;align-items:center;padding:18px;border-radius:12px;background:var(--subtle);border:1px solid var(--line)}
+  .demo.on-white{background:var(--surface)}
+  .lbl{font-size:11.5px;color:var(--ink-3);margin-bottom:8px;display:block}
+
+  /* 胶囊 / 分段控件 */
+  .chips{display:flex;flex-wrap:wrap;gap:7px}
+  .chip{display:inline-flex;align-items:center;gap:6px;height:30px;padding:0 13px;border:1px solid var(--line-strong);border-radius:var(--r-pill);background:var(--surface);color:var(--ink-2);font-size:12.5px;cursor:pointer;transition:.12s ease}
+  .chip:hover{border-color:#b6bcc6;color:var(--ink)}
+  .chip[aria-pressed="true"]{background:var(--accent-soft);border-color:#c3cdec;color:var(--accent);font-weight:500}
+  .seg{display:inline-flex;gap:2px;padding:2px;border:1px solid var(--line);border-radius:var(--r-pill);background:var(--chrome)}
+  .seg button{height:28px;padding:0 14px;border:0;border-radius:var(--r-pill);background:transparent;color:var(--ink-2);font-size:12.5px;cursor:pointer}
+  .seg button[aria-pressed="true"]{background:var(--surface);color:var(--ink);font-weight:500;box-shadow:0 1px 2px rgba(20,25,32,.09)}
+
+  /* 旋转指示器 */
+  .spin{animation:spin 1s linear infinite}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* ---- Composer（记忆点） ---- */
+  .composer{max-width:660px;padding:20px;border:0;border-radius:var(--r-composer);background:var(--surface);box-shadow:0 10px 34px rgba(20,24,31,.07)}
+  .composer.focus{box-shadow:0 10px 34px rgba(20,24,31,.07),0 0 0 3px rgba(66,92,199,.16)}
+  .composer textarea{display:block;width:100%;min-height:96px;padding:6px 8px;border:0;background:transparent;color:var(--ink);font-family:inherit;font-size:15px;line-height:1.65;resize:none;outline:none}
+  .composer textarea::placeholder{color:var(--ink-3)}
+  .composer footer{display:flex;align-items:center;justify-content:space-between;gap:14px;margin-top:12px;padding-top:12px;border-top:1px solid var(--line)}
+  .composer .tools{display:flex;gap:7px;flex-wrap:wrap}
+  .kbd{padding:1px 6px;border:1px solid var(--line);border-radius:5px;background:var(--subtle);color:var(--ink-3);font-size:10.5px}
+
+  /* ---- 线框 ---- */
+  .wire{display:grid;grid-template-columns:200px 1fr;gap:0;overflow:hidden;border-radius:14px;border:1px solid var(--line);background:var(--surface);min-height:330px}
+  .wire .nav{background:var(--chrome);padding:16px 12px;border-right:1px solid var(--line)}
+  .wire .nav .it{height:30px;margin-bottom:5px;border-radius:8px;background:rgba(255,255,255,.6)}
+  .wire .nav .it.on{background:var(--surface);box-shadow:0 1px 2px rgba(20,25,32,.07)}
+  .wire .nav .grp{margin-top:18px;font-size:10.5px;color:var(--ink-3);padding:0 4px 6px}
+  .wire .body{padding:22px 24px;display:grid;gap:16px;align-content:start;justify-items:center}
+  .wire .hero{width:100%;max-width:520px;height:132px;border-radius:22px;background:var(--surface);border:1px solid var(--line);box-shadow:0 10px 34px rgba(20,24,31,.06)}
+  .wire .grid4{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;width:100%;max-width:520px}
+  .wire .grid4 i{display:block;height:74px;border-radius:8px;background:var(--subtle);border:1px solid var(--line)}
+  .wire .wall{display:grid;grid-template-columns:repeat(auto-fill,minmax(96px,1fr));gap:2px;width:100%}
+  .wire .wall i{display:block;aspect-ratio:1;border-radius:4px;background:#e7e9ec}
+
+  ul.spec{margin:0;padding-left:20px;color:var(--ink-2);font-size:13.5px}
+  ul.spec li{margin:5px 0}
+  ul.spec li b{color:var(--ink);font-weight:600}
+  table{width:100%;border-collapse:collapse;font-size:13px}
+  th,td{padding:9px 10px;text-align:left;border-bottom:1px solid var(--line)}
+  th{color:var(--ink-3);font-size:11.5px;font-weight:600}
+  td:first-child{color:var(--ink);font-weight:500;white-space:nowrap}
+  .tag{display:inline-block;padding:2px 8px;border-radius:var(--r-pill);background:var(--accent-soft);color:var(--accent);font-size:11px;font-weight:500}
+  .tag.grey{background:var(--chrome);color:var(--ink-2)}
+</style>
+</head>
+<body data-page-node-id="gXzo7KIonDAhjWjIjYMVvQ">
+<div class="wrap" data-page-node-id="sg9QZqSMUlHu29VUHCCew2">
+
+  <header class="doc-head" data-page-node-id="QDVDtvbobDtVrZ8xB5hG3U">
+    <span class="eyebrow" data-page-node-id="QyPP6nC5NbBM67oyGACxCq">KANTOKU · 监督酱 — 界面设计方案 v2</span>
+    <h1 data-page-node-id="ZJ6fZwOgcrDoyGK6ohXS4r">把创作入口收敛成一个输入框，<br data-page-node-id="rHFZOXasZ9NELmQqwkCOIJ">把结果摆成可以挑的样子</h1>
+    <p data-page-node-id="xqzHc8H6R1BXL4xiuG2SJq">参考小云雀与既梦的交互范式，针对「本地 AI 漫剧生产工作台」的真实能力做转译。不新增伪功能，不伪造生成结果——所有改动都落在现有数据与接口能支撑的范围内。</p>
+  </header>
+
+  <!-- ============ 1 ============ -->
+  <section data-page-node-id="l6CNiGc0F4BGMW0HN3POMG">
+    <div class="sec-head" data-page-node-id="uSoMNHXfoghyIh7rCCmQbP"><h2 data-page-node-id="RZSoGWEogDGuZKXjmBF4Mt">一 · 从两家产品提炼的四个范式</h2><span data-page-node-id="YkWZaA2o65LPQH7NDAeUGS">可迁移的部分</span></div>
+    <p class="note" data-page-node-id="gEcFGK2wfGDyHUAxFSBpt8">小云雀与既梦形态不同（前者移动端对话流，后者 PC 左右分栏），但有四个共同决策。它们就是这次升级的骨架。</p>
+    <div class="grid-2" data-page-node-id="dHOqoWyQ9UNEVIuMBFQDMt">
+      <div class="card" data-page-node-id="SNRGfMaPbKX63cuc26V82G">
+        <h3 data-page-node-id="UyqsuUnEAdyIXxHoj9avTb">1 · 单一输入框驱动</h3>
+        <p class="note" style="margin:0" data-page-node-id="eoWJxCv4NvkH6JCVrdLFSe">所有创作从一个输入框开始。模型、尺寸、数量这些参数不另开面板，而是<strong data-page-node-id="U6S0yIDqymU6P96PNBjcOK">内嵌在输入区底部</strong>，随手写随时改。用户不需要先"配置"再"创作"。</p>
+      </div>
+      <div class="card" data-page-node-id="lu9RRnJgYKse79raJoJLEH">
+        <h3 data-page-node-id="Wdl4cpAcNvlKvx8n96gLCi">2 · 灵感模板可一键做同款</h3>
+        <p class="note" style="margin:0" data-page-node-id="llexm8Zl3HXxHseu2nnoL8">首页不只有输入框，下方是模板流。看到喜欢的直接套用，把"从零描述"降级为"改一点点"。这是降低门槛最有效的一环。</p>
+      </div>
+      <div class="card" data-page-node-id="wxKOAHFCBEbgXBVDPR9fsn">
+        <h3 data-page-node-id="VkEJLCVWtzf1u6STcGr16b">3 · 结果并排，供挑选</h3>
+        <p class="note" style="margin:0" data-page-node-id="P9dI4ABdmJFGWY49oyYMQn">生成不是终点，挑选才是。结果以网格并排呈现，配「重新编辑 / 再次生成」，让"不满意"有明确出口。</p>
+      </div>
+      <div class="card" data-page-node-id="nwX5skU51ho2eskNCAiTrD">
+        <h3 data-page-node-id="pnqZ0umcCAYRirMoETRIFK">4 · 左侧导航带最近创作</h3>
+        <p class="note" style="margin:0" data-page-node-id="t61CAa5SiPsis7alRgRTcp">历史创作记录直接挂在导航里，回来就能接着改，而不是先进"资产库"再翻找。</p>
+      </div>
+    </div>
+    <p class="note" style="margin-top:18px" data-page-node-id="h59Qc2feKMlqrxWsi72GP4"><strong data-page-node-id="7WA1QZm2pqtC98ut9dGEgY">本次取舍：</strong>你选择保留现有导航（不重构信息架构），因此范式 4 只做<strong data-page-node-id="WhYOCWm60Sj8jrRGdAIlrl">视觉升级</strong>；范式 1、2、3 完整落地。</p>
+  </section>
+
+  <!-- ============ 2 ============ -->
+  <section data-page-node-id="WO4Z0RZQIhzEhL937fCpBI">
+    <div class="sec-head" data-page-node-id="REjnXzsqhOQenWod2tDELF"><h2 data-page-node-id="M2WpuW8uh6SFpnYrEhpHNW">二 · 字体</h2><span data-page-node-id="v25H8y4bUUBHxMXZtNjopc">单一字族，靠字号与字重拉开层级</span></div>
+    <p class="note" data-page-node-id="z7hJXH41gxz1Gd8Uzk06VN">上一版首页标题用了衬线体（Source Han Serif）。小云雀、既梦都是<strong data-page-node-id="LzaQmmOmEiH9GOaq2EqctF">无衬线、字重对比强烈</strong>的现代中文界面——衬线体来自另一份参考稿，与这次方向不符，所以撤掉，改为全局单一无衬线字族。</p>
+    <div class="card" data-page-node-id="vPZ0Amd5sptBLuutLFSVJ8">
+      <h3 data-page-node-id="NEYCyP5UTFQqW5bliLNJbv">字族</h3>
+      <p class="note" data-page-node-id="0Pq4hqHhiOcjCEF7oGodX1"><code data-page-node-id="zwMtIJuhaty0ClZFWAtNza">"PingFang SC", "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", "Noto Sans SC", "Microsoft YaHei", Inter</code><br data-page-node-id="p19VLmYaJMxe1Z1LK2qIbU">
+      中文优先取系统高质量黑体，西文回落 Inter。不引入 Web Font——本地工具应当秒开，不依赖网络。</p>
+      <h3 data-page-node-id="LTVXhaJ1vWRbB7IjYbEESQ">字号阶梯</h3>
+      <div class="type-row" data-page-node-id="TO29iHq2YmAXO0YhrasbVT"><em data-page-node-id="Y0jdEnJdiVYP9JthOiBoI2">Hero</em><span style="font-size:28px;font-weight:600;letter-spacing:-.025em;line-height:1.25" data-page-node-id="RIuMAVskpO2KPe7Ku3XvpA">描述你要做的这一镜</span><code data-page-node-id="RrpbPYAqUDtJEJsCain7rz">28 / 600 / -.025em</code></div>
+      <div class="type-row" data-page-node-id="Jq48BQOaeyFqcqxz4qY3np"><em data-page-node-id="nDhgl4WfqgzWmDlZeQElb4">页面标题</em><span style="font-size:21px;font-weight:600;letter-spacing:-.02em" data-page-node-id="Atm3uP1JR0cj4z3YJ0zU73">任务与运行</span><code data-page-node-id="laLcdkIfdYpWJ5lIvsHAk9">21 / 600</code></div>
+      <div class="type-row" data-page-node-id="aqV3mc5fojJWIOsYVnf15b"><em data-page-node-id="qSVqvkAO3GafRazoikh0jg">区块标题</em><span style="font-size:16px;font-weight:600" data-page-node-id="sSDKyvojhqhL6fopa3HFuF">生产流水线</span><code data-page-node-id="21e8L1qYz0flAqHPp1rdBF">16 / 600</code></div>
+      <div class="type-row" data-page-node-id="3PLMz22tpQGLdRjFJK8wYA"><em data-page-node-id="YYWoT1oER2AAh1B6f4E4tw">正文</em><span style="font-size:14px" data-page-node-id="9niYVZIXcWdD9oWAy7VNiL">让 AI 创作可控、可追溯、可规模化</span><code data-page-node-id="I4ypkWCzQxWS5Wneqv2CgX">14 / 400 / 1.6</code></div>
+      <div class="type-row" data-page-node-id="p1TFKwErM47akmNcjCyft9"><em data-page-node-id="QcxkvBRIue4XujRJZVdU7v">控件</em><span style="font-size:13px;font-weight:500" data-page-node-id="LxbLc4jGQXUPV9QQfY32Rr">开始创作</span><code data-page-node-id="1wwUGMRARrlRUtUFehBDPg">13 / 500</code></div>
+      <div class="type-row" data-page-node-id="UoxOFrN9GKT6NwHPGuiH3w"><em data-page-node-id="nKgTS6lWz4oo33kp4a6dNJ">辅助信息</em><span style="font-size:12px;color:var(--ink-2)" data-page-node-id="spx1eXDlCcEo35tDGiBnab">Studio · 图片生产 · 03-14 21:40</span><code data-page-node-id="keEkbyo8CnlGzO3KG9Y9sF">12 / 400</code></div>
+      <div class="type-row" data-page-node-id="a9TkR9lEZfnIpGH4jIPgtQ"><em data-page-node-id="FbPDWOoFHi94S93AjhBfBd">标注</em><span style="font-size:11px;color:var(--ink-3)" data-page-node-id="ROibp6uHtuvggTjpK7ps7m">单图预算预占 ¥0.30</span><code data-page-node-id="UaOOY3B3f0ar94NlcDjRkz">11 / 400</code></div>
+    </div>
+    <p class="note" style="margin-top:16px" data-page-node-id="55jbN7tYF8bNzmqkkE1Yqt">层级靠<strong data-page-node-id="DarQJQ3ywEhEbSIrnPHWYs">字号 + 字重 + 颜色</strong>三重落差，而不是靠给标题加 ALL-CAPS 小标签。同时去掉表格表头的全大写与宽字距——那是模板味很重的处理。</p>
+  </section>
+
+  <!-- ============ 3 ============ -->
+  <section data-page-node-id="3csFuZVPuBv40gqFFHEmj6">
+    <div class="sec-head" data-page-node-id="nWBtC7Fnd2IEjcUokc0WIU"><h2 data-page-node-id="Ww5vO2tqR2GDLFKlwNfEEe">三 · 色彩</h2><span data-page-node-id="Hy3ta2G14ONR6Z2ct4BD2Y">沿用现有中性冷灰，只加强对比</span></div>
+    <div class="card" data-page-node-id="Txqn8VyRnUKA7eZJXFANrs">
+      <div class="swatches" data-page-node-id="HM2gTavDXlRdQN5Yp7QRvK">
+        <div class="sw" data-page-node-id="8REDG8Kqa0BDCI4wdnzSs1"><i style="background:#f6f7f8" data-page-node-id="CqwWxKvzDldhxZEY0UuFXp"></i><b data-page-node-id="6oC5PFfnc6rzcKqEFQq9X1">画布</b><small data-page-node-id="bcDEsbUGCaO13S2lkzwK1k">#f6f7f8</small></div>
+        <div class="sw" data-page-node-id="D4mT0lO3sVrXlzNf7HHfrO"><i style="background:#f2f2f2" data-page-node-id="wXGJhgNyhB8hFGf82xh2rW"></i><b data-page-node-id="KBDeY5CrVfdVbIV77WKaEp">外壳</b><small data-page-node-id="H1OGRUdPuWbK6fa1PdNsFe">#f2f2f2</small></div>
+        <div class="sw" data-page-node-id="4zTSisDHQqHZXmabrFandA"><i style="background:#ffffff" data-page-node-id="9ADj80b6S1iCgEyMsFJ20c"></i><b data-page-node-id="oNeFHUVvzf9EYlcmnwXpbG">面板</b><small data-page-node-id="ddoBFnbebD5gBlNR4nhoiF">#ffffff</small></div>
+        <div class="sw" data-page-node-id="SEbPSSJUsYSEJsAtR4TPRS"><i style="background:#f8f9fa" data-page-node-id="kuTnxSvgoDu8ev67THOsYv"></i><b data-page-node-id="6VjEM6mQfx3K7NGuznqtQ8">次级面</b><small data-page-node-id="SA9YPfcvZXeN9QVA9Rcx57">#f8f9fa</small></div>
+        <div class="sw" data-page-node-id="v9q7uuQxm71pu9ZDZPAMBB"><i style="background:#171a1e" data-page-node-id="gs2VeVB5zSocovXGBk9QDs"></i><b data-page-node-id="BiSr7K1qhjA8NHWl1P1Iye">主文字</b><small data-page-node-id="5F2R2QwGhx3ZkJUQhqAxt5">#171a1e</small></div>
+        <div class="sw" data-page-node-id="chzq5MLrEAWgJInjBP6vGx"><i style="background:#425cc7" data-page-node-id="PBIBGSljqvecTF0OHkLHHx"></i><b data-page-node-id="FUETsMkRgEEviWaG7xc6C6">强调</b><small data-page-node-id="HngRTZqWyM3vbghUXAa1Nv">#425cc7</small></div>
+      </div>
+      <p class="note" style="margin:18px 0 0" data-page-node-id="b61JuHS2bn2R6exFHsh7bC">色板不动——它已经和既梦的浅灰导航 + 白内容区一致，上一轮顶栏改成 #f2f2f2 后外壳也统一了。唯一调整是主文字 <code data-page-node-id="iXlLAsACJDudpy8x3r8Fuy">#1c2025</code> → <code data-page-node-id="RtAZBKuJrsqiJLyGbnBqVQ">#171a1e</code>，把正文对比度从 13.9:1 提到 15.8:1。</p>
+    </div>
+  </section>
+
+  <!-- ============ 4 ============ -->
+  <section data-page-node-id="gf5zu2s4lKHWHcioPDg7CZ">
+    <div class="sec-head" data-page-node-id="FRPAKyJPV1R3nUMFLyvHmC"><h2 data-page-node-id="ZCwFz6lZ3IxOKZVnpL5LMz">四 · 圆角与尺寸</h2><span data-page-node-id="IJDofCytPpqR3lN7qL5SvJ">按层级分配，不再统一一个值</span></div>
+    <div class="card" data-page-node-id="RyyXk0oCLHHYP7U4BVJM88">
+      <table data-page-node-id="YQxJIwGuNqxUNzju1VoDSv">
+        <tr data-page-node-id="ZOl9GcwUH4mARJJ4sYZxeW"><th data-page-node-id="cb2JwAQTAnKKXCFMFxXCUA">Token</th><th data-page-node-id="otYRXEmGnEfRvd6bhPxwYr">值</th><th data-page-node-id="SG8CQZJlSm4KGY17mQkvyB">用于</th></tr>
+        <tr data-page-node-id="W9WuQHTU1DOBlE8KpehzB5"><td data-page-node-id="Rsvwzsb19LPErskYBBzsgR">--radius-control</td><td data-page-node-id="KWg0xS5d060CG09X5vtdl3">6px → <b data-page-node-id="2itgKFRyt3dqTUZoEQfjAc">8px</b></td><td data-page-node-id="BFHSLTBcRe2JShzmgxawzf">按钮、输入框、选择器</td></tr>
+        <tr data-page-node-id="056Ow6d77HfCDM2IvUyn4D"><td data-page-node-id="WSQOSIFwoGYvYLvoNMEIsI">--radius-card</td><td data-page-node-id="Snb6QFGLVB6bGhYhBOoqlJ">14px → <b data-page-node-id="5bnTJeg9nEo5Mvi0MNbKuj">16px</b></td><td data-page-node-id="bFJphZWvlyx5hnkjUR35hc">卡片与面板</td></tr>
+        <tr data-page-node-id="x5WgK9W3ctUVikh5kWXpt1"><td data-page-node-id="FSYVQPOTdmAQNUljoK3UMD">--radius-composer</td><td data-page-node-id="QgWfjZ1hEBmCywkP7jsAnA"><b data-page-node-id="K779MGnSeOnJVhYQ53M3Sf">22px</b>（新）</td><td data-page-node-id="9DlRF49sqeVEflx7CRo133">首页输入卡——全局唯一的大圆角，是整页的记忆点</td></tr>
+        <tr data-page-node-id="IcSEQoFT3luPupqsKl8Y5i"><td data-page-node-id="Y2C43KyUQIIaSXucmLYYEa">--radius-tile</td><td data-page-node-id="Bo5SmfA2BsErVWy235rby4">3px → <b data-page-node-id="u7gCK9ZraN4qhShy4bmeHe">4px</b></td><td data-page-node-id="9c6MmRGwGH6AwJGirm54JV">资产瓦片（密集图墙，近直角）</td></tr>
+        <tr data-page-node-id="iIGgKWEKV68MAGEOWdxWyA"><td data-page-node-id="kirpA3kDVgeDf7L9UlqGzG">--radius-pill</td><td data-page-node-id="LUT6YpISOr4eThmn53Rqdv">999px</td><td data-page-node-id="fKJ9N0AGWIVKlc3LdLBGvZ">胶囊、徽章、分段控件</td></tr>
+      </table>
+      <p class="note" style="margin:16px 0 0" data-page-node-id="6z1UXa1WCOrYJCZF7HWyLu">原则：<strong data-page-node-id="enXGTjNBmFXxt1TDzC5hK0">越靠近输入动作，圆角越大</strong>。输入卡 22px 是最大值，往下逐级收敛到瓦片的 4px。这样层级是能"摸"出来的。</p>
+    </div>
+  </section>
+
+  <!-- ============ 5 · 按钮 ============ -->
+  <section data-page-node-id="xcP2D0KYuVIjNVxDKt2DBX">
+    <div class="sec-head" data-page-node-id="W93DdwgJRmL0cOBl0O6wVB"><h2 data-page-node-id="v2H1U1AySoULINM17pVbKS">五 · 按钮与控件</h2><span data-page-node-id="RIAMdt5NNBdbw5mmj0gW8T">五个层级 × 三种尺寸</span></div>
+    <p class="note" data-page-node-id="sBaSC1UT4lO5wZqvIoDsDr">现有 <code data-page-node-id="6bOH6Zn8ghpSBatXdxzina">.ui-button</code> 只有一个实心样式加一个 primary，靠 <code data-page-node-id="FmjsBK2ZeP3mwgKM1XFKI6">kbd</code> 子元素临时拼装。改为完整的层级体系，所有状态（悬停 / 按下 / 禁用 / 加载 / 聚焦）都有定义。</p>
+
+    <div class="card" data-page-node-id="p17WFyR4fDB67mfWw6FJun">
+      <h3 data-page-node-id="oHxpWpmVR5tzJ0BervBBG4">层级</h3>
+      <div class="demo on-white" data-page-node-id="AotqW8wtuDsbYVcLzDp3xs">
+        <button class="btn btn-primary" data-page-node-id="rAlvRA6YTBXZBDhHOOXFqr">开始创作</button>
+        <button class="btn btn-secondary" data-page-node-id="J6EeaaIuYEQ5VEXwMIBzql">保存草稿</button>
+        <button class="btn btn-quiet" data-page-node-id="W4C6lQzvApaHTBqXlSZaxt">取消</button>
+        <button class="btn btn-danger" data-page-node-id="qHxK9UODs82y7NkLC8HBQC">删除</button>
+      </div>
+      <p class="note" style="margin:12px 0 0" data-page-node-id="Ey3Ais9mgEKDT10669ohiF"><span class="tag" data-page-node-id="oy8Sr1DtWgCE6CmSV4eidz">Primary</span> 一个视图里最多一个，是页面唯一想让你按的按钮。 &nbsp;<span class="tag grey" data-page-node-id="Of79PCNrrUdWeJg9mEopK3">Secondary</span> 白底发丝边，用于并列动作。 &nbsp;<span class="tag grey" data-page-node-id="i1kXdiEb37QQfYkcDH3Fz0">Quiet</span> 无边框，hover 才出现底色，用于取消类低频动作。</p>
+
+      <h3 data-page-node-id="g55phVH0ONTarVmZ9VhJX0">尺寸</h3>
+      <div class="demo on-white" data-page-node-id="WXInEeyfUWGLh8YWENNpFv">
+        <button class="btn btn-primary btn-lg" data-page-node-id="mFfsn4tlarBxMBBMCt61jK">生成这一镜</button>
+        <button class="btn btn-secondary btn-lg" data-page-node-id="qzBXoZjgV6K9ZtDcim7fQE">重新编辑</button>
+        <button class="btn btn-primary" data-page-node-id="muJCMu10RKKHIVgS6pSmwZ">开始创作</button>
+        <button class="btn btn-secondary" data-page-node-id="dIkppGjfodC1piav596kdl">重新编辑</button>
+        <button class="btn btn-primary btn-sm" data-page-node-id="45zLcptNmHPbbwDIsYMOFG">批准</button>
+        <button class="btn btn-secondary btn-sm" data-page-node-id="KfRc9rWUGwEyMHAAtyIOXD">返修</button>
+      </div>
+      <p class="note" style="margin:12px 0 0" data-page-node-id="J7sYG5YAnrKDcHM0QAved4">高 42 / 34 / 28。默认 34，输入区的主行动用 42——手指和视线都先落在大按钮上。</p>
+
+      <h3 data-page-node-id="8bB3RfH5GXXRNDvyQOJ9aT">状态</h3>
+      <div class="demo on-white" data-page-node-id="rJECDBsT9wNAyPEE03yxgD">
+        <button class="btn btn-primary" disabled data-page-node-id="gxVv1i52llF4ujSbQCBax6">开始创作</button>
+        <button class="btn btn-primary" data-page-node-id="Y9dGW97ay20VaSpNRTYgxb"><span class="spin" style="display:inline-block;width:13px;height:13px;border:2px solid rgba(255,255,255,.4);border-top-color:#fff;border-radius:50%" data-page-node-id="OywVTduqC3fplq88pjpxPd"></span>生成中</button>
+        <button class="btn btn-secondary" style="outline:2px solid var(--accent);outline-offset:2px" data-page-node-id="0VNfnmxsHIFWdrkDIDLFLF">键盘聚焦</button>
+      </div>
+      <p class="note" style="margin:12px 0 0" data-page-node-id="upeSNBmDoqL66ZtAXpCUfX">按下时整钮下沉 1px（<code data-page-node-id="ijCwPnQSVNiMQ1LKhyOGvb">translateY</code>），不只变颜色。加载态保留按钮宽度，避免布局跳动。</p>
+
+      <h3 data-page-node-id="wWsZhR9F8n7ILsyCB8cF25">图标按钮</h3>
+      <div class="demo on-white" data-page-node-id="ub678FE3TScFUdQPbU0mSA">
+        <button class="btn btn-secondary btn-icon btn-lg" title="放大" data-page-node-id="aK4ijs1TWDlhi42XXd4sOZ">⤢</button>
+        <button class="btn btn-quiet btn-icon" title="更多" data-page-node-id="nRDpmZYNJQ0ltRqWgvsZpl">···</button>
+        <button class="btn btn-quiet btn-icon btn-sm" title="关闭" data-page-node-id="1W3BQBh4R5kluX6GImpArm">✕</button>
+      </div>
+
+      <h3 data-page-node-id="k3UGUi6LlzPnBjoniW8LC4">胶囊与分段控件</h3>
+      <div class="demo on-white" data-page-node-id="AQYZ8hNtAYohAhZn3MvnEz">
+        <div class="chips" data-page-node-id="nSewNN3HGGdhfrwaZusHZf">
+          <button class="chip" aria-pressed="true" data-page-node-id="U0u3qI4ycsOXH3KE4OS7DL">图片生成</button>
+          <button class="chip" data-page-node-id="LVWmxPKLa6M1CZKwEyKHzz">数字人口播</button>
+          <button class="chip" data-page-node-id="bWvy27CQxCkORlNS5lKyWM">AI 设计</button>
+          <button class="chip" data-page-node-id="Z9PqBSLVkM9WGzsJe9kDcZ">一镜到底</button>
+        </div>
+      </div>
+      <div class="demo on-white" style="margin-top:10px" data-page-node-id="bJ5MqINGmBuj1r9omXp8kR">
+        <div class="seg" data-page-node-id="c52onq8hfPFwg6yvCq5xRf">
+          <button aria-pressed="true" data-page-node-id="rjZO2KK4H3ebR5BQS6KPuA">网格</button><button data-page-node-id="kcP2tTYQ8aWfLaLRSrDBX0">列表</button>
+        </div>
+        <div class="seg" data-page-node-id="hcosHqnhWbwtcijMHB5nR1">
+          <button aria-pressed="true" data-page-node-id="JOuhwSphXLGssaWMRuIx8z">1K</button><button data-page-node-id="zt1j0Bnzq13oYnSsGe5xN3">2K</button><button data-page-node-id="2wKqvPjfUPj5lUiXbKCWUA">4K</button>
+        </div>
+      </div>
+      <p class="note" style="margin:12px 0 0" data-page-node-id="PuRtycdOz2BG6ZtSt82k4u">胶囊用于<strong data-page-node-id="jfoPwCWrpMOBCrFixHCPmA">多选/单选参数</strong>（模型、能力、模板），分段控件用于<strong data-page-node-id="9jnBFE09d0gQSCsVbIjGlU">互斥视图切换</strong>。两者不可混用——这是既梦和小云雀都守住的一条。</p>
+    </div>
+  </section>
+
+  <!-- ============ 6 · Composer ============ -->
+  <section data-page-node-id="AQkg1Aav3M2r8fOHASjVfQ">
+    <div class="sec-head" data-page-node-id="6e3XhF1t20MA3EKmuCovWw"><h2 data-page-node-id="pOFBLhTlX8AZp6ZUpbqWEW">六 · 输入卡（Composer）</h2><span data-page-node-id="BEOpxAWU61TtEXuqu8R5av">整页唯一的大动作</span></div>
+    <p class="note" data-page-node-id="dRqbdMZLlmN4kMbb1ezQ3Q">这张卡是这次改版的记忆点：22px 圆角、淡投影浮起、参数内嵌底部。其他所有元素都保持克制，把注意力让给它。</p>
+    <div class="card" data-page-node-id="x2DWtFHTqDNoVMFurs9HPE">
+      <div class="composer focus" data-page-node-id="LIE1SIcOQ5NFcOWHrKPLJn">
+        <textarea placeholder="描述你要做的这一镜，例如：雨后的城市街道，电影感光线，写实风格…"></textarea>
+        <footer data-page-node-id="yYtgkDUMGGXdYxAGuo7sa1">
+          <div class="tools" data-page-node-id="pMUGnYOXdo8iVhvnC7fo6z">
+            <button class="chip" aria-pressed="true" data-page-node-id="eR4yZqITu0BNJUZWbcTyrP">图片生成</button>
+            <button class="chip" data-page-node-id="MaQYkGLIrqRz0uWuGWILL7">2K</button>
+            <button class="chip" data-page-node-id="jKBaSwIAgVBnzTqYXl6dFb">16:9</button>
+          </div>
+          <button class="btn btn-primary btn-lg" data-page-node-id="vqR0AmfzHldkD1qVIAyCB3">开始创作<span class="kbd" data-page-node-id="2cvGSTXYFvM0bznB7EZ95J">Ctrl ↵</span></button>
+        </footer>
+      </div>
+      <p class="note" style="margin:18px 0 0" data-page-node-id="Xg9jWXMKtAWEvEtEKAABol">参数做成胶囊直接长在输入区里，改模型/比例不需要离开输入框。聚焦时外圈加 3px 强调色光环，明确告诉用户"光标在这里"。</p>
+    </div>
+  </section>
+
+  <!-- ============ 7 · 布局 ============ -->
+  <section data-page-node-id="rrLfcHhDsUuAQwbcRkmeId">
+    <div class="sec-head" data-page-node-id="8SC3MKMGAhS88e4hSgDzlW"><h2 data-page-node-id="GPfoQYJy4UYkLPHmKZ17VC">七 · 首页布局</h2><span data-page-node-id="X4criAhvfcWRxnO34sXYqZ">对话式入口 + 灵感模板流</span></div>
+    <div class="wire" data-page-node-id="GB0GzA2IRjExGTe1x3fVrN">
+      <div class="nav" data-page-node-id="wmgtpl7QLxDDgxq6HwXGfi">
+        <div class="it on" data-page-node-id="Y3h4Gn3oS5Ef6EbiQDkoIi"></div><div class="it" data-page-node-id="6k80k3DS8IarMHwnHGSBzS"></div><div class="it" data-page-node-id="QAyEJS0hyV9kCXdzRVoSHE"></div><div class="it" data-page-node-id="ARHmCTC9LDhpG6QZpcaLOP"></div>
+        <div class="grp" data-page-node-id="20BVQ8sYk0hzMGahC9yjIa">最近创作</div>
+        <div class="it" data-page-node-id="SXKCwGmV6Du2YKFrhBLKFf"></div><div class="it" data-page-node-id="IGkBfKTLRqGSYRRfsVw9mG"></div><div class="it" data-page-node-id="k3IKZN2wDuB834FhN9ubIg"></div>
+      </div>
+      <div class="body" data-page-node-id="dnRgEIz0EmBRYmwYMaKQht">
+        <div style="width:100%;max-width:520px;text-align:center;font-size:15px;color:var(--ink-2)" data-page-node-id="Alxj0gBLtG6oag2QP4Xarg">问候语 + 一句话说明</div>
+        <div class="hero" data-page-node-id="mqWdaREtdLPUe2IlUzpPMu"></div>
+        <div class="grid4" data-page-node-id="C6E1lL1n8LKTEI44hsnet9"><i data-page-node-id="K2n9hlWAhTd5zLQgmOm2No"></i><i data-page-node-id="obDnhuF840O5I9rqjAWJ1P"></i><i data-page-node-id="UQVnLi2uNHCot8QwPuDDRs"></i><i data-page-node-id="YdruqwoRlxLmgZTr5k4Prw"></i></div>
+        <div class="grid4" style="max-width:520px" data-page-node-id="N93kEBACZRcODsqpqAZAg5"><i data-page-node-id="SkzDyWDvU2KsJVLNbqzNXx"></i><i data-page-node-id="wfh459eMTKjOjdp3NZZ9Oy"></i><i data-page-node-id="3N9YseC9pVyZDgO1EtNEkD"></i><i data-page-node-id="jpelzPkJ38nJtHuIbSLGzI"></i></div>
+      </div>
+    </div>
+    <p class="note" style="margin-top:16px" data-page-node-id="3nCI5kc2lygvfRhAGdKTnf">自上而下：问候 → 输入卡 → 灵感模板流（4 列网格，可横向滚动）→ 继续创作（最近的真实 Run）。右侧的流水线 / 待办栏保留。</p>
+  </section>
+
+  <!-- ============ 8 · 结果 ============ -->
+  <section data-page-node-id="rjwg9I9GeVeX7Kg5tQGGGW">
+    <div class="sec-head" data-page-node-id="vfxiQCPEObLAUVJCommAaH"><h2 data-page-node-id="HV4heiL8Z1cSD6l7LVGlAj">八 · 结果挑选</h2><span data-page-node-id="USJxt9Pb3wClyGlMslE4Qs">按真实能力做，不伪造第四张</span></div>
+    <div class="card" data-page-node-id="HFG07ULlb3bLEco0kIUxf0">
+      <p class="note" data-page-node-id="IYUGlAp39TxtDy9MzLXl9e">既梦一次出 4 张是因为接口支持批量。你的 <code data-page-node-id="x1NFH8oUfm3upcUhmzmUDb">settings.yaml</code> 里 <code data-page-node-id="mqRTO5ITrjUlqXDxpmsX2y">quantity</code> 硬锁为 1（"1 · 当前真实接口"），所以<strong data-page-node-id="BxiLZsc1YId0zlx3jHv87D">不做假的 2×2 四选一</strong>。真实做法是：</p>
+      <ul class="spec" data-page-node-id="eOP8SE7kFPaCCDoqEAYYxQ">
+        <li data-page-node-id="uhNYU63EAshZ3KkXqt29I8">同一 project + 镜号的<strong data-page-node-id="1EemCntEWBasP662ceTbkI">每一次成功生成都是一个候选</strong>，按时间加入结果网格</li>
+        <li data-page-node-id="R4aoN09xFY5q60297zTlns">网格列数自适应真实候选数：1 张居中大图，2 张并排，3–4 张 2×2，更多则按 <code data-page-node-id="F7kvjlzFK1PDqe3J1NF3Fx">auto-fill</code> 铺满</li>
+        <li data-page-node-id="Xp789EFgLlf6vx1Scfs5LY">选中某张 → 该 Run 成为当前产物，进入质检 / 审批 / 归档</li>
+        <li data-page-node-id="Pj7LW5OhK8zP57OAZ3pCDm">网格下方常驻 <b data-page-node-id="5FYeok9K1UTOBfNEb2KdhN">重新编辑</b> 与 <b data-page-node-id="YAtBtHT1uSIUxHrYGNkeIP">再次生成</b>；"再次生成"产生的新图自动追加为下一个候选</li>
+      </ul>
+      <div class="demo on-white" style="margin-top:16px;justify-content:center;gap:12px" data-page-node-id="xkHs3eQKkuYJxylSW86kEm">
+        <div style="width:150px;height:150px;border-radius:var(--r-tile);background:#e7e9ec" data-page-node-id="G350rwzTAAJ5EjnY6dPMah"></div>
+        <div style="width:150px;height:150px;border-radius:var(--r-tile);background:#e7e9ec;box-shadow:0 0 0 2px var(--accent)" data-page-node-id="xOv8GDGtndNFcRoEsI8cft"></div>
+        <div style="width:150px;height:150px;border-radius:var(--r-tile);background:#e7e9ec" data-page-node-id="7nr34UcWg1NAwDAlMcKH3x"></div>
+      </div>
+      <p class="note" style="margin:12px 0 0;text-align:center" data-page-node-id="s0IAWAx8qOLEqKVzl2Dl4x">选中态：2px 强调色描边 + 右上角对勾。候选数 = 真实生成次数。</p>
+    </div>
+  </section>
+
+  <!-- ============ 9 · 交互 ============ -->
+  <section data-page-node-id="N0IBinnQ24w0T0b9ieg2OJ">
+    <div class="sec-head" data-page-node-id="g8kPWGU0h83Udir0fQrqU7"><h2 data-page-node-id="76uNCr47ATaFiQ1AJAGAvX">九 · 交互与动效</h2><span data-page-node-id="k6uTBjpZi8G6irH0YUtu2B">只响应用户动作</span></div>
+    <div class="card" data-page-node-id="4LKLsnh93EIAKju78RsTZK">
+      <table data-page-node-id="jXa082X4HVrm85QJ47ptuo">
+        <tr data-page-node-id="07U8nCD1iLjqEZcSYbyUsI"><th data-page-node-id="fWnJfGXcpsxWYHacZN1Eu9">场景</th><th data-page-node-id="Ze1HoBpHv2KZcGeoUdcbQT">处理</th></tr>
+        <tr data-page-node-id="xaSDE4DMLKXo0NnixiZ6LB"><td data-page-node-id="qaQiPNaiVvWEFfBNEPdD5k">按钮按下</td><td data-page-node-id="7Btvx6uG65pDFw0XMUdFwL">下沉 1px，120ms</td></tr>
+        <tr data-page-node-id="BbZ0CwVJDIUDN66w1FtPWh"><td data-page-node-id="Oi9dZegLPq0RM9OlOEbNH8">卡片悬停</td><td data-page-node-id="gC5XHSiuhUYp1SlFkzZM0F">抬起 1px + 阴影加深，不放大不变色</td></tr>
+        <tr data-page-node-id="DT2TGH48F57qoonrdv0AHW"><td data-page-node-id="w4SVeOeo6JGLuCiBRvTRBr">瓦片悬停</td><td data-page-node-id="yFo0AuOsJyepCoq5TH8e6e">图片放大 1.05，底部渐变信息条淡入</td></tr>
+        <tr data-page-node-id="NNE13DXLMNzizEqK8HMyfI"><td data-page-node-id="u09qB5xPAqubBt1ULA2aPd">键盘聚焦</td><td data-page-node-id="h00NmQFXLXJbW7ofdEyAP0">2px 强调色描边 + 2px 偏移，全站统一</td></tr>
+        <tr data-page-node-id="5EgHx8mIYgkx2566nhiY13"><td data-page-node-id="CfC9R1bftKxdJfARQlJA4i">生成中</td><td data-page-node-id="VXweJDNygmFs80XZZVOd98">按钮内嵌转圈，保留原宽度</td></tr>
+        <tr data-page-node-id="F2hkGmXP9Jn9xxbleFsF77"><td data-page-node-id="ycsVkjXS8UQTJp0FglrvDh">结果出现</td><td data-page-node-id="FWc5aPFq8FGp17cChq5gcv">淡入 + 轻微上移，只此一次，不做逐项错峰</td></tr>
+      </table>
+      <p class="note" style="margin:16px 0 0" data-page-node-id="xC9aip8PeYldEpqGwlJm6b">不做非用户触发的常驻动画。首页保留打字机问候（它已在代码中，是品牌的一部分），但不给每个区块加入场动画——那会让工具显得轻浮。</p>
+    </div>
+  </section>
+
+  <!-- ============ 10 ============ -->
+  <section data-page-node-id="vxby3E9hQhgPhNXjXRLj7M">
+    <div class="sec-head" data-page-node-id="Se7InCbpjtfqZ5123KagAp"><h2 data-page-node-id="VnL3HGadaZKorf2FnDTEz4">十 · 落地清单</h2><span data-page-node-id="zJhHgNTfLwAm5pGQIzxlyN">按改动面从大到小</span></div>
+    <div class="card" data-page-node-id="VBA4CTMVEpNscBEKKjSW6m">
+      <table data-page-node-id="8SybVvVAuPbCNhay5ngGei">
+        <tr data-page-node-id="F5sFCLlPY05QmuCCEc0p78"><th data-page-node-id="jUD9HMeNgaVypDgUfGWCXq">#</th><th data-page-node-id="9mXpQ9tBhjiWEpkwcRACYF">改动</th><th data-page-node-id="lv4VhxFGigRJYfRDBeAmHE">文件</th></tr>
+        <tr data-page-node-id="VmfWIFRV1nccSQXXoxbzYL"><td data-page-node-id="BjE3FR5GegBOn8Szcd5mRk">1</td><td data-page-node-id="jjjOCqrVBSvEnbQl6jHFeh">字体栈换中文优先，撤掉衬线 Hero，重排字号阶梯</td><td data-page-node-id="vTlNn4sAIX2SwCkFejFuwV">tokens.css</td></tr>
+        <tr data-page-node-id="eEI8aE7ulry618jn4cPrH1"><td data-page-node-id="V8DaUVXt34RkJ14Xh1Y9zx">2</td><td data-page-node-id="IDdIaiBVv0HH4aHHhjUmbG">圆角层级重排，新增 --radius-composer</td><td data-page-node-id="9ApRDkG3WHcLKa3jVVCSGt">tokens.css</td></tr>
+        <tr data-page-node-id="djWUXeZo3vIo7bMfCRrlsu"><td data-page-node-id="b1qYrysQLIn8XEowLQO297">3</td><td data-page-node-id="N9MLHwhkdbJULQA0y4mrNk">按钮五层级 × 三尺寸 × 全状态；胶囊与分段控件</td><td data-page-node-id="tbAlgBiefVsoLlWDxHUhCz">style.css</td></tr>
+        <tr data-page-node-id="q5k4TRUbJJHsFJeqReDPmB"><td data-page-node-id="IrLvlZzXHk3dw1B5eY5E5k">4</td><td data-page-node-id="y1D89URcgNSoJiDioTag3E">首页：输入卡改造 + 灵感模板流</td><td data-page-node-id="Ip4IYBj49oofiBIhLMZAl5">HomeView.vue</td></tr>
+        <tr data-page-node-id="MpKWbsAvEUYHnnpHOazPQU"><td data-page-node-id="WXwVNlDOjsNQsR03oMrKvx">5</td><td data-page-node-id="NMJG2hICJ5YiXf4lMibbMs">工作台：结果候选网格 + 重新编辑 / 再次生成</td><td data-page-node-id="dGtYYAqNYcVUHBA7vECQA1">CreationChat.vue</td></tr>
+        <tr data-page-node-id="GyAbIVltw0uBJTGynNa0N7"><td data-page-node-id="xTvAus5p1YzZR7iwID2Q8c">6</td><td data-page-node-id="CsknrCM0Z6AposdCZf94i6">去掉表格表头全大写、按钮与链接上多余的 → 符号</td><td data-page-node-id="vbmc0AIy5BDiTHMNYbartF">style.css</td></tr>
+      </table>
+    </div>
+  </section>
+
+</div>
+</body>
+</html>

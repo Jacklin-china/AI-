@@ -1,0 +1,116 @@
+/* ==========================================================================
+   Kantoku Design System — Tokens
+   Professional Production Workspace：专业 / 克制 / 冷静 / 高密度 / 桌面工具感
+   本文件是所有视觉决策的唯一来源；组件与页面只允许引用变量，禁止硬编码色值。
+   ========================================================================== */
+:root {
+  /* ---- Surface / Canvas ---- */
+  --canvas: #f6f7f8;
+  --canvas-inset: #eef0f2;
+  --surface: #ffffff;
+  --surface-subtle: #f8f9fa;
+  --surface-raised: #ffffff;
+
+  /* ---- Sidebar（对齐 WorkBuddy 浅色导航：面板 #f2f2f2 + 软灰填充 #e6e6e6，无深色） ---- */
+  --sidebar-bg: #f2f2f2;
+  --sidebar-hover: #e6e6e6;
+  --sidebar-selected: #e6e6e6;
+  --sidebar-ink: #1f2329;
+  --sidebar-text: #4a4f57;
+  --sidebar-muted: #8a9099;
+  --sidebar-accent: #1f2329;
+  --sidebar-border: #e6e6e6;
+
+  /* ---- Topbar（对齐参考稿：与侧栏同色灰底 #f2f2f2、无分隔线） ----
+     顶栏与侧栏同色，使两者连成同一条灰色外壳；页面画布 #f6f7f8 略浅一档，
+     靠色阶差形成边界，因此不再需要 border-bottom。 */
+  --topbar-bg: #f2f2f2;
+
+  /* ---- Text ---- */
+  --text-primary: #171a1e;   /* 由 #1c2025 加深：正文对比度 13.9:1 → 15.8:1 */
+  --text-secondary: #626a73;
+  --text-muted: #878e98;
+
+  /* ---- Border（严格对齐 WorkBuddy 浅色主题：default #dcdee3 / muted #e8eaed / input #e5e7eb）
+       采用 WorkBuddy 的冷调灰（带轻微蓝味），而非纯中性灰，避免与底座 UI 观感不一致 ---- */
+  --border: #dcdee3;
+  --border-muted: #e8eaed;
+  --border-strong: #c9cdd4;
+  --border-hover: #aeb5be;
+  --border-soft: #e6e6e6;   /* WorkBuddy 软灰：chip/悬浮/侧栏分隔 */
+  --surface-stage: #e7e9ec;
+
+  /* ---- Accent（仅少量使用：主按钮 / Active / Focus） ---- */
+  --accent: #425cc7;
+  --accent-hover: #374cae;
+  --accent-active: #2f4198;
+  --accent-soft: #eceffb;
+  --accent-ring: rgba(66, 92, 199, 0.16);
+
+  /* ---- Status ---- */
+  --success: #27845c;
+  --success-soft: #e8f3ee;
+  --success-border: #c6e0d3;
+  --warning: #a86c18;
+  --warning-soft: #faf1e0;
+  --warning-border: #ecd9b4;
+  --danger: #c64444;
+  --danger-soft: #faecec;
+  --danger-border: #ecc8c8;
+  --info: #35679b;
+  --info-soft: #e9f1f8;
+  --info-border: #c6d9ea;
+
+  /* ---- Typography（对齐 WorkBuddy 桌面端字体体系） ---- */
+  --font-ui: "PingFang SC", "HarmonyOS Sans SC", "MiSans", "Source Han Sans SC", "Noto Sans SC", "Microsoft YaHei", Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", "Helvetica Neue", Arial, sans-serif;
+  /* 说明：全站单一无衬线字族。上一版的衬线 Hero（Source Han Serif）来自另一份参考稿，
+     与小云雀 / 既梦的现代无衬线方向不符，已撤除；层级改由字号 + 字重 + 颜色三重落差承担。 */
+  --font-page: 21px;      /* 页面标题 */
+  --font-hero: 28px;      /* 首页 Hero 标题 */
+  --font-section: 16px;   /* 区块标题 */
+  --font-body: 14px;      /* 正文 */
+  --font-control: 13px;   /* 按钮 / 控件文字 */
+  --font-table: 13px;     /* 表格 */
+  --font-meta: 12px;      /* 辅助信息 */
+  --font-kicker: 11px;    /* 标注 */
+  --line-body: 1.5;
+  --line-table: 1.4;
+  --line-tight: 1.25;
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---- Radius ---- */
+  /* 原则：越靠近输入动作，圆角越大。Composer 22px 是全站最大值，往下逐级收敛到瓦片 4px。 */
+  --radius-control: 8px;    /* Button / Input / Select */
+  --radius-panel: 16px;     /* Card / Panel */
+  --radius-composer: 22px;  /* 首页输入卡：全站唯一的大圆角，整页的记忆点 */
+  --radius-dialog: 10px;    /* Dialog / Palette */
+  --radius-tile: 4px;       /* 资产瓦片：近直角（密集图墙） */
+  --radius-pill: 999px;     /* Badge / Chip */
+
+  /* ---- Spacing（4px 基线） ---- */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+
+  /* ---- Layout ---- */
+  --sidebar-width: 220px;
+  --sidebar-collapsed: 56px;
+  --topbar-height: 48px;
+
+  /* ---- Shadow（克制：仅浮层使用） ---- */
+  --shadow-dialog: 0 16px 48px rgba(20, 24, 31, 0.18);
+  --shadow-pop: 0 6px 20px rgba(20, 24, 31, 0.1);
+  --shadow-hero: 0 10px 34px rgba(20, 24, 31, 0.07);   /* Hero 输入卡：无边框靠投影浮起 */
+  --shadow-card: 0 2px 8px rgba(20, 24, 31, 0.05), 0 1px 2px rgba(20, 24, 31, 0.04);   /* 普通内容面板：去边框后靠极淡投影浮起 */
+
+  /* ---- Motion（仅响应用户动作） ---- */
+  --motion-fast: 120ms ease;
+  --motion-med: 180ms ease;
+}

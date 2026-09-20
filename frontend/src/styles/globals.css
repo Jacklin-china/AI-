@@ -1,0 +1,25 @@
+* { box-sizing: border-box; }
+html, body, #app { min-width: 1060px; min-height: 100%; margin: 0; }
+body {
+  min-height: 100vh;
+  background: var(--canvas);
+  color: var(--text-primary);
+  font-family: var(--font-ui);
+  font-size: var(--font-body);
+  font-weight: var(--weight-regular);
+  line-height: var(--line-body);
+  font-feature-settings: "cv11", "ss01";
+  text-rendering: optimizeLegibility;
+  -webkit-font-smoothing: antialiased;
+}
+button, input, textarea, select { font: inherit; color: inherit; }
+button { cursor: pointer; }
+button:disabled, input:disabled, textarea:disabled, select:disabled { cursor: not-allowed; opacity: .48; }
+button:focus-visible, input:focus-visible, textarea:focus-visible, select:focus-visible, [tabindex]:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+h1, h2, h3, p { margin-block-start: 0; }
+::selection { background: #d3dbf5; }
+
+/* 数据与金额统一使用等宽数字，表格对齐不跳动 */
+.num, td[data-num], .operation-strip strong, .cost-widget strong { font-variant-numeric: tabular-nums; }
+
+@media (prefers-reduced-motion: reduce) { *, *::before, *::after { scroll-behavior: auto !important; transition: none !important; animation-duration: .01ms !important; } }
