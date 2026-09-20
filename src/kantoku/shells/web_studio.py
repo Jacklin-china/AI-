@@ -15,9 +15,14 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
+from kantoku.adapters.commerce import (
+    MockMarketplaceAdapter,
+    MockSourceAdapter,
+    MockTranslationAdapter,
+)
 from kantoku.capabilities.video import MockVideoProvider, VideoService
 from kantoku.config import KantokuError, ToolError, get_settings
-from kantoku.config.settings import ROOT, VideoSettings
+from kantoku.config.settings import ROOT, RuntimeSettings, VideoSettings
 from kantoku.core import budget
 from kantoku.core.approval import ApprovalService
 from kantoku.core.runtime.batch import BatchService
@@ -69,7 +74,10 @@ class StudioApplication:
         database_path = configured if configured.is_absolute() else ROOT / configured
         self.runtime_store = RuntimeStore(database_path)
         self.runtime = GraphRuntime(self.runtime_store)
+        self.skills = SkillRegistry()
+        SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
         settings = get_settings()
+        self.runtime_settings = getattr(settings, "runtime", RuntimeSettings())
         video_settings = getattr(settings, "video", VideoSettings())
         video = VideoService(self.runtime_store, MockVideoProvider(), video_settings)
         self.runtime.register(build_comic_workflow(
@@ -77,11 +85,12 @@ class StudioApplication:
             video_service=video,
             video_enabled=video_settings.enabled,
         ))
-        self.runtime.register(build_commerce_workflow())
+        self.runtime.register(build_commerce_workflow(
+            MockSourceAdapter(), MockMarketplaceAdapter(), self.skills,
+            MockTranslationAdapter(),
+        ))
         self.approvals = ApprovalService(self.runtime_store, self.runtime)
         self.batches = BatchService(self.runtime_store, self.runtime)
-        self.skills = SkillRegistry()
-        SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
         self.runner = TaskRunner(max_workers=2)
 
     def task(self, request_id: str) -> StudioTask:
@@ -342,7 +351,9 @@ class StudioApplication:
             state = ComicState.model_validate(data.get("state", data))
             run = self.runtime.start(COMIC_WORKFLOW_ID, state)
         elif domain == "commerce":
-            state = CommerceState.model_validate(data.get("state", data))
+            raw_state = dict(data.get("state", data))
+            raw_state.setdefault("max_reworks", self.runtime_settings.max_reworks)
+            state = CommerceState.model_validate(raw_state)
             run = self.runtime.start(COMMERCE_WORKFLOW_ID, state)
         else:
             raise ToolError("不支持的 Domain Pack", detail=domain)
@@ -425,12 +436,24 @@ class StudioApplication:
         raw_items = data.get("items")
         if not isinstance(raw_items, list) or not raw_items:
             raise ToolError("Batch items 必须是非空数组")
-        states = [workflow.state_type.model_validate(item) for item in raw_items]
+        states = []
+        for item in raw_items:
+            raw_state = dict(item)
+            if "max_reworks" in workflow.state_type.model_fields:
+                raw_state.setdefault("max_reworks", self.runtime_settings.max_reworks)
+            states.append(workflow.state_type.model_validate(raw_state))
+        concurrency_limit = int(data.get("concurrency_limit", 2))
+        maximum = self.runtime_settings.batch_max_concurrency
+        if concurrency_limit > maximum:
+            raise ToolError(
+                "Batch 并发超过配置上限",
+                detail=f"requested={concurrency_limit}; max={maximum}",
+            )
         batch = self.batches.create(
             name=str(data.get("name", workflow_id)).strip() or workflow_id,
             workflow_id=workflow_id,
             states=states,
-            concurrency_limit=int(data.get("concurrency_limit", 2)),
+            concurrency_limit=concurrency_limit,
         )
         return self._batch_payload(batch.id)
 

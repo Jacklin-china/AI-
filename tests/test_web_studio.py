@@ -353,7 +353,7 @@ def test_core_api_run_approval_restart_resume_and_artifact(
         run = json.loads(response.read())
         assert response.status == 201
         assert run["status"] == "waiting"
-        assert run["current_node"] == "human_approval"
+        assert run["current_node"] == "candidate_approval"
         run_id = run["id"]
 
         connection.request("GET", "/api/approvals", headers={"X-Studio-Token": app.token})
@@ -368,12 +368,16 @@ def test_core_api_run_approval_restart_resume_and_artifact(
         )
         response = connection.getresponse()
         assert response.status == 200
-        assert json.loads(response.read())["decision"] == "approve"
+        candidate_result = json.loads(response.read())
+        assert candidate_result["decision"] == "approve"
+        assert candidate_result["current_node"] == "publish_approval"
 
         restarted = web_studio.StudioApplication()
-        completed = restarted.resume_core_run(run_id)
+        publish = restarted.runtime_store.approval_for_node(run_id, "publish_approval")
+        assert publish is not None
+        completed = restarted.decide_core_approval(publish.id, "approve", {})
         assert completed["status"] == "completed"
-        assert completed["state"]["qc_result"]["mock"] is True
+        assert completed["state"]["marketplace_draft"]["mock"] is True
 
         connection.request(
             "GET",
