@@ -149,6 +149,23 @@ class GraphRuntime:
             )
         return self._execute(run, workflow, state)
 
+    def cancel(self, run_id: str) -> RunRecord:
+        """取消未结束 Run；已结束 Run 保持原状态。"""
+        run = self.store.get_run(run_id)
+        if run.status in {
+            ExecutionStatus.COMPLETED,
+            ExecutionStatus.FAILED,
+            ExecutionStatus.CANCELLED,
+        }:
+            return run
+        return self.store.update_run(
+            run.id,
+            status=ExecutionStatus.CANCELLED,
+            state=run.state,
+            current_node=run.current_node,
+            error="cancelled_by_user",
+        )
+
     def _execute(
         self,
         run: RunRecord,

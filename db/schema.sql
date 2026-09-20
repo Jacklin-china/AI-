@@ -220,3 +220,24 @@ CREATE TABLE IF NOT EXISTS skill_executions (
     outputs_json TEXT NOT NULL DEFAULT '{}',
     FOREIGN KEY (run_id) REFERENCES runs(id)
 );
+
+CREATE TABLE IF NOT EXISTS batches (
+    id TEXT PRIMARY KEY,
+    name TEXT NOT NULL,
+    status TEXT NOT NULL,
+    concurrency_limit INTEGER NOT NULL,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS batch_runs (
+    batch_id TEXT NOT NULL,
+    run_id TEXT NOT NULL,
+    position INTEGER NOT NULL,
+    PRIMARY KEY (batch_id, run_id),
+    UNIQUE (batch_id, position),
+    FOREIGN KEY (batch_id) REFERENCES batches(id),
+    FOREIGN KEY (run_id) REFERENCES runs(id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_batch_runs_run ON batch_runs (run_id);

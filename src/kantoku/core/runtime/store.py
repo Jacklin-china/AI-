@@ -19,6 +19,8 @@ from .models import (
     ApprovalRecord,
     ArtifactRecord,
     ArtifactType,
+    BatchRecord,
+    BatchStatus,
     CheckpointRecord,
     ExecutionStatus,
     NodeExecutionRecord,
@@ -76,6 +78,24 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
             completed_at TEXT, error TEXT, outputs_json TEXT NOT NULL DEFAULT '{}',
             FOREIGN KEY (run_id) REFERENCES runs(id)
         );
+        """,
+    ),
+    (
+        2,
+        """
+        CREATE TABLE IF NOT EXISTS batches (
+            id TEXT PRIMARY KEY, name TEXT NOT NULL, status TEXT NOT NULL,
+            concurrency_limit INTEGER NOT NULL, created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS batch_runs (
+            batch_id TEXT NOT NULL, run_id TEXT NOT NULL, position INTEGER NOT NULL,
+            PRIMARY KEY (batch_id, run_id),
+            UNIQUE (batch_id, position),
+            FOREIGN KEY (batch_id) REFERENCES batches(id),
+            FOREIGN KEY (run_id) REFERENCES runs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_batch_runs_run ON batch_runs(run_id);
         """,
     ),
 )
@@ -202,11 +222,27 @@ class RuntimeStore:
             raise ToolError("找不到指定 Run", detail=run_id)
         return self._run(row)
 
-    def list_runs(self, limit: int = 100) -> list[RunRecord]:
-        """按更新时间倒序列出 Run。"""
+    def list_runs(
+        self,
+        limit: int = 100,
+        *,
+        domain: str | None = None,
+        status: ExecutionStatus | None = None,
+    ) -> list[RunRecord]:
+        """按更新时间倒序列出 Run，可按领域与状态过滤。"""
+        clauses: list[str] = []
+        params: list[object] = []
+        if domain:
+            clauses.append("domain=?")
+            params.append(domain)
+        if status:
+            clauses.append("status=?")
+            params.append(status)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(limit)
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM runs ORDER BY updated_at DESC LIMIT ?", (limit,)
+                f"SELECT * FROM runs{where} ORDER BY updated_at DESC LIMIT ?", params
             ).fetchall()
         return [self._run(row) for row in rows]
 
@@ -319,6 +355,16 @@ class RuntimeStore:
             raise ToolError("不能把审批重新设为 pending")
         now = utc_now()
         with self._connect() as connection:
+            existing = connection.execute(
+                "SELECT * FROM approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+            if existing is None:
+                raise ToolError("审批不存在", detail=approval_id)
+            current = self._approval(existing)
+            if current.decision is decision:
+                return current
+            if current.decision is not ApprovalDecision.PENDING:
+                raise ToolError("审批已经按其他决定处理", detail=approval_id)
             cursor = connection.execute(
                 "UPDATE approvals SET decision=?,response_json=?,decided_at=? "
                 "WHERE id=? AND decision=?",
@@ -326,7 +372,7 @@ class RuntimeStore:
                  ApprovalDecision.PENDING),
             )
             if cursor.rowcount != 1:
-                raise ToolError("审批不存在或已经处理", detail=approval_id)
+                raise ToolError("审批已经被其他请求处理", detail=approval_id)
             row = connection.execute(
                 "SELECT * FROM approvals WHERE id=?", (approval_id,)
             ).fetchone()
@@ -375,18 +421,51 @@ class RuntimeStore:
             location=location, version=version,
         ))
 
-    def list_artifacts(self, run_id: str) -> list[ArtifactRecord]:
-        """按创建顺序列出 Run 产物。"""
+    def get_artifact(self, artifact_id: str) -> ArtifactRecord:
+        """读取一个 Artifact。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,)
+            ).fetchone()
+        if row is None:
+            raise ToolError("找不到指定 Artifact", detail=artifact_id)
+        return self._artifact(row)
+
+    def list_artifacts(
+        self,
+        run_id: str | None = None,
+        *,
+        type: ArtifactType | None = None,
+        domain: str | None = None,
+    ) -> list[ArtifactRecord]:
+        """查询 Artifact，可按 run、type 与 domain 过滤。"""
+        clauses: list[str] = []
+        params: list[object] = []
+        if run_id:
+            clauses.append("artifacts.run_id=?")
+            params.append(run_id)
+        if type:
+            clauses.append("artifacts.type=?")
+            params.append(type)
+        if domain:
+            clauses.append("runs.domain=?")
+            params.append(domain)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM artifacts WHERE run_id=? ORDER BY created_at", (run_id,)
+                "SELECT artifacts.* FROM artifacts JOIN runs ON runs.id=artifacts.run_id"
+                f"{where} ORDER BY artifacts.created_at DESC", params,
             ).fetchall()
-        return [ArtifactRecord(
+        return [self._artifact(row) for row in rows]
+
+    @staticmethod
+    def _artifact(row: sqlite3.Row) -> ArtifactRecord:
+        return ArtifactRecord(
             id=row["id"], type=ArtifactType(row["type"]), run_id=row["run_id"],
             node_id=row["node_id"], source=row["source"], status=row["status"],
             created_at=_time(row["created_at"]), metadata=_load(row["metadata_json"]),
             location=row["location"], version=row["version"],
-        ) for row in rows]
+        )
 
     def save_skill_execution(self, record: SkillExecutionRecord) -> None:
         """记录 Skill 调用结果。"""
@@ -396,5 +475,68 @@ class RuntimeStore:
                 (record.id, record.run_id, record.node_id, record.skill_id, record.status,
                  record.started_at.isoformat(),
                  record.completed_at.isoformat() if record.completed_at else None,
-                 record.error, _dump(record.outputs)),
+                record.error, _dump(record.outputs)),
             )
+
+    def create_batch(self, name: str, concurrency_limit: int) -> BatchRecord:
+        """创建空 Batch。"""
+        if concurrency_limit < 1:
+            raise ToolError("Batch 并发限制必须大于零")
+        now = utc_now()
+        record = BatchRecord(
+            id=f"batch-{uuid4().hex}", name=name, status=BatchStatus.PENDING,
+            concurrency_limit=concurrency_limit, created_at=now, updated_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO batches VALUES (?,?,?,?,?,?)",
+                (record.id, name, record.status, concurrency_limit,
+                 now.isoformat(), now.isoformat()),
+            )
+        return record
+
+    def add_batch_run(self, batch_id: str, run_id: str, position: int) -> None:
+        """将已有 Run 关联到 Batch。"""
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO batch_runs(batch_id,run_id,position) VALUES (?,?,?)",
+                (batch_id, run_id, position),
+            )
+
+    def update_batch_status(self, batch_id: str, status: BatchStatus) -> BatchRecord:
+        """更新 Batch 缓存状态。"""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE batches SET status=?,updated_at=? WHERE id=?",
+                (status, utc_now().isoformat(), batch_id),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("找不到指定 Batch", detail=batch_id)
+        return self.get_batch(batch_id)
+
+    def get_batch(self, batch_id: str) -> BatchRecord:
+        """读取 Batch 及其 Run ID。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM batches WHERE id=?", (batch_id,)
+            ).fetchone()
+            run_rows = connection.execute(
+                "SELECT run_id FROM batch_runs WHERE batch_id=? ORDER BY position",
+                (batch_id,),
+            ).fetchall()
+        if row is None:
+            raise ToolError("找不到指定 Batch", detail=batch_id)
+        return BatchRecord(
+            id=row["id"], name=row["name"], status=row["status"],
+            concurrency_limit=row["concurrency_limit"],
+            created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
+            run_ids=[item["run_id"] for item in run_rows],
+        )
+
+    def list_batches(self) -> list[BatchRecord]:
+        """按更新时间倒序查询 Batch。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT id FROM batches ORDER BY updated_at DESC"
+            ).fetchall()
+        return [self.get_batch(row["id"]) for row in rows]

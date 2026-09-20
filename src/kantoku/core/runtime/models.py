@@ -25,6 +25,17 @@ class ExecutionStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+class BatchStatus(StrEnum):
+    """一组 Run 的汇总生命周期。"""
+
+    PENDING = "pending"
+    RUNNING = "running"
+    WAITING = "waiting"
+    COMPLETED = "completed"
+    PARTIAL_FAILED = "partial_failed"
+    CANCELLED = "cancelled"
+
+
 class ApprovalDecision(StrEnum):
     """通用人工审批结果。"""
 
@@ -133,3 +144,15 @@ class SkillExecutionRecord(CoreModel):
     completed_at: datetime | None = None
     error: str | None = None
     outputs: dict[str, Any] = Field(default_factory=dict)
+
+
+class BatchRecord(CoreModel):
+    """一个不包含领域知识的 Run 集合。"""
+
+    id: str
+    name: str
+    status: BatchStatus
+    concurrency_limit: int = Field(gt=0)
+    created_at: datetime
+    updated_at: datetime
+    run_ids: list[str] = Field(default_factory=list)

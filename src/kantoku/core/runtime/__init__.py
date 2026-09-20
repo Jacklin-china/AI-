@@ -1,6 +1,10 @@
 """通用 Workflow Runtime。"""
 
-from .models import ApprovalDecision, ArtifactType, ExecutionStatus
+from .batch import BatchService
+from .models import ApprovalDecision, ArtifactType, BatchStatus, ExecutionStatus
 from .store import RuntimeStore
 
-__all__ = ["ApprovalDecision", "ArtifactType", "ExecutionStatus", "RuntimeStore"]
+__all__ = [
+    "ApprovalDecision", "ArtifactType", "BatchService", "BatchStatus",
+    "ExecutionStatus", "RuntimeStore",
+]

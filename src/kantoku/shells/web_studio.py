@@ -11,7 +11,7 @@ import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
-from urllib.parse import unquote, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
@@ -19,6 +19,7 @@ from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.settings import ROOT
 from kantoku.core import budget
 from kantoku.core.approval import ApprovalService
+from kantoku.core.runtime.batch import BatchService
 from kantoku.core.runtime.graph import GraphRuntime
 from kantoku.core.runtime.models import ApprovalDecision
 from kantoku.core.runtime.runner import TaskRunner
@@ -72,7 +73,8 @@ class StudioApplication:
             build_comic_workflow(StudioComicServices(_provider()))
         )
         self.runtime.register(build_commerce_workflow())
-        self.approvals = ApprovalService(self.runtime_store)
+        self.approvals = ApprovalService(self.runtime_store, self.runtime)
+        self.batches = BatchService(self.runtime_store, self.runtime)
         self.skills = SkillRegistry()
         self.skills.load(comic_skills())
         self.runner = TaskRunner(max_workers=2)
@@ -353,6 +355,28 @@ class StudioApplication:
             for item in self.runtime_store.list_artifacts(run_id)
         ]
 
+    def query_core_artifacts(
+        self,
+        *,
+        run_id: str | None = None,
+        type_name: str | None = None,
+        domain: str | None = None,
+    ) -> list[dict[str, Any]]:
+        """跨 Run 查询产物。"""
+        from kantoku.core.runtime.models import ArtifactType
+
+        artifact_type = ArtifactType(type_name) if type_name else None
+        return [
+            item.model_dump(mode="json")
+            for item in self.runtime_store.list_artifacts(
+                run_id, type=artifact_type, domain=domain
+            )
+        ]
+
+    def get_core_artifact(self, artifact_id: str) -> dict[str, Any]:
+        """读取单个 Artifact。"""
+        return self.runtime_store.get_artifact(artifact_id).model_dump(mode="json")
+
     def list_core_approvals(self) -> list[dict[str, Any]]:
         """读取全部通用审批，pending 排在调用方所需顺序。"""
         return [
@@ -373,10 +397,48 @@ class StudioApplication:
             decision = decisions[action]
         except KeyError:
             raise ToolError("审批操作无效", detail=action) from None
-        record = self.approvals.decide(
+        run = self.approvals.decide_and_resume(
             approval_id, decision, data.get("response", data)
         )
-        return record.model_dump(mode="json")
+        payload = self._run_payload(run.id)
+        payload["decision"] = decision.value
+        return payload
+
+    def cancel_core_run(self, run_id: str) -> dict[str, Any]:
+        """取消一个尚未结束的 Run。"""
+        run = self.runtime.cancel(run_id)
+        return self._run_payload(run.id)
+
+    def create_core_batch(self, data: dict[str, Any]) -> dict[str, Any]:
+        """创建同一 Workflow 的通用 Batch。"""
+        workflow_id = str(data.get("workflow", "")).strip()
+        workflow = self.runtime.workflow(workflow_id)
+        raw_items = data.get("items")
+        if not isinstance(raw_items, list) or not raw_items:
+            raise ToolError("Batch items 必须是非空数组")
+        states = [workflow.state_type.model_validate(item) for item in raw_items]
+        batch = self.batches.create(
+            name=str(data.get("name", workflow_id)).strip() or workflow_id,
+            workflow_id=workflow_id,
+            states=states,
+            concurrency_limit=int(data.get("concurrency_limit", 2)),
+        )
+        return self._batch_payload(batch.id)
+
+    def _batch_payload(self, batch_id: str) -> dict[str, Any]:
+        batch = self.batches.refresh(batch_id)
+        payload = batch.model_dump(mode="json")
+        payload["runs"] = [self._run_payload(run_id) for run_id in batch.run_ids]
+        return payload
+
+    def list_core_batches(self) -> list[dict[str, Any]]:
+        """查询所有 Batch。"""
+        return [self._batch_payload(item.id) for item in self.runtime_store.list_batches()]
+
+    def cancel_core_batch(self, batch_id: str) -> dict[str, Any]:
+        """取消 Batch 中的未结束 Run。"""
+        self.batches.cancel(batch_id)
+        return self._batch_payload(batch_id)
 
     def start(self, action: str, data: dict[str, Any]) -> None:
         if action not in {
@@ -462,7 +524,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
             )
 
         def do_GET(self) -> None:
-            request_path = urlsplit(self.path).path
+            parsed = urlsplit(self.path)
+            request_path = parsed.path
             if not self.allowed(session=request_path.startswith(("/api/", "/media/"))):
                 self.json_reply(403, {"error": "请从本机工作台入口访问"})
                 return
@@ -502,6 +565,21 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(404, {"error": "Core API 路径不存在"})
                 elif request_path == "/api/approvals":
                     self.json_reply(200, {"approvals": app.list_core_approvals()})
+                elif request_path == "/api/artifacts":
+                    query = parse_qs(parsed.query)
+                    self.json_reply(200, {"artifacts": app.query_core_artifacts(
+                        run_id=query.get("run_id", [None])[0],
+                        type_name=query.get("type", [None])[0],
+                        domain=query.get("domain", [None])[0],
+                    )})
+                elif request_path.startswith("/api/artifacts/"):
+                    artifact_id = request_path.removeprefix("/api/artifacts/")
+                    self.json_reply(200, app.get_core_artifact(artifact_id))
+                elif request_path == "/api/batches":
+                    self.json_reply(200, {"batches": app.list_core_batches()})
+                elif request_path.startswith("/api/batches/"):
+                    batch_id = request_path.removeprefix("/api/batches/")
+                    self.json_reply(200, app._batch_payload(batch_id))
                 elif request_path.startswith("/media/"):
                     task = app.task(request_path.removeprefix("/media/"))
                     result = budget.load_generation_result(task.request_id)
@@ -541,10 +619,18 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif len(parts) == 4 and parts[:2] == ["api", "runs"] \
                         and parts[3] == "resume":
                     self.json_reply(200, app.resume_core_run(parts[2]))
+                elif len(parts) == 4 and parts[:2] == ["api", "runs"] \
+                        and parts[3] == "cancel":
+                    self.json_reply(200, app.cancel_core_run(parts[2]))
                 elif len(parts) == 4 and parts[:2] == ["api", "approvals"]:
                     self.json_reply(
                         200, app.decide_core_approval(parts[2], parts[3], data)
                     )
+                elif request_path == "/api/batches":
+                    self.json_reply(201, app.create_core_batch(data))
+                elif len(parts) == 4 and parts[:2] == ["api", "batches"] \
+                        and parts[3] == "cancel":
+                    self.json_reply(200, app.cancel_core_batch(parts[2]))
                 else:
                     app.start(request_path.removeprefix("/api/"), data)
                     self.json_reply(202, {"accepted": True})
