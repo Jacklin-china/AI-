@@ -1,0 +1,12 @@
+id: comic.compose_prompt
+name: Compose Comic Prompt
+domain: comic
+description: 复用 Studio 规则，把创作简报整理为可编辑提示词。
+version: 1.0.0
+required_tools: [compose_prompt]
+input_schema:
+  required: [subject, purpose, audience, style]
+output_schema:
+  required: [prompt]
+handler_file: handler.py
+handler: execute

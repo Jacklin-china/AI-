@@ -1,0 +1,12 @@
+id: commerce.calculate_pricing
+name: Calculate Pricing
+domain: commerce
+description: 根据成本、目标毛利与平台费率计算建议售价。
+version: 1.0.0
+required_tools: []
+input_schema:
+  required: [cost_fen, margin_rate, marketplace_fee_rate]
+output_schema:
+  required: [price_fen, currency]
+handler_file: handler.py
+handler: execute

@@ -1,0 +1,12 @@
+id: comic.archive_image
+name: Archive Reviewed Image
+domain: comic
+description: 复用不可变人工终审与图片归档能力。
+version: 1.0.0
+required_tools: [archive_reviewed_image]
+input_schema:
+  required: [request_id]
+output_schema:
+  required: [image_path, metadata_path]
+handler_file: handler.py
+handler: execute

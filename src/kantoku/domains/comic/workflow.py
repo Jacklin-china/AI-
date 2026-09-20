@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from kantoku.capabilities.video import VideoGenerationRequest, VideoService
 from kantoku.core.runtime.graph import (
     END,
     START,
@@ -20,7 +21,12 @@ from .services import ComicWorkflowServices
 WORKFLOW_ID = "comic.production.v1"
 
 
-def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[ComicState]:
+def build_comic_workflow(
+    service: ComicWorkflowServices,
+    *,
+    video_service: VideoService | None = None,
+    video_enabled: bool = False,
+) -> WorkflowDefinition[ComicState]:
     """构建复用现有生产能力的 Comic Workflow。"""
 
     def call(name: str, state: ComicState, _context: RuntimeContext) -> dict[str, Any]:
@@ -35,7 +41,7 @@ def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[C
 
     def archive(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
         update = dict(service.archive(state))
-        context.store.create_artifact(
+        artifact = context.store.create_artifact(
             type=ArtifactType.IMAGE,
             run_id=context.run_id,
             node_id=context.node_id,
@@ -43,7 +49,23 @@ def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[C
             location=update.get("archive_path"),
             metadata={"request_id": state.request_id, "domain": "comic"},
         )
+        update["image_artifact_id"] = artifact.id
         return update
+
+    def video(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
+        if video_service is None or state.image_artifact_id is None:
+            raise RuntimeError("video capability is not configured")
+        artifact = video_service.generate(VideoGenerationRequest(
+            request_id=f"video-{context.run_id}-{state.request_id}",
+            run_id=context.run_id,
+            node_id=context.node_id,
+            image_artifact_id=state.image_artifact_id,
+            prompt=state.prompt,
+            project=state.project,
+            shot_no=state.shot_no,
+            config={"optional": True},
+        ))
+        return {"video_artifact_id": artifact.id}
 
     def approval_route(state: ComicState) -> str:
         if state.approval_decision == ApprovalDecision.APPROVE:
@@ -75,6 +97,7 @@ def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[C
         ),
         "rework": WorkflowNode("rework", lambda s, c: call("rework", s, c)),
         "archive": WorkflowNode("archive", archive),
+        "video": WorkflowNode("video", video),
     }
     edges = {
         START: "prepare",
@@ -86,7 +109,11 @@ def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[C
             {"approve": "archive", "revise": "rework", "reject": END},
         ),
         "rework": "generate",
-        "archive": END,
+        "archive": ConditionalEdge(
+            lambda _state: "enabled" if video_enabled else "disabled",
+            {"enabled": "video", "disabled": END},
+        ),
+        "video": END,
     }
     return WorkflowDefinition(
         id=WORKFLOW_ID,
@@ -96,4 +123,3 @@ def build_comic_workflow(service: ComicWorkflowServices) -> WorkflowDefinition[C
         edges=edges,
         services={"comic": service},
     )
-

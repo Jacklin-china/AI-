@@ -15,8 +15,9 @@ from urllib.parse import parse_qs, unquote, urlsplit
 
 from pydantic import ValidationError
 
+from kantoku.capabilities.video import MockVideoProvider, VideoService
 from kantoku.config import KantokuError, ToolError, get_settings
-from kantoku.config.settings import ROOT
+from kantoku.config.settings import ROOT, VideoSettings
 from kantoku.core import budget
 from kantoku.core.approval import ApprovalService
 from kantoku.core.runtime.batch import BatchService
@@ -24,10 +25,9 @@ from kantoku.core.runtime.graph import GraphRuntime
 from kantoku.core.runtime.models import ApprovalDecision
 from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
-from kantoku.core.skills import SkillRegistry
+from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
 from kantoku.domains.comic.services import StudioComicServices
-from kantoku.domains.comic.skills import comic_skills
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
 from kantoku.domains.commerce import CommerceState, build_commerce_workflow
 from kantoku.domains.commerce.workflow import WORKFLOW_ID as COMMERCE_WORKFLOW_ID
@@ -69,14 +69,19 @@ class StudioApplication:
         database_path = configured if configured.is_absolute() else ROOT / configured
         self.runtime_store = RuntimeStore(database_path)
         self.runtime = GraphRuntime(self.runtime_store)
-        self.runtime.register(
-            build_comic_workflow(StudioComicServices(_provider()))
-        )
+        settings = get_settings()
+        video_settings = getattr(settings, "video", VideoSettings())
+        video = VideoService(self.runtime_store, MockVideoProvider(), video_settings)
+        self.runtime.register(build_comic_workflow(
+            StudioComicServices(_provider()),
+            video_service=video,
+            video_enabled=video_settings.enabled,
+        ))
         self.runtime.register(build_commerce_workflow())
         self.approvals = ApprovalService(self.runtime_store, self.runtime)
         self.batches = BatchService(self.runtime_store, self.runtime)
         self.skills = SkillRegistry()
-        self.skills.load(comic_skills())
+        SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
         self.runner = TaskRunner(max_workers=2)
 
     def task(self, request_id: str) -> StudioTask:
@@ -384,6 +389,10 @@ class StudioApplication:
             for item in self.runtime_store.list_approvals()
         ]
 
+    def list_core_skills(self) -> list[dict[str, Any]]:
+        """返回文件化 Skill metadata，不泄露机器绝对路径。"""
+        return [item.model_dump(mode="json") for item in self.skills.list()]
+
     def decide_core_approval(
         self, approval_id: str, action: str, data: dict[str, Any]
     ) -> dict[str, Any]:
@@ -565,6 +574,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(404, {"error": "Core API 路径不存在"})
                 elif request_path == "/api/approvals":
                     self.json_reply(200, {"approvals": app.list_core_approvals()})
+                elif request_path == "/api/skills":
+                    self.json_reply(200, {"skills": app.list_core_skills()})
                 elif request_path == "/api/artifacts":
                     query = parse_qs(parsed.query)
                     self.json_reply(200, {"artifacts": app.query_core_artifacts(

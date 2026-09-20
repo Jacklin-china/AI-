@@ -26,6 +26,7 @@ class SkillMetadata(BaseModel):
     required_tools: tuple[str, ...] = ()
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
+    handler_ref: str | None = None
 
 
 SkillExecutor = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]
@@ -62,6 +63,10 @@ class SkillRegistry:
             return self._skills[skill_id]
         except KeyError:
             raise ToolError("Skill 未注册", detail=skill_id) from None
+
+    def list(self) -> list[SkillMetadata]:
+        """按 ID 返回已注册 Skill metadata。"""
+        return [self._skills[key].metadata for key in sorted(self._skills)]
 
     def execute(
         self,

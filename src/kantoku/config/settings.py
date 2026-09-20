@@ -136,6 +136,26 @@ class StorageSettings(BaseModel):
     sqlite_path: Path
 
 
+class RuntimeSettings(BaseModel):
+    """Graph 与 Batch 的安全上限。"""
+
+    max_reworks: int = Field(default=1, ge=0, le=5, strict=True)
+    batch_max_concurrency: int = Field(default=2, gt=0, le=16, strict=True)
+
+
+class VideoSettings(BaseModel):
+    """可选视频能力配置；默认关闭。"""
+
+    enabled: bool = False
+    provider: str = "mock"
+    model: str = "mock-video-v1"
+    timeout_s: float = Field(default=30, gt=0, allow_inf_nan=False)
+    retry: int = Field(default=1, ge=0, le=3, strict=True)
+    estimated_fen: int = Field(default=1, gt=0, strict=True)
+    max_fen: int = Field(default=1, ge=0, strict=True)
+    output_dir: Path = Path("data/videos")
+
+
 class Settings(BaseSettings):
     """项目配置总入口；业务代码只通过 ``get_settings`` 获取配置。"""
 
@@ -146,6 +166,8 @@ class Settings(BaseSettings):
     image: ImageSettings
     budget: BudgetSettings
     storage: StorageSettings
+    runtime: RuntimeSettings = RuntimeSettings()
+    video: VideoSettings = VideoSettings()
 
 
 def _require_env(name: str) -> str:

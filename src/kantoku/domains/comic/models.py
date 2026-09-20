@@ -31,3 +31,5 @@ class ComicState(RunState):
     rework_count: int = Field(default=0, ge=0)
     max_reworks: int = Field(default=1, ge=0, le=3)
     archive_path: str | None = None
+    image_artifact_id: str | None = None
+    video_artifact_id: str | None = None

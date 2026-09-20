@@ -97,5 +97,19 @@ budget:                        # 成本红线：任何付费调用前必须检�
 storage:
   sqlite_path: data/kantoku.db # 项目库/台账/素材索引同一个库
 
+runtime:
+  max_reworks: 1               # Domain 返工硬上限，防止 Workflow 无限循环
+  batch_max_concurrency: 2     # Core Batch 本机并发上限
+
+video:
+  enabled: false               # 默认关闭；本轮仅提供显式 Mock Provider
+  provider: mock
+  model: mock-video-v1
+  timeout_s: 30
+  retry: 1                     # Provider 网络层重试，不与 Workflow retry 叠乘
+  estimated_fen: 1
+  max_fen: 1
+  output_dir: data/videos
+
 vtuber:
   base_url: ws://localhost:12393  # Open-LLM-VTuber 后端地址，W10 可选

@@ -1,0 +1,12 @@
+id: commerce.localize_listing
+name: Localize Listing
+domain: commerce
+description: 将商品 Listing 本地化为目标 locale；ru-RU 通过注入的 LLM Translation Tool。
+version: 1.0.0
+required_tools: [llm_translation]
+input_schema:
+  required: [listing, locale]
+output_schema:
+  required: [localized_listing, locale]
+handler_file: handler.py
+handler: execute
