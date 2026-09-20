@@ -566,6 +566,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     "/",
                     "/workspace",
                     "/runs",
+                    "/approvals",
+                    "/batches",
                     "/assets",
                     "/history",
                     "/skills",

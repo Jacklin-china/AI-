@@ -104,3 +104,79 @@ export interface GenerationSettings {
   quality: string
   quantity: number
 }
+
+export type ExecutionStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
+export type BatchStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'partial_failed' | 'cancelled'
+
+export interface NodeExecution {
+  run_id: string
+  node_id: string
+  status: ExecutionStatus
+  started_at: string | null
+  completed_at: string | null
+  retry_count: number
+  error: string | null
+  outputs: Record<string, unknown>
+}
+
+export interface CoreRun {
+  id: string
+  domain: string
+  workflow: string
+  status: ExecutionStatus
+  state: Record<string, unknown>
+  current_node: string
+  started_at: string
+  updated_at: string
+  completed_at: string | null
+  error: string | null
+  cost_fen: number
+  nodes: NodeExecution[]
+}
+
+export interface CoreApproval {
+  id: string
+  run_id: string
+  node_id: string
+  decision: 'pending' | 'approve' | 'reject' | 'request_revision'
+  request: Record<string, unknown>
+  response: Record<string, unknown>
+  created_at: string
+  decided_at: string | null
+}
+
+export interface CoreArtifact {
+  id: string
+  type: 'image' | 'video' | 'prompt' | 'document' | 'json' | 'listing' | 'report'
+  run_id: string
+  node_id: string
+  source: string
+  status: string
+  created_at: string
+  metadata: Record<string, unknown>
+  location: string | null
+  version: number
+}
+
+export interface CoreSkill {
+  id: string
+  name: string
+  domain: string
+  description: string
+  version: string
+  required_tools: string[]
+  input_schema: Record<string, unknown>
+  output_schema: Record<string, unknown>
+  handler_ref: string | null
+}
+
+export interface CoreBatch {
+  id: string
+  name: string
+  status: BatchStatus
+  concurrency_limit: number
+  created_at: string
+  updated_at: string
+  run_ids: string[]
+  runs: CoreRun[]
+}

@@ -8,12 +8,14 @@ import {
   History,
   House,
   Images,
+  Layers3,
   Megaphone,
   Palette,
   Settings,
   ShoppingBag,
   Sparkles,
   TableProperties,
+  UserCheck,
 } from 'lucide-vue-next'
 import type { FunctionalComponent } from 'vue'
 
@@ -27,6 +29,8 @@ const navItems: { name: string; label: string; path: string; icon: FunctionalCom
   { name: 'home', label: '首页', path: '/', icon: House, match: ['dashboard'] },
   { name: 'workspace', label: '工作台', path: '/workspace', icon: Frame, match: ['workspace'] },
   { name: 'runs', label: '任务与运行', path: '/runs', icon: TableProperties, match: ['runs', 'run_detail'] },
+  { name: 'approvals', label: '审批', path: '/approvals', icon: UserCheck, match: ['approvals'] },
+  { name: 'batches', label: '批量任务', path: '/batches', icon: Layers3, match: ['batches'] },
   { name: 'assets', label: '资产', path: '/assets', icon: Images, match: ['assets'] },
   { name: 'history', label: '历史记录', path: '/history', icon: History, match: ['history'] },
   { name: 'skills', label: '技能', path: '/skills', icon: Sparkles, match: ['skills'] },

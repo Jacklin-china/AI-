@@ -5,6 +5,7 @@ const labels: Record<string, string> = {
   running: '运行中', waiting: '等待', completed: '已完成', succeeded: '已完成',
   failed: '失败', cancelled: '已取消', unknown: '待核对', draft: '草稿',
   pending: '待启动', available: '可用', preview: '预览', coming_soon: '待上线',
+  approve: '已批准', reject: '已拒绝', request_revision: '要求修改', revise: '要求修改', partial_failed: '部分失败',
 }
 </script>
 

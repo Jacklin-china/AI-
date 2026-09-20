@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { AlertCircle, Check, Loader2, Minus } from 'lucide-vue-next'
 
-export type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'failed'
+export type WorkflowStepStatus = 'pending' | 'running' | 'waiting' | 'completed' | 'failed' | 'cancelled'
 export interface WorkflowStep { id: string; name: string; status: WorkflowStepStatus; detail?: string }
 defineProps<{ steps: WorkflowStep[]; compact?: boolean }>()
 </script>

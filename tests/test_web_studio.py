@@ -388,6 +388,74 @@ def test_core_api_run_approval_restart_resume_and_artifact(
         artifacts = json.loads(response.read())["artifacts"]
         assert response.status == 200
         assert artifacts[0]["metadata"]["mock"] is True
+
+        connection.request(
+            "GET",
+            f"/api/artifacts?domain=commerce&run_id={run_id}",
+            headers={"X-Studio-Token": app.token},
+        )
+        response = connection.getresponse()
+        global_artifacts = json.loads(response.read())["artifacts"]
+        assert response.status == 200
+        assert {item["id"] for item in global_artifacts} == {
+            item["id"] for item in artifacts
+        }
+        connection.request(
+            "GET",
+            f"/api/artifacts/{artifacts[0]['id']}",
+            headers={"X-Studio-Token": app.token},
+        )
+        response = connection.getresponse()
+        assert json.loads(response.read())["id"] == artifacts[0]["id"]
+
+        connection.request("GET", "/api/skills", headers={"X-Studio-Token": app.token})
+        response = connection.getresponse()
+        skills = json.loads(response.read())["skills"]
+        assert response.status == 200
+        assert {item["domain"] for item in skills} >= {"comic", "commerce"}
+        assert all(not str(item["handler_ref"]).startswith("C:\\") for item in skills)
+    finally:
+        connection.close()
+
+
+def test_core_batch_http_api_lists_and_cancels(
+    server: int,
+    app: web_studio.StudioApplication,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+    try:
+        connection.request(
+            "POST",
+            "/api/batches",
+            body=json.dumps({
+                "name": "HTTP five product demo",
+                "workflow": "commerce.production.v1",
+                "concurrency_limit": 2,
+                "items": [{"requirement": f"product {index}"} for index in range(5)],
+            }),
+            headers=headers,
+        )
+        response = connection.getresponse()
+        batch = json.loads(response.read())
+        assert response.status == 201
+        assert batch["status"] == "waiting"
+        assert len(batch["runs"]) == 5
+
+        connection.request("GET", "/api/batches", headers=headers)
+        response = connection.getresponse()
+        assert any(item["id"] == batch["id"] for item in json.loads(response.read())["batches"])
+        connection.request("GET", f"/api/batches/{batch['id']}", headers=headers)
+        response = connection.getresponse()
+        assert json.loads(response.read())["id"] == batch["id"]
+        connection.request(
+            "POST", f"/api/batches/{batch['id']}/cancel", body="{}", headers=headers
+        )
+        response = connection.getresponse()
+        cancelled = json.loads(response.read())
+        assert response.status == 200
+        assert cancelled["status"] == "cancelled"
+        assert all(run["status"] == "cancelled" for run in cancelled["runs"])
     finally:
         connection.close()
 

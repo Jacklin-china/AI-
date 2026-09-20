@@ -41,12 +41,12 @@ export const domains: DomainDefinition[] = [
     name: 'Commerce',
     label: '电商',
     icon: 'CO',
-    description: '跨境商品研究、素材与发布流程',
-    status: 'preview',
-    capabilities: ['Product Research', 'Listing', 'Product Assets'],
-    workflows: ['Product to Listing (Preview)'],
+    description: '跨境商品研究、定价、本地化、素材质检与发布审批；外部平台当前使用显式 Mock Adapter。',
+    status: 'available',
+    capabilities: ['Product Research', 'Pricing', 'Localization', 'Product Assets', 'Marketplace Draft'],
+    workflows: ['Commerce Production v1'],
     skills: [
-      { id: 'listing-draft', name: 'Listing Draft', description: 'Commerce Pack 尚未接入真实平台 Adapter。', status: 'preview', requiredTools: ['Marketplace Adapter'] },
+      { id: 'listing-draft', name: 'Listing Draft', description: '生成并本地化平台 Listing 草稿；Marketplace Adapter 当前为 Mock。', status: 'available', requiredTools: ['Mock Marketplace Adapter'] },
     ],
   },
   {
