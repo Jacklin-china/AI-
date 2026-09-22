@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+from datetime import UTC, datetime
 
 from kantoku.domains.commerce.models import Candidate
 
@@ -19,5 +20,9 @@ class MockSourceAdapter:
             cost_fen=1200 + index * 150,
             skus=[f"MOCK-{index + 1}-A", f"MOCK-{index + 1}-B"],
             source="mock-source",
+            source_external_id=f"DEMO-{digest[index:index + 8]}",
+            captured_at=datetime.now(UTC).isoformat(),
+            supplier="Demo Supplier",
+            raw_snapshot_hash=digest,
             mock=True,
         ) for index in range(3)]

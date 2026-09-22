@@ -9,7 +9,8 @@ from typing import Any, Protocol
 
 from pydantic import ValidationError
 
-from kantoku.config import ToolError
+from kantoku.config import ExternalJobPending, ToolError
+from kantoku.core import budget
 from kantoku.perception.qc import qc_image
 from kantoku.perception.review import (
     build_rework_plan,
@@ -60,15 +61,29 @@ class StudioComicServices:
         return {"request_id": task.request_id}
 
     def generate(self, state: ComicState) -> Mapping[str, Any]:
-        """调用现有幂等生图入口。"""
+        """调用现有幂等生图入口；失败时释放未提交的预占，避免泄漏占用预算。"""
         if state.request_id is None:
             raise ToolError("Comic Run 尚未准备生成任务")
         task = next((item for item in list_tasks() if item.request_id == state.request_id), None)
         if task is None:
             raise ToolError("找不到 Comic 生成任务", detail=state.request_id)
-        result = execute_task(task, provider=self.provider, confirmed=state.confirmed)
+        try:
+            result = execute_task(task, provider=self.provider, confirmed=state.confirmed)
+        except Exception:
+            reservation = budget.get_reservation(state.request_id)
+            if reservation is not None and reservation.status == "reserved":
+                budget.release(state.request_id)
+            raise
+        if result.path is None:
+            reason = (result.error or "供应商未返回图片，请稍后查询原任务").strip()
+            if result.status == "unknown":
+                raise ExternalJobPending(
+                    reason[:120],
+                    needs_reconciliation="NEEDS_RECONCILIATION" in reason,
+                )
+            raise ToolError(f"图片生成未完成：{reason[:120]}")
         return {
-            "image_path": str(result.path) if result.path else None,
+            "image_path": str(result.path),
             "provider_job_id": result.provider_job_id,
         }
 

@@ -20,7 +20,7 @@ from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 
 
-def test_skill_loader_discovers_four_file_skills() -> None:
+def test_skill_loader_discovers_file_skills() -> None:
     registry = SkillRegistry()
     metadata = SkillLoader(ROOT / "skills", project_root=ROOT).load(registry)
     assert {item.id for item in metadata} == {
@@ -28,6 +28,7 @@ def test_skill_loader_discovers_four_file_skills() -> None:
         "comic.compose_prompt",
         "commerce.calculate_pricing",
         "commerce.localize_listing",
+        "commerce.product_image",
     }
     assert all(item.handler_ref and not Path(item.handler_ref.split(":")[0]).is_absolute()
                for item in metadata)

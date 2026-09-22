@@ -10,9 +10,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
+from loguru import logger
 from pydantic import ValidationError
 
 from kantoku.config import BudgetError, ToolError
+from kantoku.config.observability import current_run_id
 from kantoku.core.budget import (
     ReservationRequest,
     claim_submission,
@@ -168,6 +170,8 @@ class LocalFakeImageProvider:
 
 def _unknown_result(provider_job_id: str | None, error: BaseException) -> ImageGenerationResult:
     detail = str(error) if isinstance(error, ToolError) else type(error).__name__
+    if provider_job_id is None:
+        detail = f"NEEDS_RECONCILIATION：{detail}"
     return ImageGenerationResult(
         path=None,
         provider_job_id=provider_job_id,
@@ -185,14 +189,23 @@ def _record_result(
     if result.provider_job_id not in {None, provider_job_id}:
         raise ToolError("供应商查询结果的任务 ID 不一致")
     normalized = result.model_copy(update={"provider_job_id": provider_job_id})
+    logger.bind(component="image-generation", generation_request_id=reservation_id,
+                provider_task_id=provider_job_id).info("result status={}", normalized.status)
     mark_outcome(
         reservation_id,
         normalized.status,
         provider_job_id=provider_job_id,
     )
     save_generation_result(reservation_id, normalized)
+    if normalized.path is not None:
+        logger.bind(component="image-generation", generation_request_id=reservation_id,
+                    provider_task_id=provider_job_id).info("download path={}", normalized.path)
     if normalized.actual_fen is not None:
         settle(reservation_id, normalized.actual_fen)
+        logger.bind(
+            component="image-generation", generation_request_id=reservation_id,
+            provider_task_id=provider_job_id,
+        ).info("settle actual_fen={}", normalized.actual_fen)
     return normalized
 
 
@@ -245,6 +258,9 @@ def prepare_image_reservation(
             kind="image",
             est_fen=estimated_fen,
             model=provider.model_id,
+            run_id=current_run_id(),
+            provider=str(provider.generation_identity().get("provider", "unknown")),
+            idempotency_key=client_request_id,
         )
     except ValidationError as error:
         raise BudgetError("生图预占参数无效", detail=type(error).__name__) from error
@@ -276,25 +292,38 @@ def gen_image(
     )
     client_request_id = request.reservation_id
     reservation = reserve(**request.model_dump())
+    provider_name = str(provider.generation_identity().get("provider", "unknown"))
+    event = logger.bind(component="image-generation", generation_request_id=client_request_id,
+                        idempotency_key=client_request_id, provider=provider_name)
+    event.info("reserve status={} est_fen={}", reservation.status, reservation.est_fen)
     if reservation.status != "reserved":
         saved = load_generation_result(client_request_id)
         if saved is not None:
-            if saved.path is not None and not saved.path.is_file():
+            if saved.status != "unknown" and saved.path is not None and not saved.path.is_file():
                 raise ToolError("原图片文件已缺失，请核对原任务文件；不会自动付费重生成")
-            return saved
+            if saved.status != "unknown":
+                return saved
+        if reservation.status == "released":
+            raise BudgetError("原请求未提交且预算已释放；请重新确认费用后创建新生成请求")
+        if reservation.provider_job_id is not None:
+            event.bind(provider_task_id=reservation.provider_job_id).info("poll existing task")
+            return reconcile_image(client_request_id, provider=provider)
+        event.warning("needs_reconciliation provider_task_id missing status={}", reservation.status)
         return ImageGenerationResult(
             path=None,
-            provider_job_id=reservation.provider_job_id,
+            provider_job_id=None,
             status="unknown",
             actual_fen=None,
-            error="该请求已提交过，未再次付费提交；请查询或人工对账",
+            error="NEEDS_RECONCILIATION：原任务缺少供应商任务 ID，请人工查账；不会重新提交",
         )
 
     if not claim_submission(client_request_id):
+        event.info("submit already claimed by another worker")
         return ImageGenerationResult(
             status="unknown", error="该请求已由另一执行者领取，请查询原任务"
         )
     try:
+        event.info("submit once")
         provider_job_id = provider.submit(
             prompt=prompt,
             shot_no=shot_no,
@@ -306,8 +335,10 @@ def gen_image(
             raise ToolError("供应商未返回任务 ID")
         provider_job_id = provider_job_id.strip()
         mark_submitted(client_request_id, provider_job_id=provider_job_id)
+        event.bind(provider_task_id=provider_job_id).info("submitted")
     except (Exception, KeyboardInterrupt) as error:
         mark_outcome(client_request_id, "unknown")
+        event.warning("submit outcome unknown exception={}", type(error).__name__)
         result = _unknown_result(None, error)
         save_generation_result(client_request_id, result)
         if isinstance(error, KeyboardInterrupt):
@@ -315,6 +346,7 @@ def gen_image(
         return result
 
     try:
+        event.bind(provider_task_id=provider_job_id).info("poll")
         result = provider.query(provider_job_id)
     except (Exception, KeyboardInterrupt) as error:
         mark_outcome(
@@ -323,6 +355,9 @@ def gen_image(
             provider_job_id=provider_job_id,
         )
         result = _unknown_result(provider_job_id, error)
+        event.bind(provider_task_id=provider_job_id).warning(
+            "poll outcome unknown exception={}", type(error).__name__
+        )
         save_generation_result(client_request_id, result)
         if isinstance(error, KeyboardInterrupt):
             raise
@@ -349,14 +384,19 @@ def reconcile_image(
     if reservation.status == "released":
         raise BudgetError("生图任务预算已经释放")
     if reservation.provider_job_id is None:
+        logger.bind(component="image-generation", generation_request_id=client_request_id).warning(
+            "needs_reconciliation provider_task_id missing status={}", reservation.status
+        )
         return ImageGenerationResult(
             path=None,
             provider_job_id=None,
             status="unknown",
             actual_fen=None,
-            error="供应商任务 ID 未返回，需要人工查账",
+            error="NEEDS_RECONCILIATION：供应商任务 ID 未返回，需要人工查账",
         )
     try:
+        logger.bind(component="image-generation", generation_request_id=client_request_id,
+                    provider_task_id=reservation.provider_job_id).info("poll existing task")
         result = provider.query(reservation.provider_job_id)
     except (Exception, KeyboardInterrupt) as error:
         result = _unknown_result(reservation.provider_job_id, error)

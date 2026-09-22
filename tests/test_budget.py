@@ -55,6 +55,34 @@ def _reserve(reservation_id: str, *, shot_no: int = 1, est_fen: int = 30) -> Bud
     )
 
 
+def test_existing_ledger_gains_generation_metadata_without_losing_rows(
+    isolated_database: Path,
+) -> None:
+    isolated_database.parent.mkdir(parents=True, exist_ok=True)
+    with sqlite3.connect(isolated_database) as connection:
+        connection.execute(
+            "CREATE TABLE ledger (reservation_id TEXT PRIMARY KEY, job TEXT, "
+            "project TEXT, episode TEXT, shot_no INTEGER, kind TEXT, est_fen INTEGER, "
+            "actual_fen INTEGER, model TEXT, provider_job_id TEXT, status TEXT, "
+            "created_at TEXT, updated_at TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO ledger VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            ("historical", "old-job", "project", "episode", 1, "image", 30,
+             None, "old-model", "old-task-id", "unknown", "2026-09-20 00:00:00",
+             "2026-09-20 00:00:00"),
+        )
+
+    record = budget.get_reservation("historical")
+    assert record is not None
+    assert record.status == "unknown"
+    assert record.provider_job_id == "old-task-id"
+    assert record.run_id is None
+    assert record.provider is None
+    assert record.idempotency_key is None
+    assert record.artifact_id is None
+
+
 def test_estimate_image_cost_uses_conservative_config_rounding() -> None:
     assert budget.estimate_image_fen() == 30
     assert budget.estimate_image_fen(1) == 10

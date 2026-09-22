@@ -1,0 +1,12 @@
+id: commerce.product_image
+name: Commerce Product Image
+domain: commerce
+description: 将商品、SKU、渠道与约束整理为结构化商品图 Brief 和 Prompt。
+version: 1.0.0
+required_tools: [image_capability]
+input_schema:
+  required: [product_name, sku, marketplace, locale, revision]
+output_schema:
+  required: [brief, prompt]
+handler_file: handler.py
+handler: execute

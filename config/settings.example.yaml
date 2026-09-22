@@ -7,17 +7,17 @@ app:
   log_level: INFO              # DEBUG / INFO / WARNING
 
 llm:
-  base_url: https://api.openai.com/v1
-  model_chat: gpt-5.6-sol
-  api_key_env: OPENAI_API_KEY
-  chat_extra_body:
-    reasoning_effort: low
+  # 主文本模型：DeepSeek，密钥只放根目录 .env
+  base_url: https://api.deepseek.com/v1
+  model_chat: deepseek-chat
+  api_key_env: DEEPSEEK_API_KEY
+  chat_extra_body: {}
 
-  vision_base_url: https://api.openai.com/v1
-  model_vision: gpt-5.6-sol
-  vision_api_key_env: OPENAI_API_KEY
-  vision_extra_body:
-    reasoning_effort: low
+  # 视觉理解：火山方舟豆包多模态；即梦 AK/SK 只用于下方 Visual API 生图。
+  vision_base_url: https://ark.cn-beijing.volces.com/api/v3
+  model_vision: doubao-seed-2-0-lite-260428
+  vision_api_key_env: ARK_API_KEY
+  vision_extra_body: {}
   vision_max_tokens: 512       # 质检只返回短 JSON，限制输出成本
   vision_max_image_bytes: 10485760
 
@@ -51,18 +51,19 @@ llm:
   structured_temperature: 1.0
   max_tokens: 4096
   timeout_s: 60
-  retry: 1
+  retry: 2
+  retry_backoff_s: 1
   chat_use_temperature: false
-  chat_max_tokens_parameter: max_completion_tokens
+  chat_max_tokens_parameter: max_tokens
   vision_use_temperature: false
-  vision_max_tokens_parameter: max_completion_tokens
+  vision_max_tokens_parameter: max_tokens
   fallback_use_temperature: true
   fallback_max_tokens_parameter: max_tokens
 
 image:
-  provider: openai-gpt-image
-  base_url: https://api.openai.com/v1
-  model: gpt-image-2.5-flare
+  provider: volcengine-jimeng
+  base_url: https://visual.volcengineapi.com
+  model: high_aes_general_v40
   region: cn-north-1
   service: cv
   api_version: "2022-08-31"
@@ -70,7 +71,7 @@ image:
   query_action: CVSync2AsyncGetResult
   access_key_env: VOLC_ACCESSKEY
   secret_key_env: VOLC_SECRETKEY
-  api_key_env: OPENAI_API_KEY
+  api_key_env: VOLC_ACCESSKEY
   quality: medium
   output_format: png
   width: 2560                   # 官方推荐的 2K 16:9 尺寸
@@ -96,6 +97,13 @@ budget:                        # 成本红线：任何付费调用前必须检�
 
 storage:
   sqlite_path: data/kantoku.db # 项目库/台账/素材索引同一个库
+
+commerce:
+  data_mode: production       # production 无真实 Source 时阻断；demo 才启用 Mock Data
+  image_mode: mock            # real 时仍先经过验收上限和统一预算控制
+  text_mode: mock             # real 时复用 Core LLM
+  real_image_acceptance_max_fen: 30
+  marketplace: Ozon Mock Marketplace
 
 runtime:
   max_reworks: 1               # Domain 返工硬上限，防止 Workflow 无限循环

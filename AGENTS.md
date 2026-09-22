@@ -1,34 +1,10 @@
-# AGENTS.md — AI 协作开发约束（每次会话必须先读本文件）
+# Kantoku AI 协作规范
 
-项目：kantoku-agent（监督酱 · AI 漫剧副导演）。
-本文件是 AI 编码助手（ZCode/Claude 等）在本仓库工作的**入口约束**，与 docs/01-开发规范.md 具有同等效力。
+任何 AI 或自动化工具修改本仓库前，先读本文件并核实当前代码。详细的实现边界与交付步骤见 [docs/engineering/README.md](docs/engineering/README.md)。
 
-## 会话工作流（每次开发会话按此执行）
-
-1. 先读 `docs/03-项目开发流程.md` 确认当前里程碑，再读 `docs/04-功能开发引导.md` §0 的进度指针确认今天的任务；**只做当前里程碑范围内的任务**。
-2. 动手前读相关文档（01 规范 / 02 选型 / 03 流程）；需求只从 `docs/03` §8.2 的工时成本表取，不自行发明功能。
-3. 新增/修改代码必须：类型注解完整、配置走 `kantoku.config.get_settings()`、异常走 `kantoku.config.errors` 体系。
-4. 完成标准（自 M1 有代码起适用）：`uv run ruff check .` 与 `uv run pytest` 全绿，否则不得收尾。
-5. 收尾动作：更新 `docs/03` §10 的周日自检记录 → 按 Conventional Commits 给出提交信息建议。
-
-> 文档只有四份：`01 规范` · `02 选型` · `03 流程（周次与验收）` · `04 引导（今天写什么）`。
-
-## 硬性红线（违反即返工）
-
-- 密钥只存 `.env`；代码、日志、文档、提交信息中出现真实密钥 = 立即作废密钥并返工。
-- 模型名、端点、价格、预算、超时只从 `config/settings.yaml` 读取，**禁止硬编码**。
-- 任何付费调用（生图/图生视频）必须先过预算控制器（reserve → 调用 → settle），超限抛 `BudgetError` 并由 Agent 语音告知，禁止默默失败。
-- 外部调用必须有超时与重试（默认 timeout_s=30、retry=2）；禁止裸 `except:`。
-- 公共函数必须有类型注解；新增第三方依赖必须先在 `docs/02` 登记用途与理由。
-- **禁止修改 Open-LLM-VTuber 底座核心代码**，只通过其对外接口集成；底座独立运行。
-
-## 范围冻结
-
-`docs/03-项目开发流程.md` §1.3 的"明确不做"清单（模型微调、Agent 框架运行时依赖、
-向量数据库集群、ComfyUI 本地部署、多 Agent 编排、底座作前置依赖）在任何会话中都不得实现；
-相关想法写进该文档的 Future Work 即可。
-
-## 环境注意（Windows）
-
-- 全程 UTF-8；文件读写显式 `encoding="utf-8"`；路径一律 `pathlib.Path`。
-- 行尾 LF（见 `.gitattributes`）；命令行环境为 cmd，注意命令兼容性。
+- **One Core. Multiple Domains.** `core/` 只放通用 Run、Workflow、预算、审批、Artifact、Skill 等机制；不得出现 Comic、Commerce、Ozon、SKU 等领域逻辑。领域业务放 `domains/`，通用 AI 能力放 `capabilities/`，外部模型与平台通过 Adapter 接入。
+- Skill 必须能从目录发现并独立测试，不把 Provider 写死在 Skill 或 Core 中。优先复用已有实现，不为修一个问题造第二套系统；禁止 `*_new`、`*_old`、`*_backup`、`*_final`、`*_v2` 式复制开发。
+- Secret 只放被 Git 忽略的 `.env`；模型、端点、价格与预算只从 `config/settings.yaml` 读取。任何付费生成都要遵守预占、单次提交、查询、结算；未知账单不得自动重提。
+- Python 后端必须能通过 `python -m kantoku serve` 和 PyCharm 的 **Kantoku Backend → Run** 一键启动。Vue 3 + TypeScript + Vite 前端只维护 `frontend/` 一份源码，由前端自己的 `npm run dev` 启动。
+- 所有异常必须关联日志、`trace_id`、`error_id` 和完整脱敏 traceback；不能记录 Secret。修 Bug 必须补能复现问题的回归测试。
+- 修改前先审计引用、路由、动态加载、Skill manifest 与测试，保留用户现有改动和业务记录。功能完成须通过结构检查、ruff、pytest、前端构建与类型检查，检查 Git diff 和敏感文件后创建有意义的 commit，并推送当前 GitHub origin；禁止 force push。无法完成的验收须明确标记 BLOCKED。

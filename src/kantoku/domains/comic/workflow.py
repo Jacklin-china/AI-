@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from kantoku.capabilities.video import VideoGenerationRequest, VideoService
+from kantoku.core.budget import attach_image_artifact
 from kantoku.core.runtime.graph import (
     END,
     START,
@@ -16,7 +17,7 @@ from kantoku.core.runtime.graph import (
 from kantoku.core.runtime.models import ApprovalDecision, ArtifactType
 
 from .models import ComicState
-from .services import ComicWorkflowServices
+from .services import ComicWorkflowServices, StudioComicServices
 
 WORKFLOW_ID = "comic.production.v1"
 
@@ -39,6 +40,15 @@ def build_comic_workflow(
             raise RuntimeError("approval decision is missing")
         return dict(service.review(state, decision.value, context.approval_response))
 
+    def approve_cost(_state: ComicState, context: RuntimeContext) -> dict[str, Any]:
+        decision = context.approval_decision
+        if decision is None:
+            return {"confirmed": True, "cost_decision": "approve"}
+        return {
+            "confirmed": decision is ApprovalDecision.APPROVE,
+            "cost_decision": decision.value,
+        }
+
     def archive(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
         update = dict(service.archive(state))
         artifact = context.store.create_artifact(
@@ -50,6 +60,8 @@ def build_comic_workflow(
             metadata={"request_id": state.request_id, "domain": "comic"},
         )
         update["image_artifact_id"] = artifact.id
+        if isinstance(service, StudioComicServices) and state.request_id is not None:
+            attach_image_artifact(state.request_id, artifact.id)
         return update
 
     def video(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
@@ -79,6 +91,20 @@ def build_comic_workflow(
 
     nodes = {
         "prepare": WorkflowNode("prepare", lambda s, c: call("prepare", s, c)),
+        "cost_approval": WorkflowNode(
+            "cost_approval", approve_cost, requires_approval=True,
+            approval_when=lambda state: not state.confirmed,
+            approval_request=lambda state: {
+                "kind": "cost_approval", "estimate_fen": state.estimate_fen,
+                "project": state.project, "provider": "Jimeng",
+                "message": (
+                    "批准后才会调用付费生图服务。"
+                    if state.image_count <= 1
+                    else f"识别到 {state.image_count} 张需求；当前每次任务生成 1 张，"
+                         "批准后才会调用付费生图服务，剩余张数将在后续任务中逐张确认。"
+                ),
+            },
+        ),
         "generate": WorkflowNode(
             "generate", lambda s, c: call("generate", s, c), retry_limit=1
         ),
@@ -101,7 +127,11 @@ def build_comic_workflow(
     }
     edges = {
         START: "prepare",
-        "prepare": "generate",
+        "prepare": "cost_approval",
+        "cost_approval": ConditionalEdge(
+            lambda state: "approve" if state.cost_decision in {None, "approve"} else "reject",
+            {"approve": "generate", "reject": END},
+        ),
         "generate": "qc",
         "qc": "human_review",
         "human_review": ConditionalEdge(

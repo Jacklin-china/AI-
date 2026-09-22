@@ -177,6 +177,49 @@ export interface CoreBatch {
   concurrency_limit: number
   created_at: string
   updated_at: string
+  version: number
   run_ids: string[]
   runs: CoreRun[]
+  progress: {
+    total: number
+    completed: number
+    waiting: number
+    failed: number
+    cancelled: number
+    percent: number
+    cost_fen: number
+  }
+}
+
+export type ConversationMessageType = 'text' | 'plan' | 'status' | 'approval' | 'artifact' | 'error'
+
+export interface ConversationMessage {
+  id: string
+  conversation_id: string
+  role: 'user' | 'assistant' | 'system'
+  type: ConversationMessageType
+  content: string
+  run_id: string | null
+  event_id: string | null
+  created_at: string
+}
+
+export interface Conversation {
+  id: string
+  title: string
+  interaction_mode: 'autonomous' | 'guided'
+  domain: string | null
+  active_run_id: string | null
+  created_at: string
+  updated_at: string
+  messages?: ConversationMessage[]
+}
+
+export interface IntentPlan {
+  intent: string
+  needs_execution: boolean
+  suggested_domain: string | null
+  suggested_skills: string[]
+  confidence: number
+  clarification: string | null
 }

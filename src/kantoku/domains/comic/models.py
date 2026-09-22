@@ -16,7 +16,9 @@ class ComicState(RunState):
     prompt: str
     shot_no: int = Field(gt=0)
     estimate_fen: int = Field(gt=0)
+    image_count: int = Field(default=1, ge=1, le=20)
     confirmed: bool = False
+    cost_decision: str | None = None
     target_platform: str = "studio"
     genre: str = "comic"
     target_audience: str = "general"

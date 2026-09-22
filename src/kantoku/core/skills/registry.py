@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from typing import Any
 from uuid import uuid4
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict
 
 from kantoku.config import ToolError
@@ -82,14 +83,20 @@ class SkillRegistry:
         skill = self.get(skill_id)
         execution_id = f"skill-exec-{uuid4().hex}"
         started = utc_now()
+        activity = logger.bind(
+            component="skill", skill=skill_id, run_id=run_id, node_id=node_id,
+        )
+        activity.info("skill execution started id={}", execution_id)
         try:
             outputs = dict(skill.executor(inputs, context))
         except Exception as error:
+            activity.error("skill execution failed id={} exception={}",
+                           execution_id, type(error).__name__)
             if store is not None:
                 store.save_skill_execution(SkillExecutionRecord(
                     id=execution_id, run_id=run_id, node_id=node_id, skill_id=skill_id,
                     status=ExecutionStatus.FAILED, started_at=started,
-                    completed_at=utc_now(), error=f"{type(error).__name__}: {error}",
+                    completed_at=utc_now(), error=type(error).__name__,
                 ))
             raise
         if store is not None:
@@ -98,4 +105,5 @@ class SkillRegistry:
                 status=ExecutionStatus.COMPLETED, started_at=started,
                 completed_at=utc_now(), outputs=outputs,
             ))
+        activity.info("skill execution completed id={}", execution_id)
         return outputs

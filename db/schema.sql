@@ -65,6 +65,10 @@ CREATE TABLE IF NOT EXISTS ledger (
     provider_job_id TEXT CHECK (
         provider_job_id IS NULL OR length(trim(provider_job_id)) > 0
     ),
+    run_id TEXT,
+    provider TEXT,
+    idempotency_key TEXT,
+    artifact_id TEXT,
     status TEXT NOT NULL CHECK (
         status IN (
             'reserved', 'submitted', 'succeeded', 'failed',

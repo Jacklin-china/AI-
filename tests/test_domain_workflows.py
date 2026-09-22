@@ -11,6 +11,7 @@ from kantoku.adapters.commerce import (
     MockSourceAdapter,
     MockTranslationAdapter,
 )
+from kantoku.config import ExternalJobPending
 from kantoku.config.settings import ROOT
 from kantoku.core.runtime.graph import GraphRuntime
 from kantoku.core.runtime.models import ApprovalDecision, ExecutionStatus
@@ -84,6 +85,33 @@ def test_comic_workflow_waits_resumes_and_archives(tmp_path: Path) -> None:
     assert completed.state["archive_path"] == "/fake/archive.png"
     assert services.generated == 1
     assert store.list_artifacts(completed.id)[0].source == "comic.archive"
+
+
+def test_external_job_waits_across_runtime_restart_then_resumes(tmp_path: Path) -> None:
+    class PendingOnceServices(FakeComicServices):
+        def generate(self, state: ComicState) -> Mapping[str, Any]:
+            if self.generated == 0:
+                self.generated += 1
+                raise ExternalJobPending("供应商仍在生成中")
+            return super().generate(state)
+
+    store_path = tmp_path / "pending.db"
+    services = PendingOnceServices()
+    workflow = build_comic_workflow(services)
+    runtime = GraphRuntime(RuntimeStore(store_path))
+    runtime.register(workflow)
+    waiting = runtime.start(workflow.id, ComicState(
+        project="demo", prompt="scene", shot_no=1, estimate_fen=10, confirmed=True
+    ))
+    assert waiting.status is ExecutionStatus.WAITING
+    assert waiting.current_node == "generate"
+
+    restarted = GraphRuntime(RuntimeStore(store_path))
+    restarted.register(workflow)
+    resumed = restarted.resume(waiting.id)
+    assert resumed.status is ExecutionStatus.WAITING
+    assert resumed.current_node == "human_review"
+    assert services.generated == 2
 
 
 def test_comic_revision_loops_once_and_requests_new_approval(tmp_path: Path) -> None:

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from concurrent.futures import Future, ThreadPoolExecutor
+from contextvars import copy_context
 from dataclasses import dataclass
 from queue import Empty, Queue
 from threading import Event, Thread
@@ -91,7 +92,8 @@ class TaskRunner:
 
     def submit(self, execute: Callable[[], Any]) -> Future[Any]:
         """提交任务并返回可查询 Future。"""
-        return self._executor.submit(execute)
+        context = copy_context()
+        return self._executor.submit(context.run, execute)
 
     def close(self) -> None:
         """等待已提交任务后关闭。"""

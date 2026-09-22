@@ -4,6 +4,7 @@ import json
 import re
 import threading
 from collections.abc import Iterator
+from datetime import UTC, datetime
 from http.client import HTTPConnection
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,8 +12,9 @@ from types import SimpleNamespace
 import pytest
 from test_image_gen import _settings
 
-from kantoku.config import ToolError
+from kantoku.config import ToolError, logging_setup
 from kantoku.core import budget
+from kantoku.core.conversations import ConversationMessageRecord, MessageRole, MessageType
 from kantoku.domains.comic import services as comic_services
 from kantoku.perception import report, review
 from kantoku.schemas.qc import QcResult
@@ -88,6 +90,40 @@ def test_http_root_and_session_boundary(server: int, app: web_studio.StudioAppli
         assert state["budgets"] == {}
     finally:
         connection.close()
+
+
+def test_http_trace_and_error_id_match_structured_log(
+    server: int, app: web_studio.StudioApplication,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    try:
+        logging_setup.setup_logging("INFO")
+        headers = {"X-Studio-Token": app.token, "X-Trace-ID": "trace-http-test-123"}
+        connection.request("GET", "/api/runs", headers=headers)
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.getheader("X-Trace-ID") == headers["X-Trace-ID"]
+        response.read()
+        connection.request("POST", "/api/runs", body="{", headers=headers)
+        response = connection.getresponse()
+        assert response.status == 400
+        failure = json.loads(response.read())
+        assert failure["trace_id"] == headers["X-Trace-ID"]
+        assert failure["error_kind"] == "invalid_input"
+        records = [
+            json.loads(line)["record"] for line in
+            (tmp_path / "logs" / "kantoku.log").read_text(encoding="utf-8").splitlines()
+        ]
+        assert any(record["extra"]["trace_id"] == headers["X-Trace-ID"]
+                   and "request start" in record["message"] for record in records)
+        assert any(record["extra"]["error_id"] == failure["error_id"]
+                   and "web_studio.py" in record["message"] for record in records)
+        assert app.token not in json.dumps(records)
+    finally:
+        connection.close()
+        logging_setup.logger.remove()
 
 
 def test_vue_bundle_is_served_without_exposing_session_token(
@@ -498,3 +534,30 @@ def test_comic_core_uses_existing_generate_qc_review_and_archive(
     assert completed["status"] == "completed"
     assert Path(completed["state"]["archive_path"]).is_file()
     assert app.list_core_artifacts(waiting["id"])[0]["source"] == "comic.archive"
+
+
+def _chat_message(role: MessageRole) -> ConversationMessageRecord:
+    return ConversationMessageRecord(
+        id="m1", conversation_id="c1", role=role, type=MessageType.TEXT,
+        content="内容", run_id=None, event_id=None,
+        created_at=datetime.now(UTC),
+    )
+
+
+def test_image_count_parses_quantity_words() -> None:
+    assert web_studio._image_count("帮我生成一张写实人像") == 1
+    assert web_studio._image_count("生成3张海报") == 3
+    assert web_studio._image_count("做五张概念图") == 5
+    assert web_studio._image_count("画两只猫") == 2
+    assert web_studio._image_count("随便聊聊") == 1
+    assert web_studio._image_count("生成99张图") == 20
+
+
+def test_execution_confirmation_needs_short_phrase_and_prior_guidance() -> None:
+    assistant = [_chat_message(MessageRole.ASSISTANT)]
+    user_only = [_chat_message(MessageRole.USER)]
+    assert web_studio._is_execution_confirmed("可以", assistant) is True
+    assert web_studio._is_execution_confirmed("开始生成", assistant) is True
+    assert web_studio._is_execution_confirmed("可以", user_only) is False
+    assert web_studio._is_execution_confirmed("可以" * 40, assistant) is False
+    assert web_studio._is_execution_confirmed("帮我做一张图", assistant) is False

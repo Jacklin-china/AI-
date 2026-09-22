@@ -12,12 +12,14 @@ from types import SimpleNamespace
 import pytest
 
 from kantoku.config import BudgetError, ToolError
+from kantoku.config.observability import run_trace
 from kantoku.core import budget
 from kantoku.schemas.media import ImageGenerationResult
 from kantoku.tools import image_gen
 from kantoku.tools.image_gen import (
     LocalFakeImageProvider,
     gen_image,
+    prepare_image_reservation,
     reconcile_image,
     release_failed_image,
 )
@@ -155,7 +157,7 @@ def test_submit_timeout_becomes_unknown_and_same_request_is_not_resubmitted(
     assert saved is not None and saved.status == "unknown"
     saved_result = budget.load_generation_result("submit-timeout")
     assert saved_result is not None
-    assert saved_result.error == "TimeoutError，需查询或人工对账"
+    assert saved_result.error == "NEEDS_RECONCILIATION：TimeoutError，需查询或人工对账"
 
 
 class _RecoveringQueryProvider(LocalFakeImageProvider):
@@ -186,6 +188,67 @@ def test_query_timeout_is_reconciled_without_second_paid_submission(tmp_path: Pa
     assert saved is not None
     assert saved.status == "settled"
     assert saved.actual_fen == 20
+
+
+def test_retry_of_submitted_job_polls_original_task_without_resubmit(tmp_path: Path) -> None:
+    provider = _RecoveringQueryProvider(
+        tmp_path / "images", model_id="configured-image-model", actual_fen=20
+    )
+    first = _generate(provider, client_request_id="existing-job")
+    recovered = _generate(provider, client_request_id="existing-job")
+
+    assert first.status == "unknown"
+    assert recovered.status == "succeeded"
+    assert recovered.provider_job_id == first.provider_job_id
+    assert provider.submit_count == 1
+    assert provider.query_count == 2
+    assert budget.get_reservation("existing-job").actual_fen == 20
+
+
+def test_released_before_submit_is_not_misreported_as_paid_job(tmp_path: Path) -> None:
+    provider = LocalFakeImageProvider(
+        tmp_path / "images", model_id="configured-image-model", actual_fen=20
+    )
+    request = prepare_image_reservation(
+        "雨夜便利店，人物站在收银台前", 1,
+        project="video-001", episode="episode-001",
+        client_request_id="released-before-submit", provider=provider,
+    )
+    budget.reserve(**request.model_dump())
+    budget.release(request.reservation_id)
+
+    with pytest.raises(BudgetError, match="未提交且预算已释放"):
+        _generate(provider, client_request_id=request.reservation_id)
+    assert provider.submit_count == 0
+
+
+def test_explicit_new_request_creates_new_provider_job(tmp_path: Path) -> None:
+    provider = LocalFakeImageProvider(
+        tmp_path / "images", model_id="configured-image-model", actual_fen=20
+    )
+    first = _generate(provider, client_request_id="first-generation")
+    second = _generate(provider, client_request_id="user-requested-regeneration")
+
+    assert first.provider_job_id != second.provider_job_id
+    assert provider.submit_count == 2
+    assert len(budget.list_ledger()) == 2
+
+
+def test_generation_record_links_run_provider_key_and_artifact(tmp_path: Path) -> None:
+    provider = LocalFakeImageProvider(
+        tmp_path / "images", model_id="configured-image-model", actual_fen=20
+    )
+    with run_trace("run-test-generation", "generate"):
+        result = _generate(provider, client_request_id="generation-123")
+    assert result.status == "succeeded"
+    record = budget.get_reservation("generation-123")
+    assert record is not None
+    assert record.run_id == "run-test-generation"
+    assert record.provider == "local-fake"
+    assert record.idempotency_key == "generation-123"
+    assert record.provider_job_id == result.provider_job_id
+    linked = budget.attach_image_artifact("generation-123", "artifact-123")
+    assert linked.artifact_id == "artifact-123"
 
 
 class _UnbilledFailureProvider(LocalFakeImageProvider):
@@ -303,7 +366,9 @@ def test_interruption_keeps_unknown_bill_and_prevents_resubmission(
         _generate(provider)
     assert budget.get_reservation("request-1").status == "unknown"
     saved = budget.load_generation_result("request-1")
-    assert saved is not None and saved.error == "KeyboardInterrupt，需查询或人工对账"
+    assert saved is not None and saved.error == (
+        "NEEDS_RECONCILIATION：KeyboardInterrupt，需查询或人工对账"
+    )
     assert _generate(provider).status == "unknown"
 
 

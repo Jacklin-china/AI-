@@ -41,3 +41,11 @@ class TracingError(KantokuError):
 
 class ToolError(KantokuError):
     """工具注册、参数解析或执行失败。"""
+
+
+class ExternalJobPending(KantokuError):
+    """外部任务仍待查询或人工对账；Run 应保留可恢复断点。"""
+
+    def __init__(self, message: str, *, needs_reconciliation: bool = False) -> None:
+        super().__init__(message)
+        self.needs_reconciliation = needs_reconciliation

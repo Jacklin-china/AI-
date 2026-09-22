@@ -9,6 +9,7 @@ from decimal import ROUND_CEILING, ROUND_FLOOR, Decimal
 from pathlib import Path
 from typing import Annotated, Literal
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from kantoku.config import BudgetError, ToolError, get_settings
@@ -46,6 +47,10 @@ class BudgetReservation(BaseModel):
     actual_fen: int | None = Field(default=None, ge=0)
     model: NonBlank
     provider_job_id: NonBlank | None = None
+    run_id: NonBlank | None = None
+    provider: NonBlank | None = None
+    idempotency_key: NonBlank | None = None
+    artifact_id: NonBlank | None = None
     status: LedgerStatus
     created_at: NonBlank
     updated_at: NonBlank
@@ -66,6 +71,9 @@ class ReservationRequest(BaseModel):
     kind: NonBlank
     est_fen: int = Field(gt=0)
     model: NonBlank
+    run_id: NonBlank | None = None
+    provider: NonBlank | None = None
+    idempotency_key: NonBlank | None = None
 
 
 class BudgetSummary(BaseModel):
@@ -94,6 +102,13 @@ def _connect() -> sqlite3.Connection:
         connection = sqlite3.connect(path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+        existing_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(ledger)")
+        }
+        for column in ("run_id", "provider", "idempotency_key", "artifact_id"):
+            if column not in existing_columns:
+                connection.execute(f"ALTER TABLE ledger ADD COLUMN {column} TEXT")
+        connection.commit()
         return connection
     except (OSError, UnicodeError, sqlite3.Error):
         if connection is not None:
@@ -228,6 +243,9 @@ def reserve(
     kind: str,
     est_fen: int,
     model: str,
+    run_id: str | None = None,
+    provider: str | None = None,
+    idempotency_key: str | None = None,
 ) -> BudgetReservation:
     """原子检查四级额度并预占；相同请求重复执行不会新增台账。"""
     try:
@@ -240,6 +258,9 @@ def reserve(
             kind=kind,
             est_fen=est_fen,
             model=model,
+            run_id=run_id,
+            provider=provider,
+            idempotency_key=idempotency_key,
         )
     except ValidationError as error:
         raise BudgetError("预算预占参数无效", detail=type(error).__name__) from error
@@ -300,6 +321,19 @@ def _reserve_one(
         )
         if immutable != incoming:
             raise BudgetError("预算请求 ID 已被其他任务使用")
+        for name in ("run_id", "provider", "idempotency_key"):
+            previous = getattr(reservation, name)
+            supplied = getattr(requested, name)
+            if previous is not None and supplied is not None and previous != supplied:
+                raise BudgetError("预算请求 ID 的生图身份与历史记录不一致")
+            if previous is None and supplied is not None:
+                connection.execute(
+                    f"UPDATE ledger SET {name} = ? WHERE reservation_id = ?",
+                    (supplied, requested.reservation_id),
+                )
+        if any(getattr(reservation, name) is None and getattr(requested, name) is not None
+               for name in ("run_id", "provider", "idempotency_key")):
+            return _require_reservation(connection, requested.reservation_id)
         return reservation
 
     _assert_available(
@@ -313,8 +347,9 @@ def _reserve_one(
         """
             INSERT INTO ledger (
                 reservation_id, job, project, episode, shot_no, kind,
-                est_fen, actual_fen, model, provider_job_id, status
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'reserved')
+                est_fen, actual_fen, model, provider_job_id, status,
+                run_id, provider, idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'reserved', ?, ?, ?)
             """,
         (
             requested.reservation_id,
@@ -325,6 +360,9 @@ def _reserve_one(
             requested.kind,
             requested.est_fen,
             requested.model,
+            requested.run_id,
+            requested.provider,
+            requested.idempotency_key,
         ),
     )
     row = connection.execute(
@@ -347,6 +385,38 @@ def get_reservation(reservation_id: str) -> BudgetReservation | None:
         return None if row is None else _row_to_reservation(row)
     except sqlite3.Error as error:
         raise ToolError("预算台账读取失败", detail=type(error).__name__) from error
+    finally:
+        connection.close()
+
+
+def attach_image_artifact(reservation_id: str, artifact_id: str) -> BudgetReservation:
+    """Bind the final Artifact to its already recorded paid generation."""
+    if not artifact_id.strip():
+        raise BudgetError("图片 Artifact ID 不能为空")
+    connection = _connect()
+    try:
+        with connection:
+            connection.execute("BEGIN IMMEDIATE")
+            current = _require_reservation(connection, reservation_id)
+            if current.artifact_id is not None and current.artifact_id != artifact_id:
+                raise BudgetError("生图任务已绑定其他 Artifact")
+            if current.status not in {"succeeded", "settled"}:
+                raise BudgetError("生图结果未成功，不能绑定 Artifact")
+            connection.execute(
+                "UPDATE ledger SET artifact_id = ?, updated_at = CURRENT_TIMESTAMP "
+                "WHERE reservation_id = ?",
+                (artifact_id, reservation_id),
+            )
+            linked = _require_reservation(connection, reservation_id)
+            logger.bind(
+                component="image-generation", run_id=linked.run_id or "-",
+                generation_request_id=reservation_id,
+                provider=linked.provider or "-",
+                provider_task_id=linked.provider_job_id or "-",
+            ).info("artifact id={}", artifact_id)
+            return linked
+    except sqlite3.Error as error:
+        raise ToolError("生图 Artifact 关联失败", detail=type(error).__name__) from error
     finally:
         connection.close()
 

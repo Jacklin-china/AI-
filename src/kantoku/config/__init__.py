@@ -10,6 +10,7 @@
 from .errors import (
     BudgetError,
     ConfigError,
+    ExternalJobPending,
     KantokuError,
     LLMError,
     SchemaError,
@@ -21,6 +22,7 @@ from .settings import get_settings
 __all__ = [
     "KantokuError",
     "ConfigError",
+    "ExternalJobPending",
     "LLMError",
     "SchemaError",
     "BudgetError",

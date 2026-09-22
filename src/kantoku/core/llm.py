@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from time import perf_counter, sleep
 from typing import Any, Literal
+from uuid import uuid4
 
 from loguru import logger
 from openai import APIConnectionError, APIStatusError, OpenAI
@@ -332,6 +333,98 @@ def chat(
                     f"fallback={_error_summary(fallback_error)}"
                 ),
             ) from fallback_error
+
+
+def stream_chat(
+    messages: Sequence[ChatCompletionMessageParam],
+    *,
+    model: str | None = None,
+    temperature: float | None = None,
+    timeout_s: float | None = None,
+    on_retry: Callable[[int, int], None] | None = None,
+    trace_id: str | None = None,
+) -> Iterator[str]:
+    """Stream real provider deltas; never retry after any text was delivered."""
+    settings = get_settings()
+    selected_model = model or settings.llm.model_chat
+    selected_timeout = timeout_s if timeout_s is not None else settings.llm.timeout_s
+    selected_temperature = temperature if temperature is not None else settings.llm.temperature
+    request_id = f"llm-{uuid4().hex[:12]}"
+    client: OpenAI | None = None
+    started_at = perf_counter()
+    emitted = False
+    try:
+        client = _build_client(
+            base_url=settings.llm.base_url,
+            api_key=settings.llm.chat_api_key(),
+            timeout_s=selected_timeout,
+        )
+        request: dict[str, Any] = {
+            "messages": messages,
+            "model": selected_model,
+            "stream": True,
+        }
+        if settings.llm.chat_use_temperature:
+            request["temperature"] = selected_temperature
+        request[settings.llm.chat_max_tokens_parameter] = settings.llm.max_tokens
+        logger.bind(
+            component="llm", provider="deepseek", request_id=request_id,
+            trace_id=trace_id or "-",
+        ).info("provider request started model={}", selected_model)
+        for attempt in range(settings.llm.retry + 1):
+            try:
+                stream = client.chat.completions.create(
+                    **request, extra_body=dict(settings.llm.chat_extra_body)
+                )
+                for chunk in stream:
+                    if not chunk.choices:
+                        continue
+                    content = chunk.choices[0].delta.content
+                    if content:
+                        emitted = True
+                        yield content
+                if not emitted:
+                    raise LLMError("模型没有返回文本内容")
+                break
+            except Exception as error:
+                if emitted or not _is_retryable(error) or attempt >= settings.llm.retry:
+                    raise
+                retry_number = attempt + 1
+                logger.bind(component="llm", provider="deepseek", request_id=request_id,
+                            trace_id=trace_id or "-").warning(
+                    "provider retry attempt={}/{} reason={}",
+                    retry_number, settings.llm.retry, _error_summary(error),
+                )
+                if on_retry is not None:
+                    on_retry(retry_number, settings.llm.retry)
+                sleep(settings.llm.retry_backoff_s * (2**attempt))
+        logger.bind(
+            component="llm", provider="deepseek", request_id=request_id,
+            trace_id=trace_id or "-",
+        ).info(
+            "provider request completed model={} duration_ms={}",
+            selected_model, round((perf_counter() - started_at) * 1000),
+        )
+    except ConfigError:
+        raise
+    except Exception as error:
+        logger.bind(
+            component="llm", provider="deepseek", request_id=request_id,
+            trace_id=trace_id or "-",
+        ).opt(exception=error).error(
+            "provider request failed model={} emitted={}", selected_model, emitted
+        )
+        if isinstance(error, LLMError):
+            raise
+        raise LLMError("主模型流式调用失败", detail=_error_summary(error)) from error
+    finally:
+        if client is not None:
+            try:
+                client.close()
+            except Exception as close_error:
+                logger.bind(component="llm", request_id=request_id, trace_id=trace_id or "-").error(
+                    "LLM 连接关闭失败：{}", type(close_error).__name__
+                )
 
 
 def vision_chat(

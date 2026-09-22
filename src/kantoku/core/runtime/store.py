@@ -11,10 +11,22 @@ from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
+from loguru import logger
+
 from kantoku.config import ToolError, get_settings
+from kantoku.config.observability import current_trace_id
 from kantoku.config.settings import ROOT
+from kantoku.core.conversations import (
+    ConversationMessageRecord,
+    ConversationRecord,
+    InteractionMode,
+    MessageRole,
+    MessageType,
+)
 
 from .models import (
+    BATCH_TERMINAL_STATUSES,
+    TERMINAL_STATUSES,
     ApprovalDecision,
     ApprovalRecord,
     ArtifactRecord,
@@ -25,6 +37,8 @@ from .models import (
     ExecutionStatus,
     NodeExecutionRecord,
     RunRecord,
+    RuntimeEventRecord,
+    RuntimeEventType,
     SkillExecutionRecord,
     utc_now,
 )
@@ -98,6 +112,55 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
         CREATE INDEX IF NOT EXISTS idx_batch_runs_run ON batch_runs(run_id);
         """,
     ),
+    (
+        3,
+        """
+        CREATE TABLE IF NOT EXISTS run_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT, run_id TEXT NOT NULL,
+            sequence INTEGER NOT NULL, event_type TEXT NOT NULL, node_id TEXT,
+            payload_json TEXT NOT NULL DEFAULT '{}', created_at TEXT NOT NULL,
+            UNIQUE (run_id, sequence),
+            FOREIGN KEY (run_id) REFERENCES runs(id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_run_events_stream ON run_events(run_id, sequence);
+        """,
+    ),
+    (
+        4,
+        """
+        ALTER TABLE batches ADD COLUMN version INTEGER NOT NULL DEFAULT 1;
+        """,
+    ),
+    (
+        5,
+        """
+        CREATE TABLE IF NOT EXISTS conversations (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, interaction_mode TEXT NOT NULL,
+            domain TEXT, active_run_id TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+            FOREIGN KEY (active_run_id) REFERENCES runs(id)
+        );
+        CREATE TABLE IF NOT EXISTS conversation_messages (
+            id TEXT PRIMARY KEY, conversation_id TEXT NOT NULL, role TEXT NOT NULL,
+            type TEXT NOT NULL, content TEXT NOT NULL, run_id TEXT, event_id TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+            FOREIGN KEY (run_id) REFERENCES runs(id),
+            UNIQUE (conversation_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_conversations_updated
+            ON conversations(updated_at DESC);
+        CREATE INDEX IF NOT EXISTS idx_conversation_messages
+            ON conversation_messages(conversation_id, created_at);
+        """,
+    ),
+    (
+        6,
+        """
+        ALTER TABLE conversations ADD COLUMN deleted_at TEXT;
+        CREATE INDEX IF NOT EXISTS idx_conversations_visible
+            ON conversations(deleted_at, updated_at DESC);
+        """,
+    ),
 )
 
 
@@ -130,6 +193,133 @@ class RuntimeStore:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.migrate()
 
+    def create_conversation(
+        self,
+        title: str = "新对话",
+        *,
+        interaction_mode: InteractionMode = InteractionMode.AUTONOMOUS,
+        domain: str | None = None,
+    ) -> ConversationRecord:
+        """Create a durable conversation independently from runtime runs."""
+        now = utc_now()
+        record = ConversationRecord(
+            id=f"conversation-{uuid4().hex}", title=title.strip() or "新对话",
+            interaction_mode=interaction_mode, domain=domain,
+            created_at=now, updated_at=now,
+        )
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT INTO conversations "
+                "(id,title,interaction_mode,domain,active_run_id,created_at,updated_at) "
+                "VALUES (?,?,?,?,?,?,?)",
+                (record.id, record.title, record.interaction_mode.value, record.domain,
+                 None, now.isoformat(), now.isoformat()),
+            )
+        return record
+
+    def list_conversations(
+        self, limit: int = 50, *, domain: str | None = None, query: str = ""
+    ) -> list[ConversationRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM conversations WHERE deleted_at IS NULL "
+                "AND (? IS NULL OR domain=?) AND title LIKE ? "
+                "ORDER BY updated_at DESC LIMIT ?",
+                (domain, domain, f"%{query}%", limit),
+            ).fetchall()
+        return [self._conversation(row) for row in rows]
+
+    def get_conversation(self, conversation_id: str) -> ConversationRecord:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversations WHERE id=? AND deleted_at IS NULL", (conversation_id,)
+            ).fetchone()
+        if row is None:
+            raise ToolError("找不到指定对话", detail=conversation_id)
+        return self._conversation(row)
+
+    def update_conversation(
+        self,
+        conversation_id: str,
+        *,
+        title: str | None = None,
+        domain: str | None = None,
+        active_run_id: str | None = None,
+    ) -> ConversationRecord:
+        current = self.get_conversation(conversation_id)
+        now = utc_now()
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET title=?,domain=?,active_run_id=?,updated_at=? "
+                "WHERE id=?",
+                (title if title is not None else current.title,
+                 domain if domain is not None else current.domain,
+                 active_run_id if active_run_id is not None else current.active_run_id,
+                 now.isoformat(), conversation_id),
+            )
+        return self.get_conversation(conversation_id)
+
+    def delete_conversation(self, conversation_id: str) -> None:
+        """Hide only the conversation; Runs, artifacts and ledgers remain untouched."""
+        self.get_conversation(conversation_id)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET deleted_at=? WHERE id=?",
+                (utc_now().isoformat(), conversation_id),
+            )
+
+    def add_conversation_message(
+        self,
+        conversation_id: str,
+        *,
+        role: MessageRole,
+        type: MessageType,
+        content: str,
+        run_id: str | None = None,
+        event_id: str | None = None,
+    ) -> ConversationMessageRecord:
+        self.get_conversation(conversation_id)
+        record = ConversationMessageRecord(
+            id=f"message-{uuid4().hex}", conversation_id=conversation_id,
+            role=role, type=type, content=content, run_id=run_id,
+            event_id=event_id, created_at=utc_now(),
+        )
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO conversation_messages VALUES (?,?,?,?,?,?,?,?)",
+                (record.id, record.conversation_id, record.role.value, record.type.value,
+                 record.content, record.run_id, record.event_id,
+                 record.created_at.isoformat()),
+            )
+            connection.execute(
+                "UPDATE conversations SET updated_at=? WHERE id=?",
+                (record.created_at.isoformat(), conversation_id),
+            )
+        return record
+
+    def list_conversation_messages(
+        self, conversation_id: str
+    ) -> list[ConversationMessageRecord]:
+        self.get_conversation(conversation_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM conversation_messages WHERE conversation_id=? "
+                "ORDER BY created_at,id", (conversation_id,),
+            ).fetchall()
+        return [ConversationMessageRecord(
+            id=row["id"], conversation_id=row["conversation_id"], role=row["role"],
+            type=row["type"], content=row["content"], run_id=row["run_id"],
+            event_id=row["event_id"], created_at=_time(row["created_at"]),
+        ) for row in rows]
+
+    @staticmethod
+    def _conversation(row: sqlite3.Row) -> ConversationRecord:
+        return ConversationRecord(
+            id=row["id"], title=row["title"], interaction_mode=row["interaction_mode"],
+            domain=row["domain"], active_run_id=row["active_run_id"],
+            created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
+        )
+
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         try:
@@ -147,6 +337,8 @@ class RuntimeStore:
     def migrate(self) -> None:
         """以只增不删方式升级旧数据库。"""
         with self._connect() as connection:
+            connection.execute("PRAGMA journal_mode = WAL")
+            connection.execute("PRAGMA synchronous = NORMAL")
             connection.execute(
                 "CREATE TABLE IF NOT EXISTS core_schema_migrations "
                 "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -192,8 +384,16 @@ class RuntimeStore:
         current_node: str,
         error: str | None = None,
         cost_fen: int | None = None,
+        force: bool = False,
     ) -> RunRecord:
-        """原子更新 Run 的恢复指针与状态。"""
+        """原子更新 Run 状态；终态默认不可被普通写入回退。"""
+        current = self.get_run(run_id)
+        if (
+            not force
+            and current.status in TERMINAL_STATUSES
+            and status not in TERMINAL_STATUSES
+        ):
+            return current
         now = utc_now()
         completed = now.isoformat() if status in {
             ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.CANCELLED
@@ -221,6 +421,24 @@ class RuntimeStore:
         if row is None:
             raise ToolError("找不到指定 Run", detail=run_id)
         return self._run(row)
+
+    def set_run_cost(self, run_id: str, cost_fen: int) -> RunRecord:
+        """以 Core 为费用事实源更新 Run，并写入可恢复事件。"""
+        if type(cost_fen) is not int or cost_fen < 0:
+            raise ToolError("Run 费用必须是非负整数分")
+        current = self.get_run(run_id)
+        if current.cost_fen == cost_fen:
+            return current
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE runs SET cost_fen=?,updated_at=? WHERE id=?",
+                (cost_fen, utc_now().isoformat(), run_id),
+            )
+        self.append_event(
+            run_id, RuntimeEventType.COST_UPDATED,
+            payload={"cost_fen": cost_fen, "delta_fen": cost_fen - current.cost_fen},
+        )
+        return self.get_run(run_id)
 
     def list_runs(
         self,
@@ -335,6 +553,10 @@ class RuntimeStore:
                 (record.id, run_id, node_id, record.decision, _dump(request), "{}",
                  record.created_at.isoformat()),
             )
+        self.append_event(
+            run_id, RuntimeEventType.APPROVAL_REQUIRED, node_id=node_id,
+            payload={"approval_id": record.id, "request": request},
+        )
         return record
 
     def approval_for_node(self, run_id: str, node_id: str) -> ApprovalRecord | None:
@@ -345,6 +567,16 @@ class RuntimeStore:
                 "ORDER BY created_at DESC LIMIT 1", (run_id, node_id),
             ).fetchone()
         return self._approval(row) if row else None
+
+    def get_approval(self, approval_id: str) -> ApprovalRecord:
+        """按 ID 读取审批；供幂等决策在恢复工作流前检查当前状态。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM approvals WHERE id=?", (approval_id,)
+            ).fetchone()
+        if row is None:
+            raise ToolError("审批不存在", detail=approval_id)
+        return self._approval(row)
 
     def decide_approval(
         self, approval_id: str, decision: ApprovalDecision,
@@ -376,7 +608,12 @@ class RuntimeStore:
             row = connection.execute(
                 "SELECT * FROM approvals WHERE id=?", (approval_id,)
             ).fetchone()
-        return self._approval(row)
+        resolved = self._approval(row)
+        self.append_event(
+            resolved.run_id, RuntimeEventType.APPROVAL_RESOLVED, node_id=resolved.node_id,
+            payload={"approval_id": resolved.id, "decision": resolved.decision.value},
+        )
+        return resolved
 
     def list_approvals(self, pending_only: bool = False) -> list[ApprovalRecord]:
         """查询审批队列。"""
@@ -407,6 +644,14 @@ class RuntimeStore:
                  record.status, record.created_at.isoformat(), _dump(record.metadata),
                  record.location, record.version),
             )
+        self.append_event(
+            record.run_id, RuntimeEventType.ARTIFACT_CREATED, node_id=record.node_id,
+            payload={
+                "artifact_id": record.id, "type": record.type.value,
+                "source": record.source, "location": record.location,
+                "version": record.version,
+            },
+        )
         return record
 
     def create_artifact(
@@ -489,9 +734,11 @@ class RuntimeStore:
         )
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO batches VALUES (?,?,?,?,?,?)",
+                "INSERT INTO batches(id,name,status,concurrency_limit,created_at,"
+                "updated_at,version) "
+                "VALUES (?,?,?,?,?,?,?)",
                 (record.id, name, record.status, concurrency_limit,
-                 now.isoformat(), now.isoformat()),
+                 now.isoformat(), now.isoformat(), record.version),
             )
         return record
 
@@ -503,11 +750,19 @@ class RuntimeStore:
                 (batch_id, run_id, position),
             )
 
-    def update_batch_status(self, batch_id: str, status: BatchStatus) -> BatchRecord:
-        """更新 Batch 缓存状态。"""
+    def update_batch_status(
+        self, batch_id: str, status: BatchStatus, *, force: bool = False
+    ) -> BatchRecord:
+        """更新 Batch 状态；终态默认不会被重新计算覆盖。"""
+        current = self.get_batch(batch_id)
+        if not force and current.status is status:
+            return current
+        terminal = current.status in BATCH_TERMINAL_STATUSES
+        if not force and terminal and status not in BATCH_TERMINAL_STATUSES:
+            return current
         with self._connect() as connection:
             cursor = connection.execute(
-                "UPDATE batches SET status=?,updated_at=? WHERE id=?",
+                "UPDATE batches SET status=?,updated_at=?,version=version+1 WHERE id=?",
                 (status, utc_now().isoformat(), batch_id),
             )
             if cursor.rowcount != 1:
@@ -530,6 +785,7 @@ class RuntimeStore:
             id=row["id"], name=row["name"], status=row["status"],
             concurrency_limit=row["concurrency_limit"],
             created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
+            version=row["version"],
             run_ids=[item["run_id"] for item in run_rows],
         )
 
@@ -540,3 +796,63 @@ class RuntimeStore:
                 "SELECT id FROM batches ORDER BY updated_at DESC"
             ).fetchall()
         return [self.get_batch(row["id"]) for row in rows]
+
+    def batch_ids_for_run(self, run_id: str) -> list[str]:
+        """返回包含指定 Run 的 Batch，用于写入进度事件。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT batch_id FROM batch_runs WHERE run_id=? ORDER BY batch_id",
+                (run_id,),
+            ).fetchall()
+        return [str(row["batch_id"]) for row in rows]
+
+    def append_event(
+        self,
+        run_id: str,
+        event_type: RuntimeEventType,
+        *,
+        node_id: str | None = None,
+        payload: dict[str, Any] | None = None,
+    ) -> RuntimeEventRecord:
+        """追加一条事件；sequence 在同一 Run 内单调递增。"""
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT COALESCE(MAX(sequence), 0) AS seq FROM run_events WHERE run_id=?",
+                (run_id,),
+            ).fetchone()
+            sequence = int(row["seq"]) + 1
+            record = RuntimeEventRecord(
+                id=0, run_id=run_id, sequence=sequence, event_type=event_type,
+                node_id=node_id, payload=payload or {}, created_at=utc_now(),
+            )
+            cursor = connection.execute(
+                "INSERT INTO run_events(run_id,sequence,event_type,node_id,payload_json,"
+                "created_at) VALUES (?,?,?,?,?,?)",
+                (run_id, sequence, event_type.value, node_id,
+                 _dump(record.payload), record.created_at.isoformat()),
+            )
+            record = record.model_copy(update={"id": int(cursor.lastrowid or 0)})
+        logger.bind(
+            component="runtime-event", trace_id=current_trace_id() or "-",
+            run_id=run_id, node_id=node_id or "-",
+        ).info("event={} sequence={}", event_type.value, sequence)
+        return record
+
+    def list_events(
+        self, run_id: str, *, after: int = 0, limit: int = 500
+    ) -> list[RuntimeEventRecord]:
+        """按 sequence 升序读取事件，用于恢复时间线与断线续传。"""
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM run_events WHERE run_id=? AND sequence>? "
+                "ORDER BY sequence ASC LIMIT ?",
+                (run_id, after, limit),
+            ).fetchall()
+        return [
+            RuntimeEventRecord(
+                id=row["id"], run_id=row["run_id"], sequence=row["sequence"],
+                event_type=RuntimeEventType(row["event_type"]), node_id=row["node_id"],
+                payload=_load(row["payload_json"]), created_at=_time(row["created_at"]),
+            )
+            for row in rows
+        ]

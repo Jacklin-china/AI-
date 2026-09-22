@@ -34,5 +34,8 @@ class ApprovalService:
         """保存决定并立即恢复所属 Run，避免前端分两次调用。"""
         if self.runtime is None:
             raise RuntimeError("ApprovalService requires a GraphRuntime")
+        current = self.store.get_approval(approval_id)
         approval = self.decide(approval_id, decision, response)
+        if current.decision is not ApprovalDecision.PENDING:
+            return self.store.get_run(approval.run_id)
         return self.runtime.resume(approval.run_id)

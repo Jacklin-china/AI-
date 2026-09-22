@@ -36,6 +36,20 @@ class BatchStatus(StrEnum):
     CANCELLED = "cancelled"
 
 
+BATCH_TERMINAL_STATUSES = frozenset({
+    BatchStatus.COMPLETED,
+    BatchStatus.PARTIAL_FAILED,
+    BatchStatus.CANCELLED,
+})
+
+
+TERMINAL_STATUSES = frozenset({
+    ExecutionStatus.COMPLETED,
+    ExecutionStatus.FAILED,
+    ExecutionStatus.CANCELLED,
+})
+
+
 class ApprovalDecision(StrEnum):
     """通用人工审批结果。"""
 
@@ -132,6 +146,38 @@ class CheckpointRecord(CoreModel):
     created_at: datetime
 
 
+class RuntimeEventType(StrEnum):
+    """Runtime 事件类型；Core 只描述事实，不生成领域文案。"""
+
+    RUN_STARTED = "run_started"
+    RUN_WAITING = "run_waiting"
+    RUN_COMPLETED = "run_completed"
+    RUN_FAILED = "run_failed"
+    RUN_CANCELLED = "run_cancelled"
+    NODE_STARTED = "node_started"
+    NODE_PROGRESS = "node_progress"
+    NODE_COMPLETED = "node_completed"
+    NODE_FAILED = "node_failed"
+    NODE_RETRYING = "node_retrying"
+    ARTIFACT_CREATED = "artifact_created"
+    APPROVAL_REQUIRED = "approval_required"
+    APPROVAL_RESOLVED = "approval_resolved"
+    COST_UPDATED = "cost_updated"
+    BATCH_UPDATED = "batch_updated"
+
+
+class RuntimeEventRecord(CoreModel):
+    """按 Run 单调递增的事件流，用于恢复对话时间线。"""
+
+    id: int
+    run_id: str
+    sequence: int = Field(ge=1)
+    event_type: RuntimeEventType
+    node_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+    created_at: datetime
+
+
 class SkillExecutionRecord(CoreModel):
     """Skill 的审计记录。"""
 
@@ -155,4 +201,5 @@ class BatchRecord(CoreModel):
     concurrency_limit: int = Field(gt=0)
     created_at: datetime
     updated_at: datetime
+    version: int = Field(default=1, gt=0)
     run_ids: list[str] = Field(default_factory=list)

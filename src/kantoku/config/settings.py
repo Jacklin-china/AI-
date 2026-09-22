@@ -55,6 +55,7 @@ class LlmSettings(BaseModel):
     max_tokens: int = Field(gt=0, strict=True)
     timeout_s: float = Field(gt=0)
     retry: int = Field(ge=0, strict=True)
+    retry_backoff_s: float = Field(default=1.0, ge=0)
     chat_use_temperature: bool = True
     chat_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     vision_use_temperature: bool = True
@@ -156,6 +157,16 @@ class VideoSettings(BaseModel):
     output_dir: Path = Path("data/videos")
 
 
+class CommerceSettings(BaseModel):
+    """Commerce 真实能力开关；外部 Source 与 Marketplace 仍保持 Mock。"""
+
+    image_mode: Literal["mock", "real"] = "mock"
+    data_mode: Literal["demo", "production"] = "production"
+    text_mode: Literal["mock", "real"] = "mock"
+    real_image_acceptance_max_fen: int = Field(default=30, ge=0, strict=True)
+    marketplace: str = "Ozon Mock Marketplace"
+
+
 class Settings(BaseSettings):
     """项目配置总入口；业务代码只通过 ``get_settings`` 获取配置。"""
 
@@ -168,6 +179,7 @@ class Settings(BaseSettings):
     storage: StorageSettings
     runtime: RuntimeSettings = RuntimeSettings()
     video: VideoSettings = VideoSettings()
+    commerce: CommerceSettings = CommerceSettings()
 
 
 def _require_env(name: str) -> str:

@@ -6,9 +6,11 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any, Generic, TypeVar
 
+from loguru import logger
 from pydantic import ValidationError
 
-from kantoku.config import ToolError
+from kantoku.config import BudgetError, ExternalJobPending, ToolError
+from kantoku.config.observability import public_error, run_trace
 from kantoku.core.state import RunState
 
 from .models import (
@@ -16,6 +18,7 @@ from .models import (
     ExecutionStatus,
     NodeExecutionRecord,
     RunRecord,
+    RuntimeEventType,
     utc_now,
 )
 from .store import RuntimeStore
@@ -25,6 +28,19 @@ END = "__end__"
 StateT = TypeVar("StateT", bound=RunState)
 NodeHandler = Callable[[StateT, "RuntimeContext"], Mapping[str, Any] | None]
 RouteHandler = Callable[[StateT], str]
+
+
+def _safe_error(
+    error: Exception, *, run_id: str, node_id: str, retry_count: int,
+) -> dict[str, Any]:
+    """Generate a safe payload while preserving traceback in the file log."""
+    payload = public_error(
+        error, component="runtime", run_id=run_id, node_id=node_id,
+        retry_count=retry_count,
+    )
+    payload["error_code"] = type(error).__name__.upper()
+    payload["debug_reference"] = f"err-{str(payload['error_id']).removeprefix('ERR-').lower()}"
+    return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -48,6 +64,7 @@ class WorkflowNode(Generic[StateT]):
     retry_limit: int = 0
     error_target: str | None = None
     requires_approval: bool = False
+    approval_when: Callable[[StateT], bool] | None = None
     approval_request: Callable[[StateT], Mapping[str, Any]] | None = None
 
 
@@ -115,6 +132,15 @@ class GraphRuntime:
 
     def start(self, workflow_id: str, initial_state: RunState | Mapping[str, Any]) -> RunRecord:
         """创建 Run 并执行到完成、失败或等待审批。"""
+        run = self.create(workflow_id, initial_state)
+        workflow = self.workflow(workflow_id)
+        state = workflow.state_type.model_validate(run.state)
+        return self._execute(run, workflow, state)
+
+    def create(
+        self, workflow_id: str, initial_state: RunState | Mapping[str, Any]
+    ) -> RunRecord:
+        """Create a durable pending Run without executing its first node."""
         workflow = self.workflow(workflow_id)
         try:
             state = workflow.state_type.model_validate(initial_state)
@@ -124,7 +150,11 @@ class GraphRuntime:
         run = self.store.create_run(
             workflow.domain, workflow.id, state.model_dump(mode="json"), first
         )
-        return self._execute(run, workflow, state)
+        self.store.append_event(
+            run.id, RuntimeEventType.RUN_STARTED,
+            payload={"workflow": workflow.id, "domain": workflow.domain},
+        )
+        return run
 
     def resume(self, run_id: str) -> RunRecord:
         """从数据库恢复指针继续，不重放已完成 Node。"""
@@ -158,13 +188,15 @@ class GraphRuntime:
             ExecutionStatus.CANCELLED,
         }:
             return run
-        return self.store.update_run(
+        cancelled = self.store.update_run(
             run.id,
             status=ExecutionStatus.CANCELLED,
             state=run.state,
             current_node=run.current_node,
             error="cancelled_by_user",
         )
+        self.store.append_event(run.id, RuntimeEventType.RUN_CANCELLED)
+        return cancelled
 
     def _execute(
         self,
@@ -181,10 +213,15 @@ class GraphRuntime:
                 current_node=END,
             )
         while current != END:
+            if self.store.get_run(run.id).status is ExecutionStatus.CANCELLED:
+                return self.store.get_run(run.id)
             node = workflow.nodes[current]
             approval_decision: ApprovalDecision | None = None
             approval_response: Mapping[str, Any] = {}
-            if node.requires_approval:
+            needs_approval = node.requires_approval and (
+                node.approval_when is None or node.approval_when(state)
+            )
+            if needs_approval:
                 request = dict(node.approval_request(state)) if node.approval_request else {}
                 approval = self.store.create_approval(run.id, node.id, request)
                 if approval.decision is ApprovalDecision.PENDING:
@@ -197,6 +234,10 @@ class GraphRuntime:
                     snapshot = state.model_dump(mode="json")
                     self.store.save_checkpoint(
                         run.id, node.id, node.id, ExecutionStatus.WAITING, snapshot
+                    )
+                    self.store.append_event(
+                        run.id, RuntimeEventType.RUN_WAITING, node_id=node.id,
+                        payload={"approval_id": approval.id, "kind": request.get("kind")},
                     )
                     return self.store.update_run(
                         run.id,
@@ -220,6 +261,7 @@ class GraphRuntime:
                 state=state.model_dump(mode="json"),
                 current_node=node.id,
             )
+            self.store.append_event(run.id, RuntimeEventType.NODE_STARTED, node_id=node.id)
             retry_count = 0
             while True:
                 context = RuntimeContext(
@@ -231,16 +273,52 @@ class GraphRuntime:
                     approval_response=approval_response,
                 )
                 try:
-                    update = dict(node.handler(state, context) or {})
+                    with run_trace(run.id, node.id):
+                        update = dict(node.handler(state, context) or {})
                     state = workflow.state_type.model_validate(
                         state.model_copy(update=update).model_dump()
                     )
                     break
+                except ExternalJobPending as pending:
+                    snapshot = state.model_dump(mode="json")
+                    self.store.save_node(NodeExecutionRecord(
+                        run_id=run.id, node_id=node.id, status=ExecutionStatus.WAITING,
+                        started_at=started, completed_at=utc_now(),
+                        retry_count=retry_count,
+                    ))
+                    self.store.save_checkpoint(
+                        run.id, node.id, node.id, ExecutionStatus.WAITING, snapshot
+                    )
+                    self.store.append_event(
+                        run.id, RuntimeEventType.RUN_WAITING, node_id=node.id,
+                        payload={"kind": "needs_reconciliation" if pending.needs_reconciliation
+                                 else "external_job_pending", "message": pending.message},
+                    )
+                    logger.bind(component="runtime-node", run_id=run.id, node_id=node.id).warning(
+                        "external job waiting reconciliation={}", pending.needs_reconciliation
+                    )
+                    return self.store.update_run(
+                        run.id, status=ExecutionStatus.WAITING,
+                        state=snapshot, current_node=node.id,
+                    )
                 except Exception as error:
-                    if retry_count < node.retry_limit:
+                    if retry_count < node.retry_limit and not isinstance(error, BudgetError):
                         retry_count += 1
+                        logger.bind(
+                            component="runtime-node", run_id=run.id, node_id=node.id,
+                        ).warning("node retry count={}", retry_count)
+                        self.store.append_event(
+                            run.id, RuntimeEventType.NODE_RETRYING, node_id=node.id,
+                            payload={"retry_count": retry_count},
+                        )
                         continue
-                    message = f"{type(error).__name__}: {error}"
+                    safe_error = _safe_error(
+                        error, run_id=run.id, node_id=node.id, retry_count=retry_count,
+                    )
+                    message = (
+                        f"{safe_error['safe_message']} "
+                        f"({safe_error['debug_reference']})"
+                    )
                     self.store.save_node(NodeExecutionRecord(
                         run_id=run.id,
                         node_id=node.id,
@@ -250,7 +328,15 @@ class GraphRuntime:
                         retry_count=retry_count,
                         error=message,
                     ))
+                    self.store.append_event(
+                        run.id, RuntimeEventType.NODE_FAILED, node_id=node.id,
+                        payload=safe_error,
+                    )
                     if node.error_target is None:
+                        self.store.append_event(
+                            run.id, RuntimeEventType.RUN_FAILED, node_id=node.id,
+                            payload=safe_error,
+                        )
                         return self.store.update_run(
                             run.id,
                             status=ExecutionStatus.FAILED,
@@ -273,6 +359,9 @@ class GraphRuntime:
                     break
             else:  # pragma: no cover - loop only exits through break/return
                 raise AssertionError("unreachable")
+
+            if self.store.get_run(run.id).status is ExecutionStatus.CANCELLED:
+                return self.store.get_run(run.id)
 
             # error_target 已经改变 current；失败节点不应被标记 completed。
             latest = {item.node_id: item for item in self.store.list_nodes(run.id)}[node.id]
@@ -297,6 +386,10 @@ class GraphRuntime:
                 retry_count=retry_count,
                 outputs=update,
             ))
+            self.store.append_event(
+                run.id, RuntimeEventType.NODE_COMPLETED, node_id=node.id,
+                payload={"retry_count": retry_count},
+            )
             snapshot = state.model_dump(mode="json")
             self.store.save_checkpoint(
                 run.id, node.id, next_node, ExecutionStatus.COMPLETED, snapshot
@@ -308,6 +401,8 @@ class GraphRuntime:
                 state=snapshot,
                 current_node=next_node,
             )
+            if next_node == END:
+                self.store.append_event(run.id, RuntimeEventType.RUN_COMPLETED)
             current = next_node
 
         return self.store.get_run(run.id)
