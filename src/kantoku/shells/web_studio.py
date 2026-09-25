@@ -5,13 +5,17 @@ from __future__ import annotations
 import argparse
 import json
 import mimetypes
+import os
 import re
 import secrets
+import socket
+import subprocess
 import threading
 import time
 import webbrowser
 from collections.abc import Callable
 from contextlib import suppress
+from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -29,23 +33,41 @@ from kantoku.adapters.commerce import (
     MockSourceAdapter,
     MockTranslationAdapter,
 )
+from kantoku.capabilities.creative import (
+    CreativeContext,
+    CreativeDecision,
+    compile_image_prompt,
+    creative_brief,
+    plan_creative_turn,
+)
+from kantoku.capabilities.image import ConversationImageService
 from kantoku.capabilities.video import MockVideoProvider, VideoService
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.observability import current_trace_id, public_error, request_trace
-from kantoku.config.settings import ROOT, CommerceSettings, RuntimeSettings, VideoSettings
+from kantoku.config.settings import (
+    CONFIG_PATH,
+    EXAMPLE_PATH,
+    ROOT,
+    CommerceSettings,
+    RuntimeSettings,
+    VideoSettings,
+)
 from kantoku.core import budget
 from kantoku.core.approval import ApprovalService
 from kantoku.core.conversations import (
     ConversationMessageRecord,
+    ConversationRecord,
+    IntentPlan,
     IntentPlanner,
     InteractionMode,
+    MediaJobStatus,
     MessageRole,
     MessageType,
 )
 from kantoku.core.llm import chat, stream_chat
 from kantoku.core.runtime.batch import BatchService
 from kantoku.core.runtime.graph import GraphRuntime
-from kantoku.core.runtime.models import ApprovalDecision
+from kantoku.core.runtime.models import ApprovalDecision, ArtifactType, RunRecord
 from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
@@ -66,6 +88,7 @@ from kantoku.perception.review import (
     record_qc_prediction,
 )
 from kantoku.schemas.qc import HumanQcLabel, QcResult
+from kantoku.shells.conversation_router import ConversationAction, route_conversation
 from kantoku.shells.image_cli import _money_fen, _provider
 from kantoku.tools.archive import archive_reviewed_image, search_archived_images
 from kantoku.tools.studio import (
@@ -159,35 +182,158 @@ def _image_count(text: str) -> int:
     return min(max(count, 1), 20)
 
 
+_GENERIC_IMAGE_REQUESTS = {
+    "生成图片", "生成一张图片", "请生成图片", "开始生成", "开始生图",
+    "画一张", "给我一张图", "给我一张图片", "再来一张", "再画一张",
+    "重新生成一张", "再生成一张",
+}
+
+
+def _image_requirement(
+    content: str, history: list[ConversationMessageRecord],
+) -> str | None:
+    """A generic follow-up may reuse a prior specific request, never invent a subject."""
+    if content.strip().rstrip("。！! ") not in _GENERIC_IMAGE_REQUESTS:
+        return content
+    for message in reversed(history):
+        candidate = message.content.strip().rstrip("。！! ")
+        if message.role == MessageRole.USER and candidate not in _GENERIC_IMAGE_REQUESTS and (
+            len(candidate) > 8 and any(
+                word in candidate for word in ("头像", "图片", "照片", "插画", "海报", "画")
+            )
+        ):
+            return candidate
+    return None
+
+
 def _wants_prompt_enhancement(data: dict[str, Any]) -> bool:
     """创作域可勾选「AI 优化提示词」；默认关闭，避免篡改精确需求。"""
     return data.get("enhance_prompt") is True
 
 
 def _enhance_prompt(requirement: str, trace_id: str) -> str:
-    """把用户需求改写为详细生图提示词；改写失败时退回原文，不阻断执行。"""
+    """Keep the user's subject verbatim; the model may add only bounded visual details."""
+    details = {
+        "composition": {
+            "portrait": "主体居中，适合头像展示",
+            "scene": "场景层次清楚",
+            "neutral": "构图完整",
+        },
+        "lighting": {
+            "soft": "光线柔和",
+            "balanced": "明暗平衡",
+            "natural": "光线自然",
+        },
+        "finish": {
+            "clean": "轮廓清晰",
+            "detailed": "细节准确",
+            "simple": "画面干净",
+        },
+    }
+    selected: list[str] = []
     try:
         message = chat([
             {
                 "role": "system",
                 "content": (
-                    "你是生图提示词专家。把用户的制作需求改写为一段详细的中文生图提示词，"
-                    "涵盖主体、动作、风格、构图、光线与质量词；只输出提示词本身，不超过 200 字。"
+                    "只为生图选择视觉技术细节，不得改写或复述用户指定的主体、角色、"
+                    "动作、风格与场景。只输出 JSON，"
+                    "字段 composition 从 portrait/scene/neutral 中选，"
+                    "lighting 从 soft/balanced/natural 中选，finish 从 clean/detailed/simple 中选。"
+                    "不要输出新人物或新场景。"
                 ),
             },
             {"role": "user", "content": requirement},
         ])
+        raw = (message.content or "").strip()
+        match = re.search(r"\{[^{}]*\}", raw)
+        options = json.loads(match.group()) if match else {}
+        if isinstance(options, dict):
+            selected = [
+                words[value] for field, words in details.items()
+                if isinstance((value := options.get(field)), str) and value in words
+            ]
     except Exception as error:
         logger.bind(component="studio", trace_id=trace_id).warning(
             "提示词优化失败，使用原始需求：{}", type(error).__name__
         )
-        return requirement
-    enhanced = (message.content or "").strip()
-    return enhanced or requirement
+    visual_details = "，".join(selected) if selected else "主体清楚，画面完整"
+    return (
+        f"严格遵照用户原始要求：{requirement.strip()}\n"
+        f"仅补充不改变内容的画面细节：{visual_details}。"
+        "不得替换用户指定的角色、身份、动作或场景；不得添加其他主角。"
+    )
+
+
+def _image_subject(requirement: str) -> str:
+    """Remove only request verbs; never rewrite the requested subject."""
+    subject = re.sub(
+        r"^(?:请|麻烦)?(?:再|重新)?(?:帮我|给我|为我)?"
+        r"(?:生成|画|绘制|制作|来|给|换成|改成)?"
+        r"(?:一张|一个|一幅|张)?",
+        "", requirement.strip(), count=1,
+    ).strip("，。！! ")
+    return subject or requirement.strip()
+
+
+def _brief_deltas(brief: str) -> Any:
+    """Small SSE chunks make understanding readable without inventing model progress."""
+    for offset in range(0, len(brief), 5):
+        yield brief[offset:offset + 5]
+        time.sleep(0.045)
+
+
+def _image_brief(requirement: str) -> str:
+    subject = _image_subject(requirement)
+    style = next(
+        (word for word in ("赛博朋克", "卡通", "动漫", "写实", "水彩", "油画", "像素", "摄影")
+         if word in requirement),
+        None,
+    )
+    style_note = f"画风保持{style}风格" if style else "画风遵照你的原始描述"
+    composition = "主体居中构图" if "头像" in requirement else "清晰构图"
+    return (
+        f"我会生成一张{subject}，重点保留你指定的主体与关键元素；"
+        f"{style_note}，{composition}。"
+    )
+
+
+def _image_result_summary(requirement: str, prompt: str, trace_id: str) -> str:
+    """Summarize the submitted brief, not unverified visual contents."""
+    subject = _image_subject(requirement)
+    parts: list[str] = []
+    try:
+        message = chat([
+            {
+                "role": "system",
+                "content": (
+                    "只从用户要求和实际提交的提示词中摘取描述，不要假装看过生成图片。"
+                    "只输出 JSON：style、composition、elements 三个字段。每个字段只能是"
+                    "原文中逐字出现的简短片段；没有就写空字符串。不得添加新人物、场景或质量结论。"
+                ),
+            },
+            {"role": "user", "content": f"用户要求：{requirement}\n提交提示词：{prompt}"},
+        ])
+        raw = (message.content or "").strip()
+        match = re.search(r"\{[^{}]*\}", raw)
+        options = json.loads(match.group()) if match else {}
+        if isinstance(options, dict):
+            for field in ("elements", "style", "composition"):
+                value = options.get(field)
+                if isinstance(value, str) and 2 <= len(value) <= 24 and (
+                    value in requirement or value in prompt
+                ) and value not in parts:
+                    parts.append(value)
+    except Exception as error:
+        logger.bind(component="studio", trace_id=trace_id).warning(
+            "出图总结生成失败，使用已提交需求：{}", type(error).__name__
+        )
+    detail = f"；本次采用了{'、'.join(parts)}等设定" if parts else ""
+    return f"已按你的要求生成一张{subject}{detail}。图片已保存到当前聊天。"
 
 
 class StudioApplication:
-    """串行运行模型任务；HTTP 线程保持可响应。"""
+    """Serve conversations and bounded background production independently."""
 
     def __init__(self) -> None:
         self.token = secrets.token_urlsafe(32)
@@ -206,6 +352,7 @@ class StudioApplication:
         self.commerce_settings = commerce_settings
         video = VideoService(self.runtime_store, MockVideoProvider(), video_settings)
         image_provider = _provider()
+        self.image_service = ConversationImageService(self.runtime_store, image_provider)
         self.runtime.register(build_comic_workflow(
             StudioComicServices(image_provider),
             video_service=video,
@@ -233,7 +380,168 @@ class StudioApplication:
         self.approvals = ApprovalService(self.runtime_store, self.runtime)
         self.batches = BatchService(self.runtime_store, self.runtime)
         self.runner = TaskRunner(max_workers=2)
+        self._media_futures: dict[str, Any] = {}
+        self._media_futures_lock = threading.Lock()
         self.intent_planner = IntentPlanner()
+        self._legacy_home_run_ids: set[str] | None = None
+        self._recover_media_jobs()
+
+    def _run_media_job(
+        self, conversation_id: str, user_message_id: str, generation_request_id: str,
+        requirement: str, prompt: str | None, estimate_fen: int, trace_id: str,
+        reference_artifact_id: str | None = None,
+    ) -> tuple[ConversationMessageRecord, ConversationMessageRecord | None]:
+        """Complete the durable job even when its originating SSE client disconnects."""
+        with request_trace(trace_id):
+            try:
+                resolved_prompt = prompt or _enhance_prompt(requirement, trace_id)
+                resolved_prompt = self.runtime_store.save_conversation_generation(
+                    generation_request_id, conversation_id, user_message_id, resolved_prompt,
+                )
+                message = self.image_service.generate(
+                    conversation_id=conversation_id, user_message_id=user_message_id,
+                    generation_request_id=generation_request_id,
+                    prompt=resolved_prompt, estimate_fen=estimate_fen,
+                    reference_artifact_id=reference_artifact_id,
+                )
+                if not message.artifact_id:
+                    reservation = budget.get_reservation(generation_request_id)
+                    if not (message.type == MessageType.STATUS and reservation
+                            and reservation.provider_job_id):
+                        self.runtime_store.update_media_job(
+                            generation_request_id, MediaJobStatus.FAILED,
+                            error_message=message.content,
+                        )
+                    return message, None
+                self.runtime_store.update_media_job(
+                    generation_request_id, MediaJobStatus.COMPLETED,
+                    artifact_id=message.artifact_id,
+                )
+                try:
+                    summary = self.runtime_store.add_conversation_message(
+                        conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
+                        content=_image_result_summary(requirement, resolved_prompt, trace_id),
+                        event_id=f"generation-summary:{generation_request_id}",
+                    )
+                except Exception:
+                    logger.bind(
+                        component="conversation-image", trace_id=trace_id,
+                        conversation_id=conversation_id,
+                        generation_request_id=generation_request_id,
+                    ).exception("图片已完成，但结果总结保存失败")
+                    summary = None
+                return message, summary
+            except Exception as error:
+                failure = public_error(
+                    error, component="conversation-image", conversation_id=conversation_id,
+                    generation_request_id=generation_request_id, trace_id=trace_id,
+                )
+                safe_message = f"{failure['safe_message']} · 错误编号：{failure['error_id']}"
+                self.runtime_store.update_media_job(
+                    generation_request_id, MediaJobStatus.FAILED,
+                    error_id=str(failure["error_id"]), error_message=safe_message,
+                )
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT, type=MessageType.ERROR,
+                    content=safe_message, event_id=f"generation-error:{generation_request_id}",
+                )
+                return message, None
+
+    def _start_media_job(
+        self, conversation_id: str, user_message_id: str, generation_request_id: str,
+        requirement: str, prompt: str | None, estimate_fen: int, trace_id: str,
+        reference_artifact_id: str | None = None,
+    ) -> Any:
+        with self._media_futures_lock:
+            future = self._media_futures.get(generation_request_id)
+            job = self.runtime_store.get_media_job(generation_request_id)
+            if future is None or (future.done() and job is not None
+                                  and job.status == MediaJobStatus.GENERATING):
+                future = self.runner.submit(lambda: self._run_media_job(
+                    conversation_id, user_message_id, generation_request_id,
+                    requirement, prompt, estimate_fen, trace_id, reference_artifact_id,
+                ))
+                self._media_futures[generation_request_id] = future
+            return future
+
+    def _recover_media_jobs(self) -> None:
+        """Restart only the same idempotent request; never invent a new paid submission."""
+        for job in self.runtime_store.list_unfinished_media_jobs():
+            saved = self.runtime_store.get_conversation_generation(job.generation_request_id)
+            reservation = budget.get_reservation(job.generation_request_id)
+            if saved is None and reservation is not None:
+                self.runtime_store.update_media_job(
+                    job.generation_request_id, MediaJobStatus.FAILED,
+                    error_message="提交记录缺少原始提示词，需要人工对账；不会重新付费提交。",
+                )
+                continue
+            history = self.runtime_store.list_conversation_messages(
+                job.conversation_id, include_deleted=True,
+            )
+            user = next((item for item in history if item.id == job.user_message_id), None)
+            requirement = _image_requirement(user.content, history) if user else None
+            if saved is not None:
+                saved_context = json.loads(saved["context_json"])
+                if isinstance(saved_context, dict) and saved_context.get("subject"):
+                    requirement = str(saved_context["subject"])
+            if requirement is None:
+                self.runtime_store.update_media_job(
+                    job.generation_request_id, MediaJobStatus.FAILED,
+                    error_message="原生图需求缺失；请查看日志，不会重复提交。",
+                )
+                continue
+            estimate_fen = reservation.est_fen if reservation else budget.quote_image_price(
+                count=1
+            ).total_fen
+            self._start_media_job(
+                job.conversation_id, job.user_message_id, job.generation_request_id,
+                requirement, saved["prompt"] if saved else None, estimate_fen,
+                f"trace-recovery-{uuid4().hex[:12]}",
+                saved["reference_artifact_id"] if saved else None,
+            )
+
+    def _recent_image_context(self, conversation_id: str) -> CreativeContext | None:
+        """Use only a completed, local Artifact from this conversation as visual context."""
+        for job in reversed(self.runtime_store.list_media_jobs(conversation_id)):
+            if job.status != MediaJobStatus.COMPLETED or not job.artifact_id:
+                continue
+            artifact = self.runtime_store.get_artifact(job.artifact_id)
+            if (artifact.conversation_id != conversation_id or not artifact.location
+                    or not Path(artifact.location).is_file()):
+                continue
+            saved = self.runtime_store.get_conversation_generation(job.generation_request_id)
+            details = json.loads(saved["context_json"]) if saved else {}
+            if not isinstance(details, dict):
+                details = {}
+            if not details.get("subject"):
+                history = self.runtime_store.list_conversation_messages(conversation_id)
+                original = next((item.content for item in history
+                    if item.id == job.user_message_id), "")
+                details["subject"] = _image_subject(original)
+            return CreativeContext(
+                subject=str(details.get("subject") or ""),
+                style=str(details.get("style") or ""),
+                composition=str(details.get("composition") or ""),
+                background=str(details.get("background") or ""),
+                artifact_id=job.artifact_id,
+            )
+        # Older conversations may have a real image Artifact but predate MediaJob.
+        history = self.runtime_store.list_conversation_messages(conversation_id)
+        for artifact in self.runtime_store.list_artifacts(
+            conversation_id=conversation_id, type=ArtifactType.IMAGE,
+        ):
+            if (artifact.status != "ready" or not artifact.location
+                    or not Path(artifact.location).is_file()):
+                continue
+            artifact_index = next((index for index, message in enumerate(history)
+                if message.artifact_id == artifact.id), len(history))
+            original = next((message.content for message in reversed(history[:artifact_index])
+                if message.role == MessageRole.USER), "")
+            return CreativeContext(
+                subject=_image_subject(original) if original else "",
+                artifact_id=artifact.id,
+            )
+        return None
 
     def create_conversation(self, data: dict[str, Any]) -> dict[str, Any]:
         mode = InteractionMode(str(data.get("interaction_mode", "autonomous")))
@@ -269,6 +577,10 @@ class StudioApplication:
             item.model_dump(mode="json")
             for item in self.runtime_store.list_conversation_messages(conversation_id)
         ]
+        result["media_jobs"] = [
+            job.model_dump(mode="json")
+            for job in self.runtime_store.list_media_jobs(conversation_id)
+        ]
         return result
 
     def stream_conversation(
@@ -280,31 +592,340 @@ class StudioApplication:
         content = str(data.get("content", "")).strip()
         if not content:
             raise ToolError("消息内容不能为空")
-        self.runtime_store.add_conversation_message(
-            conversation_id, role=MessageRole.USER, type=MessageType.TEXT, content=content,
+        hint = str(data.get("domain_hint") or conversation.domain or "") or None
+        conversation_history = self.runtime_store.list_conversation_messages(conversation_id)
+        history_before = conversation_history[-16:]
+        image_context = any(
+            message.event_id and message.event_id.startswith(
+                ("generation-user:", "generation-artifact:")
+            )
+            for message in conversation_history
         )
+        creative_decision: CreativeDecision | None = None
+        prior_image: CreativeContext | None = None
+        if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
+                and conversation.domain is None):
+            prior_image = self._recent_image_context(conversation_id)
+            creative_decision = plan_creative_turn(
+                content, prior_image, trace_id=trace_id,
+            )
+            if (prior_image is None and creative_decision.action.startswith("image.")
+                    and content.strip().rstrip("。！! ") in _GENERIC_IMAGE_REQUESTS):
+                inherited_request = _image_requirement(content, conversation_history)
+                creative_decision = replace(
+                    creative_decision,
+                    subject=_image_subject(inherited_request) if inherited_request else "",
+                )
+            plan = IntentPlan(
+                intent=creative_decision.action,
+                needs_execution=creative_decision.action != "chat",
+                confidence=0.9, suggested_domain=(
+                    "studio" if creative_decision.action.startswith("image.") else None
+                ),
+            )
+            if creative_decision.action == "chat":
+                existing_plan = self.intent_planner.plan(content, image_context=image_context)
+                if existing_plan.needs_execution and existing_plan.intent in {
+                    "video.generate", "comic_production", "commerce_production",
+                }:
+                    plan = existing_plan
+        else:
+            plan = self.intent_planner.plan(
+                content, domain_hint=hint, image_context=image_context,
+            )
+        guided = conversation.interaction_mode == InteractionMode.GUIDED
+        confirmed = guided and _is_execution_confirmed(content, history_before)
+        action = route_conversation(conversation, plan, confirmed=confirmed)
+        generation_request_id = str(
+            data.get("generation_request_id") or f"generation-{uuid4().hex}"
+        )
+        if (
+            action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}
+            and not _SAFE_TRACE.fullmatch(generation_request_id)
+        ):
+            raise ToolError("生成请求 ID 格式无效")
+        image_action = action in {
+            ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT,
+        }
+        user_message = self.runtime_store.add_conversation_message(
+            conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+            content=content,
+            event_id=(f"generation-user:{generation_request_id}" if image_action else None),
+        )
+        if user_message.content != content:
+            raise ToolError("生成请求 ID 已用于不同内容")
         if conversation.title == "新对话":
             self.runtime_store.update_conversation(
                 conversation_id, title=content[:32], active_run_id=conversation.active_run_id,
             )
-        hint = str(data.get("domain_hint") or conversation.domain or "") or None
-        plan = self.intent_planner.plan(content, domain_hint=hint)
-        yield "intent", {**plan.model_dump(mode="json"), "trace_id": trace_id}
+        yield "intent", {
+            **plan.model_dump(mode="json"), "tool": action.value,
+            "trace_id": trace_id,
+        }
+        if action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}:
+            media_job = self.runtime_store.create_media_job(
+                generation_request_id, conversation_id, user_message.id,
+            )
+            existing = self.runtime_store.get_conversation_message_by_event(
+                conversation_id, f"generation-artifact:{generation_request_id}"
+            )
+            if existing is not None:
+                if media_job.status != MediaJobStatus.COMPLETED:
+                    self.runtime_store.update_media_job(
+                        generation_request_id, MediaJobStatus.COMPLETED,
+                        artifact_id=existing.artifact_id,
+                    )
+                prepared = self.runtime_store.get_conversation_message_by_event(
+                    conversation_id, f"generation-prompt:{generation_request_id}"
+                )
+                if prepared is not None:
+                    yield "message", prepared.model_dump(mode="json")
+                    yield "prompt_prepared", {
+                        "generation_request_id": generation_request_id,
+                        "message_id": prepared.id,
+                    }
+                yield "image_ready", {
+                    "generation_request_id": generation_request_id,
+                    "artifact_id": existing.artifact_id,
+                }
+                yield "message", existing.model_dump(mode="json")
+                summary = self.runtime_store.get_conversation_message_by_event(
+                    conversation_id, f"generation-summary:{generation_request_id}"
+                )
+                if summary is not None:
+                    yield "image_summary", {
+                        "generation_request_id": generation_request_id,
+                        "message_id": summary.id,
+                    }
+                    yield "message", summary.model_dump(mode="json")
+                yield "done", {"generation_request_id": generation_request_id}
+                return
+            if media_job.status == MediaJobStatus.FAILED:
+                history = self.runtime_store.list_conversation_messages(conversation_id)
+                failed_message = next((item for item in reversed(history)
+                    if item.event_id in {
+                        f"generation-error:{generation_request_id}",
+                        f"generation-cost:{generation_request_id}",
+                        f"generation-subject:{generation_request_id}",
+                    } or (item.event_id or "").startswith(
+                        f"generation-status:{generation_request_id}:"
+                    )), None)
+                if failed_message is None:
+                    failed_message = self.runtime_store.add_conversation_message(
+                        conversation_id, role=MessageRole.ASSISTANT,
+                        type=MessageType.ERROR,
+                        content=media_job.error_message or "这次生图未完成。",
+                        event_id=f"generation-error:{generation_request_id}",
+                    )
+                yield "image_failed", {"generation_request_id": generation_request_id}
+                yield "message", failed_message.model_dump(mode="json")
+                yield "done", {"generation_request_id": generation_request_id}
+                return
+            saved = self.runtime_store.get_conversation_generation(generation_request_id)
+            requirement = (
+                creative_decision.subject if creative_decision else
+                _image_requirement(content, conversation_history)
+            )
+            if saved is not None:
+                saved_context = json.loads(saved["context_json"])
+                if isinstance(saved_context, dict) and saved_context.get("subject"):
+                    requirement = str(saved_context["subject"])
+            if not requirement:
+                self.runtime_store.update_media_job(
+                    generation_request_id, MediaJobStatus.FAILED,
+                    error_message="缺少图片主体；本次没有提交生图任务。",
+                )
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.TEXT,
+                    content="想画什么？直接告诉我主体即可，尺寸和风格可以由我在后台处理。",
+                    event_id=f"generation-subject:{generation_request_id}",
+                )
+                yield "message", message.model_dump(mode="json")
+                yield "done", {"generation_request_id": generation_request_id}
+                return
+            quote = budget.quote_image_price(count=_image_count(content))
+            auto_fen = int(get_settings().budget.autonomous_image_auto_cny * 100)
+            if quote.count != 1 or quote.total_fen > auto_fen:
+                text = (
+                    f"预计费用 ¥{quote.total_fen / 100:.2f}，超过首页自动执行额度。"
+                    "请进入专业创作域确认预算后继续；本次没有提交付费任务。"
+                )
+                self.runtime_store.update_media_job(
+                    generation_request_id, MediaJobStatus.FAILED, error_message=text,
+                )
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.TEXT, content=text,
+                    event_id=f"generation-cost:{generation_request_id}",
+                )
+                yield "message", message.model_dump(mode="json")
+                yield "done", {"generation_request_id": generation_request_id}
+                return
+            if saved is None:
+                reference_artifact_id = (
+                    prior_image.artifact_id if creative_decision and prior_image
+                    and creative_decision.use_reference else None
+                )
+                compiled_prompt = (
+                    compile_image_prompt(creative_decision, prior_image)
+                    if creative_decision else _enhance_prompt(requirement, trace_id)
+                )
+                saved_prompt = self.runtime_store.save_conversation_generation(
+                    generation_request_id, conversation_id, user_message.id,
+                    compiled_prompt,
+                    context=creative_decision.context() if creative_decision else {},
+                    reference_artifact_id=reference_artifact_id,
+                )
+            else:
+                saved_prompt = saved["prompt"]
+                reference_artifact_id = saved["reference_artifact_id"]
+            brief = (
+                creative_brief(creative_decision)
+                if creative_decision else _image_brief(requirement)
+            )
+            prepared = self.runtime_store.get_conversation_message_by_event(
+                conversation_id, f"generation-prompt:{generation_request_id}",
+            )
+            if prepared is not None:
+                brief = prepared.content
+            else:
+                for chunk in _brief_deltas(brief):
+                    yield "delta", {"content": chunk}
+            prepared = self.runtime_store.add_conversation_message(
+                conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
+                content=brief,
+                event_id=f"generation-prompt:{generation_request_id}",
+            )
+            yield "message", prepared.model_dump(mode="json")
+            yield "prompt_prepared", {
+                "generation_request_id": generation_request_id, "message_id": prepared.id,
+            }
+            self.runtime_store.update_media_job(
+                generation_request_id, MediaJobStatus.GENERATING,
+            )
+            future = self._start_media_job(
+                conversation_id, user_message.id, generation_request_id,
+                requirement, saved_prompt,
+                quote.total_fen, trace_id, reference_artifact_id,
+            )
+            yield "image_generating", {
+                "generation_request_id": generation_request_id,
+                "width": get_settings().image.width,
+                "height": get_settings().image.height,
+            }
+            while not future.done():
+                time.sleep(0.1)
+            message, summary = future.result()
+            if message.artifact_id:
+                yield "image_ready", {
+                    "generation_request_id": generation_request_id,
+                    "artifact_id": message.artifact_id,
+                }
+            elif self.runtime_store.get_media_job(
+                generation_request_id
+            ).status == MediaJobStatus.GENERATING:
+                yield "image_generating", {
+                    "generation_request_id": generation_request_id,
+                    "width": get_settings().image.width,
+                    "height": get_settings().image.height,
+                }
+            else:
+                yield "image_failed", {"generation_request_id": generation_request_id}
+            yield "message", message.model_dump(mode="json")
+            if summary is not None:
+                yield "image_summary", {
+                    "generation_request_id": generation_request_id, "message_id": summary.id,
+                }
+                yield "message", summary.model_dump(mode="json")
+            yield "done", {"generation_request_id": generation_request_id}
+            return
+        if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
+                and conversation.domain is None
+                and action is ConversationAction.CHAT
+                and any(cue in content for cue in (
+                    "图片在哪里", "图片在哪", "图在哪里", "图在哪", "刚才的图呢",
+                ))):
+            latest = self._recent_image_context(conversation_id)
+            if latest is not None and latest.artifact_id:
+                reminder = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.ARTIFACT, artifact_id=latest.artifact_id,
+                    content="这是当前聊天最近完成的图片。",
+                )
+            else:
+                generating = any(
+                    job.status in {MediaJobStatus.PENDING, MediaJobStatus.GENERATING}
+                    for job in self.runtime_store.list_media_jobs(conversation_id)
+                )
+                reminder = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
+                    content=("图片仍在生成中，完成后会直接出现在当前聊天。" if generating
+                             else "这个聊天里还没有成功生成的图片。你可以直接描述想画的内容。"),
+                )
+            yield "message", reminder.model_dump(mode="json")
+            yield "done", {"run_id": None}
+            return
+        if action is ConversationAction.VIDEO_GENERATE:
+            message = self.runtime_store.add_conversation_message(
+                conversation_id, role=MessageRole.ASSISTANT,
+                type=MessageType.TEXT,
+                content="当前尚未接入真实视频生成服务，因此没有提交视频任务或扣费。",
+            )
+            yield "message", message.model_dump(mode="json")
+            yield "done", {"run_id": None}
+            return
+        if action is ConversationAction.CHOOSE_DOMAIN:
+            text = "这项专业制作需要先进入相应创作域；首页不会擅自启动完整工作流。"
+            message = self.runtime_store.add_conversation_message(
+                conversation_id, role=MessageRole.ASSISTANT,
+                type=MessageType.TEXT, content=text,
+            )
+            yield "delta", {"content": text}
+            yield "message", message.model_dump(mode="json")
+            yield "done", {"run_id": None}
+            return
         history = self.runtime_store.list_conversation_messages(conversation_id)[-16:]
-        # 引导模式（创作域工作区）：AI 先逐步确认需求，用户明确确认后才提交工作流；
-        # 自主模式（首页）：保持原有行为，识别到执行意图即创建 Run。
-        guided = conversation.interaction_mode == InteractionMode.GUIDED
-        confirmed = guided and _is_execution_confirmed(content, history)
-        target_domain = (
-            (conversation.domain or plan.suggested_domain) if guided else plan.suggested_domain
-        )
-        execute = bool(target_domain) and (confirmed if guided else plan.needs_execution)
+        # 只有 Guided 域能进入 Graph；首页简单生图已在上方直接交给共享能力。
+        target_domain = conversation.domain
+        execute = action is ConversationAction.WORKFLOW_START
+        run: dict[str, Any] | None = None
+        if execute and target_domain:
+            requirement = _guided_requirement(history) if guided else content
+            if target_domain == "commerce":
+                requested_mode = str(data.get("data_mode") or self.commerce_settings.data_mode)
+                if requested_mode not in {"demo", "production"}:
+                    raise ToolError("电商数据模式无效")
+                state: dict[str, Any] = {
+                    "requirement": requirement, "locale": "ru-RU",
+                    "data_mode": requested_mode,
+                }
+                domain = "commerce"
+            else:
+                prompt = requirement
+                if _wants_prompt_enhancement(data):
+                    prompt = _enhance_prompt(requirement, trace_id)
+                state = {
+                    "project": (
+                        conversation.title if conversation.title != "新对话" else "Kantoku Chat"
+                    ),
+                    "prompt": prompt, "shot_no": 1,
+                    "estimate_fen": budget.estimate_image_fen(),
+                    "image_count": _image_count(requirement),
+                    "confirmed": False,
+                }
+                domain = "comic"
+            run = self.enqueue_core_run({"domain": domain, "state": state})
+            self.runtime_store.update_conversation(
+                conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
+            )
+            yield "run", run
         model_history = history[-1:] if execute else history
         if execute:
             instruction = (
-                "你已把本次需求交给已连接的生产工作流，工作流即将开始执行。"
+                "本次需求已创建真实生产任务。"
                 "用一两句话说明接下来会发生什么：需要付费的步骤会弹出审批卡片，"
-                "等待用户在卡片上点击批准。禁止说没有能力、不能执行，"
+                "等待用户在卡片上点击批准；批准前没有调用付费生图。禁止说没有能力、不能执行，"
                 "禁止要求补充可由默认值补齐的字段，"
                 "禁止要求用户再回复文字确认，禁止输出冗长的执行计划清单。"
             )
@@ -317,7 +938,10 @@ class StudioApplication:
                 "在用户确认前不要声称已开始执行。付费步骤要说明会先等待用户确认。"
             )
         else:
-            instruction = ""
+            instruction = (
+                "当前只是对话，没有创建生产任务。不要说已提交、正在生成或进入生成阶段；"
+                "若用户想要实际出图，请让用户明确提出生成图片的要求。"
+            )
         messages: list[dict[str, str]] = [
             {
                 "role": "system",
@@ -330,45 +954,24 @@ class StudioApplication:
               if item.role in {MessageRole.USER, MessageRole.ASSISTANT}],
         ]
         complete = ""
-        for delta in stream_chat(messages, trace_id=trace_id):
-            complete += delta
-            yield "delta", {"content": delta}
+        try:
+            for delta in stream_chat(messages, trace_id=trace_id):
+                complete += delta
+                yield "delta", {"content": delta}
+        except Exception:
+            if run is None:
+                raise
+            logger.bind(component="studio", trace_id=trace_id, run_id=run["id"]).exception(
+                "生成任务已创建，但聊天说明生成失败"
+            )
+            complete = "生产任务已创建。请查看下方真实进度；付费生图会先等待你在费用卡片批准。"
+            yield "delta", {"content": complete}
         message_type = MessageType.PLAN if execute else MessageType.TEXT
         assistant = self.runtime_store.add_conversation_message(
             conversation_id, role=MessageRole.ASSISTANT, type=message_type, content=complete,
         )
         yield "message", assistant.model_dump(mode="json")
-        if not execute or not target_domain:
-            yield "done", {"run_id": None}
-            return
-        requirement = _guided_requirement(history) if guided else content
-        if target_domain == "commerce":
-            requested_mode = str(data.get("data_mode") or self.commerce_settings.data_mode)
-            if requested_mode not in {"demo", "production"}:
-                raise ToolError("电商数据模式无效")
-            state: dict[str, Any] = {
-                "requirement": requirement, "locale": "ru-RU",
-                "data_mode": requested_mode,
-            }
-            domain = "commerce"
-        else:
-            prompt = requirement
-            if _wants_prompt_enhancement(data):
-                prompt = _enhance_prompt(requirement, trace_id)
-            state = {
-                "project": conversation.title if conversation.title != "新对话" else "Kantoku Chat",
-                "prompt": prompt, "shot_no": 1,
-                "estimate_fen": budget.estimate_image_fen(),
-                "image_count": _image_count(requirement),
-                "confirmed": False,
-            }
-            domain = "comic"
-        run = self.enqueue_core_run({"domain": domain, "state": state})
-        self.runtime_store.update_conversation(
-            conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
-        )
-        yield "run", run
-        yield "done", {"run_id": run["id"]}
+        yield "done", {"run_id": run["id"] if run else None}
 
     def task(self, request_id: str) -> StudioTask:
         for task in list_tasks():
@@ -385,6 +988,8 @@ class StudioApplication:
         for task in list_tasks():
             result = budget.load_generation_result(task.request_id)
             record = budget.get_reservation(task.request_id)
+            if record is not None and record.conversation_id is not None:
+                continue
             prediction = load_qc_prediction(task.request_id)
             review = load_human_review(task.request_id)
             rework = get_rework_item(task.request_id)
@@ -606,8 +1211,52 @@ class StudioApplication:
         raise ToolError("不支持的操作")
 
     def list_core_runs(self) -> list[dict[str, Any]]:
-        """返回真实 Run 与 NodeExecution，供工作台渲染。"""
-        return [self._run_payload(record.id) for record in self.runtime_store.list_runs()]
+        """仅列专业 Run；旧首页误建的 Run 保留原记录但不再展示。"""
+        records = self.runtime_store.list_runs(interaction_mode=InteractionMode.GUIDED)
+        if self._legacy_home_run_ids is None:
+            self._legacy_home_run_ids = self._legacy_autonomous_run_ids(
+                self.runtime_store.list_runs(
+                    limit=100000, interaction_mode=InteractionMode.GUIDED,
+                )
+            )
+        return [
+            self._run_payload(record.id)
+            for record in records if record.id not in self._legacy_home_run_ids
+        ]
+
+    def _legacy_autonomous_run_ids(self, records: list[RunRecord]) -> set[str]:
+        """Conservatively infer old untagged homepage Runs without deleting them."""
+        conversations = self.runtime_store.list_conversations(
+            limit=100000, include_deleted=True,
+        )
+        by_title: dict[str, list[ConversationRecord]] = {}
+        for conversation in conversations:
+            by_title.setdefault(conversation.title, []).append(conversation)
+        hidden: set[str] = set()
+        for run in records:
+            title = run.state.get("project") or run.state.get("requirement")
+            if not isinstance(title, str):
+                continue
+            candidates = by_title.get(title, [])
+            if any(item.interaction_mode is InteractionMode.GUIDED
+                   and item.created_at <= run.started_at for item in candidates):
+                continue
+            for conversation in candidates:
+                if (conversation.interaction_mode is not InteractionMode.AUTONOMOUS
+                        or conversation.domain is not None
+                        or conversation.created_at > run.started_at):
+                    continue
+                messages = self.runtime_store.list_conversation_messages(
+                    conversation.id, include_deleted=True,
+                )
+                if any(
+                    message.role is MessageRole.USER
+                    and abs((run.started_at - message.created_at).total_seconds()) < 120
+                    for message in messages
+                ):
+                    hidden.add(run.id)
+                    break
+        return hidden
 
     def get_core_run(self, run_id: str) -> dict[str, Any]:
         """返回单个真实 Run。"""
@@ -688,7 +1337,7 @@ class StudioApplication:
             item.model_dump(mode="json")
             for item in self.runtime_store.list_artifacts(
                 run_id, type=artifact_type, domain=domain
-            )
+            ) if item.run_id is not None
         ]
 
     def get_core_artifact(self, artifact_id: str) -> dict[str, Any]:
@@ -1192,12 +1841,59 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
     return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
+def _port_already_serving(port: int) -> bool:
+    """Windows 上 SO_REUSEADDR 允许多个进程重复监听同一端口；启动前探测，拒绝新旧后端并存。"""
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    probe.settimeout(0.5)
+    try:
+        return probe.connect_ex(("127.0.0.1", port)) == 0
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def _port_owner_pid(port: int) -> int | None:
+    """尽力返回占用端口的进程 PID，用于给出可操作的提示；查不到时返回 None。"""
+    if os.name != "nt":
+        return None
+    try:
+        result = subprocess.run(
+            ["netstat", "-ano"], capture_output=True, text=True, timeout=5, check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    for line in result.stdout.splitlines():
+        parts = line.split()
+        if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
+            with suppress(ValueError):
+                pid = int(parts[4])
+                if pid != os.getpid():
+                    return pid
+    return None
+
+
 def serve(*, port: int = 8000, open_browser: bool = True) -> int:
     """Start the local API, SSE endpoint and production frontend."""
-    import os
-
     os.chdir(ROOT)
+    if port and _port_already_serving(port):
+        pid = _port_owner_pid(port)
+        hint = (
+            f"占用进程 PID={pid}，可在 PyCharm 停止对应实例，或运行：Stop-Process -Id {pid}"
+            if pid is not None else "请在 PyCharm 里停止旧的运行实例"
+        )
+        print(
+            f"[BLOCKED] 127.0.0.1:{port} 已有服务在监听；可能存在未停止的旧后端进程，"
+            f"多实例会互相抢答请求。{hint}。"
+        )
+        return 2
     settings = get_settings()
+    config_path = CONFIG_PATH if CONFIG_PATH.exists() else EXAMPLE_PATH
+    logger.bind(component="startup").info(
+        "config_path={} image_provider={} image_base_url={} image_model={}",
+        config_path.resolve(), settings.image.provider, settings.image.base_url,
+        settings.image.model,
+    )
     app = StudioApplication()
     server = make_server(app, port)
     url = f"http://127.0.0.1:{server.server_port}"
@@ -1210,8 +1906,14 @@ def serve(*, port: int = 8000, open_browser: bool = True) -> int:
             return "BLOCKED"
         return "READY"
 
+    image_name = "Qwen Image" if settings.image.provider == "alibaba-qwen-image" else "Jimeng"
+    image_credentials = (
+        (settings.image.api_key,) if settings.image.provider == "alibaba-qwen-image"
+        else (settings.image.access_key, settings.image.secret_key)
+    )
     rows = (
         ("Config", "READY", settings.app.name),
+        ("Config Path", "READY", str(config_path.resolve())),
         ("Database", "READY", str(app.runtime_store.path)),
         ("Runtime", "READY", "Graph + checkpoint"),
         ("Logging", "READY", str(ROOT / "data" / "logs" / "kantoku.log")),
@@ -1220,10 +1922,8 @@ def serve(*, port: int = 8000, open_browser: bool = True) -> int:
             "Ark Vision", provider_status(settings.llm.vision_api_key),
             settings.llm.model_vision,
         ),
-        (
-            "Jimeng", provider_status(settings.image.access_key, settings.image.secret_key),
-            settings.image.model,
-        ),
+        (image_name, provider_status(*image_credentials),
+         f"{settings.image.provider} · {settings.image.model} · {settings.image.base_url}"),
         ("API", "READY", url),
         ("SSE", "READY", f"{url}/api/runs/:id/events/stream"),
     )

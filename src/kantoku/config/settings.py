@@ -90,22 +90,36 @@ class BudgetSettings(BaseModel):
     image_episode_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
     image_shot_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
     image_max_concurrency: int = Field(gt=0, strict=True)
+    image_conversation_cny: Decimal | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
+    autonomous_image_auto_cny: Decimal = Field(
+        default=Decimal(0), ge=0, allow_inf_nan=False
+    )
     token_daily_limit: int = Field(gt=0, strict=True)
 
 
+class ImagePricing(BaseModel):
+    """生图价格表：每个模型每张图的公示单价（元）；未列出的模型用兜底价。"""
+
+    default_cny_per_image: Decimal = Field(gt=0, allow_inf_nan=False)
+    cny_per_image_by_model: dict[str, Decimal] = {}
+
+
 class ImageSettings(BaseModel):
-    """官方生图供应商参数；提交动作与查询动作分开配置。"""
+    """共享生图参数；火山签名字段只供旧即梦适配器使用。"""
 
     provider: str
+    pricing: ImagePricing | None = None
     base_url: str
     model: str
-    region: str
-    service: str
-    api_version: str
-    submit_action: str
-    query_action: str
-    access_key_env: str
-    secret_key_env: str
+    region: str = ""
+    service: str = ""
+    api_version: str = ""
+    submit_action: str = ""
+    query_action: str = ""
+    access_key_env: str = ""
+    secret_key_env: str = ""
     api_key_env: str = "OPENAI_API_KEY"
     quality: str = "medium"
     output_format: str = "png"
@@ -120,14 +134,18 @@ class ImageSettings(BaseModel):
 
     def access_key(self) -> str:
         """仅在真实生图时读取 Access Key。"""
+        if not self.access_key_env:
+            raise ConfigError("即梦 Access Key 环境变量未配置")
         return _require_compact_credential(self.access_key_env, "Access Key ID")
 
     def secret_key(self) -> str:
         """仅在真实生图时读取 Secret Key。"""
+        if not self.secret_key_env:
+            raise ConfigError("即梦 Secret Key 环境变量未配置")
         return _require_compact_credential(self.secret_key_env, "Secret Access Key")
 
     def api_key(self) -> str:
-        """仅在 OpenAI 生图时读取 API Key。"""
+        """仅在 OpenAI 兼容生图时读取 Bearer API Key。"""
         return _require_compact_credential(self.api_key_env, "API Key")
 
 

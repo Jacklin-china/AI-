@@ -16,6 +16,19 @@ from kantoku.tools.image_batch import parse_image_batch
 from kantoku.tools.image_gen import LocalFakeImageProvider, ProviderAccessResult
 
 
+def test_qwen_provider_factory_uses_alibaba_adapter(monkeypatch: pytest.MonkeyPatch) -> None:
+    expected = object()
+    factory = MagicMock(return_value=expected)
+    monkeypatch.setattr(
+        image_cli, "get_settings",
+        lambda: SimpleNamespace(image=SimpleNamespace(provider="alibaba-qwen-image")),
+    )
+    monkeypatch.setattr(image_cli, "AlibabaQwenImageProvider", factory)
+
+    assert image_cli._provider() is expected
+    factory.assert_called_once_with()
+
+
 @pytest.fixture
 def environment(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> SimpleNamespace:
     settings = SimpleNamespace(

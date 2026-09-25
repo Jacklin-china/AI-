@@ -1,48 +1,48 @@
 <script setup lang="ts">
-import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { computed, nextTick, onMounted, ref, watch } from 'vue'
 import { ArrowDown } from 'lucide-vue-next'
-import type { ConversationMessage, CoreRun } from '../../types'
+import type { ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../../types'
+import { presenterFor } from '../../domains/presenters'
 import type { RuntimeEvent } from '../../services/core'
+import ApprovalCard from '../approval/ApprovalCard.vue'
 import AssistantMessageBlock from './AssistantMessageBlock.vue'
 import AssistantStreamingBlock from './AssistantStreamingBlock.vue'
 import ErrorRecoveryPanel from './ErrorRecoveryPanel.vue'
 import UserMessageBubble from './UserMessageBubble.vue'
 import WorkflowActivity from './WorkflowActivity.vue'
-const props = defineProps<{ messages: ConversationMessage[]; streaming: string; run: CoreRun | null; activities?: RuntimeEvent[]; error: string; emptyHint?: string; examples?: string[] }>()
-defineEmits<{ retry: []; openRun: [run: CoreRun]; example: [text: string] }>()
+interface InlineRunState {
+  run: CoreRun
+  activities: RuntimeEvent[]
+  approval: CoreApproval | null
+  artifact: CoreArtifact | null
+  imageUrl: string
+  videoUrl: string
+}
+const props = defineProps<{
+  messages: ConversationMessage[]; streaming: string; run: CoreRun | null
+  activities?: RuntimeEvent[]; imageUrl?: string
+  approvalBusy?: boolean; homeMode?: boolean
+  streamingByMessage?: Record<string, string>; errorMessageId?: string
+  pendingMessages?: Record<string, 'queued' | 'replying' | 'failed'>
+  activityByMessage?: Record<string, string>
+  imagePhases?: Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>
+  messageMedia?: Record<string, { type: 'image' | 'video'; url: string }>
+  messageMediaErrors?: Record<string, boolean>
+  mediaJobs?: MediaJob[]
+  inlineRuns?: Record<string, InlineRunState>
+  error: string; emptyHint?: string; examples?: string[]
+}>()
+defineEmits<{
+  retry: []; openRun: [run: CoreRun]; example: [text: string]
+  decideInline: [messageId: string, action: 'approve' | 'reject' | 'revise', response: Record<string, unknown>]
+}>()
 const scroller = ref<HTMLElement | null>(null)
 const atBottom = ref(true)
 function check(): void { const el = scroller.value; if (el) atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 72 }
-function bottom(): void { scroller.value?.scrollTo({ top: scroller.value.scrollHeight, behavior: 'smooth' }) }
-
-const displayedStreaming = ref('')
-let pendingChars = ''
-let consumed = 0
-let drainTimer: number | null = null
-
-function drain(): void {
-  if (!pendingChars) { drainTimer = null; return }
-  const step = Math.max(1, Math.ceil(pendingChars.length / 24))
-  displayedStreaming.value += pendingChars.slice(0, step)
-  pendingChars = pendingChars.slice(step)
-  drainTimer = window.setTimeout(drain, 24)
-}
-
-watch(() => props.streaming, (value) => {
-  if (value.length <= consumed) {
-    consumed = 0
-    pendingChars = ''
-    displayedStreaming.value = ''
-    if (drainTimer !== null) { window.clearTimeout(drainTimer); drainTimer = null }
-    if (!value) return
-  }
-  pendingChars += value.slice(consumed)
-  consumed = value.length
-  if (drainTimer === null) drainTimer = window.setTimeout(drain, 24)
-})
+function bottom(smooth = false): void { scroller.value?.scrollTo({ top: scroller.value.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }) }
 
 let prevMessageCount = 0
-watch(() => [props.messages.length, displayedStreaming.value, props.run?.status, props.activities?.length], async () => {
+watch(() => [props.messages.length, props.streaming, props.streamingByMessage, props.run?.status, props.activities?.length, props.imageUrl, props.inlineRuns, props.imagePhases, props.messageMedia], async () => {
   const count = props.messages.length
   const ownMessageSent = count !== prevMessageCount && props.messages[count - 1]?.role === 'user'
   prevMessageCount = count
@@ -51,7 +51,76 @@ watch(() => [props.messages.length, displayedStreaming.value, props.run?.status,
   if (ownMessageSent || follow) bottom()
 })
 onMounted(check)
-onBeforeUnmount(() => { if (drainTimer !== null) window.clearTimeout(drainTimer) })
+
+function imageRequestId(message: ConversationMessage): string | null {
+  return message.event_id?.startsWith('generation-prompt:')
+    ? message.event_id.slice('generation-prompt:'.length) : null
+}
+
+function imageResult(requestId: string): ConversationMessage | undefined {
+  return props.messages.find((item) => item.event_id === `generation-artifact:${requestId}`)
+}
+
+function mediaJobForUser(message: ConversationMessage): MediaJob | undefined {
+  const requestId = message.event_id?.startsWith('generation-user:')
+    ? message.event_id.slice('generation-user:'.length) : null
+  return requestId ? props.mediaJobs?.find((job) => job.generation_request_id === requestId) : undefined
+}
+
+function hasImagePrompt(requestId: string): boolean {
+  return props.messages.some((item) => item.event_id === `generation-prompt:${requestId}`)
+}
+
+function hasFailureMessage(requestId: string): boolean {
+  return props.messages.some((item) => item.event_id?.startsWith(`generation-error:${requestId}`)
+    || item.event_id?.startsWith(`generation-status:${requestId}`))
+}
+
+function isHomeImageArtifact(message: ConversationMessage): boolean {
+  return message.event_id?.startsWith('generation-artifact:') ?? false
+}
+
+function imagePlaceholderRatio(requestId: string): string {
+  const phase = props.imagePhases?.[requestId]
+  const ratio = phase && phase.height > 0 ? phase.width / phase.height : 1
+  return String(Math.max(0.75, Math.min(ratio, 2)))
+}
+
+function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
+  if (run.status === 'completed') return '已完成'
+  if (run.status === 'failed') return '这次没有完成'
+  if (run.status === 'cancelled') return '已取消'
+  const approvalKind = String(approval?.request.kind ?? '')
+  if (run.status === 'waiting' && approvalKind === 'cost_approval') return '等待费用确认'
+  if (run.status === 'waiting' && approvalKind === 'creative_review') return '画面已生成，等待你审核'
+  if (run.status === 'waiting') return '等待你确认'
+  const labels: Record<string, string> = {
+    prepare: '正在准备画面', generate: '正在生成图片', video: '正在生成视频',
+    qc: '正在检查画面', archive: '正在保存结果', rework: '正在修改画面',
+    requirement: '正在理解需求', source_search: '正在收集资料',
+    asset_generation: '正在制作素材', localize: '正在整理内容',
+  }
+  return labels[run.current_node] ?? '正在处理'
+}
+
+function homeError(state: InlineRunState): string {
+  const failure = [...state.activities].reverse().find((event) =>
+    event.event_type === 'run_failed' || event.event_type === 'node_failed',
+  )
+  if (!failure) return state.run.status === 'failed' ? '生成未完成，请稍后查看错误记录。' : ''
+  const message = String(failure.payload.safe_message ?? '生成未完成，请稍后查看错误记录。')
+  const errorId = failure.payload.error_id ? ` · 错误编号：${String(failure.payload.error_id)}` : ''
+  return `${message}${errorId}`
+}
+
+function qcSummary(run: CoreRun): string {
+  const result = run.state?.qc_result
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return ''
+  const qc = result as Record<string, unknown>
+  if (typeof qc.reason === 'string' && qc.reason.trim()) return `画面检查：${qc.reason.trim()}`
+  if (qc.composition_ok === true && qc.broken_hands === false && qc.watermark === false) return '画面已通过预筛，等待你确认。'
+  return '画面检查已完成，请确认结果。'
+}
 
 const TERMINAL_STATUSES = ['completed', 'failed', 'cancelled']
 const activityAnchor = ref<number | null>(null)
@@ -108,7 +177,13 @@ function activityText(event: RuntimeEvent): string {
     approval_resolved: '已记录你的决定', cost_updated: '费用已更新',
     run_completed: '任务完成', run_failed: '任务失败', run_waiting: '等待确认',
   }
-  return `${event.node_id ? `${event.node_id} · ` : ''}${labels[event.event_type] ?? event.event_type}`
+  const nodeName = event.node_id ? `${props.run ? presenterFor(props.run.domain).nodeLabel(event.node_id) : event.node_id} · ` : ''
+  const base = labels[event.event_type] ?? event.event_type
+  if (event.event_type === 'node_failed' || event.event_type === 'run_failed') {
+    const reason = String(event.payload.safe_message ?? '').trim()
+    if (reason) return `${nodeName}${base}：${reason}`
+  }
+  return `${nodeName}${base}`
 }
 </script>
 <template>
@@ -122,9 +197,49 @@ function activityText(event: RuntimeEvent): string {
         </div>
       </template>
       <template v-for="(message, index) in messages" :key="message.id">
-        <UserMessageBubble v-if="message.role === 'user'" :content="message.content" />
-        <AssistantMessageBlock v-else-if="message.role === 'assistant'" :content="message.content" />
-        <div v-if="activityAnchor === index + 1 && activityLines.length" class="runtime-activity-list anchored" aria-label="任务进度">
+        <UserMessageBubble v-if="message.role === 'user'" :content="message.content" :pending="homeMode && !activityByMessage?.[message.id] && !imagePhases?.[message.id] ? pendingMessages?.[message.id] : undefined" />
+        <div v-if="homeMode && mediaJobForUser(message) && !hasImagePrompt(mediaJobForUser(message)!.generation_request_id)" class="chat-image-generation" aria-live="polite">
+          <template v-if="['pending', 'generating'].includes(mediaJobForUser(message)!.status)">
+            <div class="chat-image-wave" role="status" :aria-label="mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片'"><span v-for="(character, position) in (mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span></div>
+            <div class="chat-image-skeleton" role="img" aria-label="图片生成中"></div>
+          </template>
+          <p v-else-if="mediaJobForUser(message)!.status === 'failed' && !hasFailureMessage(mediaJobForUser(message)!.generation_request_id)" class="chat-inline-error" role="alert">{{ mediaJobForUser(message)!.error_message }}</p>
+        </div>
+        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" />
+        <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
+          <template v-if="imageResult(imageRequestId(message)!)?.artifact_id">
+            <figure v-if="messageMedia?.[imageResult(imageRequestId(message)!)!.id]" class="chat-generated-image">
+              <img :src="messageMedia[imageResult(imageRequestId(message)!)!.id].url" alt="此聊天生成的图片" />
+            </figure>
+            <p v-else-if="messageMediaErrors?.[imageResult(imageRequestId(message)!)!.id]" class="chat-image-load-error" role="alert">图片已保存，但预览暂时无法加载。</p>
+            <div v-else class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="status" aria-label="正在载入图片"></div>
+          </template>
+          <template v-else-if="['generating', 'ready', 'summarized'].includes(imagePhases?.[imageRequestId(message)!]?.status ?? '')">
+            <div class="chat-image-wave" role="status" :aria-label="imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片'">
+              <span v-for="(character, position) in (imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span>
+            </div>
+            <div class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="img" aria-label="图片生成中"></div>
+          </template>
+          <p v-else-if="imagePhases?.[imageRequestId(message)!]?.status === 'failed' && !hasFailureMessage(imageRequestId(message)!)" class="chat-inline-error" role="alert">{{ mediaJobs?.find((job) => job.generation_request_id === imageRequestId(message))?.error_message ?? '图片生成未完成，请查看错误记录。' }}</p>
+        </div>
+        <p v-if="homeMode && activityByMessage?.[message.id]" class="chat-inline-status chat-direct-status">{{ activityByMessage[message.id] }}</p>
+        <figure v-if="homeMode && messageMedia?.[message.id] && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
+          <img v-if="messageMedia[message.id].type === 'image'" :src="messageMedia[message.id].url" alt="此聊天生成的图片" />
+          <video v-else :src="messageMedia[message.id].url" controls preload="metadata" />
+          <figcaption>{{ messageMedia[message.id].type === 'image' ? '生成的图片' : '生成的视频' }}</figcaption>
+        </figure>
+        <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" />
+        <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
+        <section v-if="homeMode && inlineRuns?.[message.id]" class="chat-inline-activity" aria-live="polite">
+          <p class="chat-inline-status">{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</p>
+          <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
+          <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>
+          <figure v-if="inlineRuns[message.id].imageUrl" class="chat-generated-image"><img :src="inlineRuns[message.id].imageUrl" alt="生成的图片" /><figcaption>{{ inlineRuns[message.id].artifact ? '图片已保存' : '图片已生成，等待审核' }}</figcaption></figure>
+          <figure v-if="inlineRuns[message.id].videoUrl" class="chat-generated-image"><video :src="inlineRuns[message.id].videoUrl" controls preload="metadata" /><figcaption>视频已保存</figcaption></figure>
+          <p v-else-if="inlineRuns[message.id].artifact?.type === 'video'" class="chat-inline-status">视频已保存，预览暂不可用。</p>
+          <ApprovalCard v-if="inlineRuns[message.id].approval" :approval="inlineRuns[message.id].approval!" :domain="inlineRuns[message.id].run.domain" :busy="approvalBusy ?? false" :image-url="inlineRuns[message.id].imageUrl" home-mode @decide="(action, response) => $emit('decideInline', message.id, action, response)" />
+        </section>
+        <div v-if="!homeMode && activityAnchor === index + 1 && activityLines.length" class="runtime-activity-list anchored" aria-label="任务进度">
           <button type="button" class="activity-toggle" :data-status="run?.status" @click="activityExpanded = !activityExpanded">
             <span>{{ runSummary }}</span>
             <small>{{ activityExpanded ? '收起执行明细' : `查看执行明细（${activities?.length ?? 0}）` }}</small>
@@ -137,16 +252,17 @@ function activityText(event: RuntimeEvent): string {
           </template>
         </div>
       </template>
-      <AssistantStreamingBlock v-if="streaming || displayedStreaming" :content="displayedStreaming" />
-      <div v-if="activityAnchor === null && activityLines.length" class="runtime-activity-list" aria-label="任务进度">
+      <AssistantStreamingBlock v-if="!homeMode && streaming" :content="streaming" />
+      <div v-if="!homeMode && activityAnchor === null && activityLines.length" class="runtime-activity-list" aria-label="任务进度">
         <div v-for="event in activityLines" :key="event.id" class="runtime-activity" :data-event="event.event_type">
           <span>{{ ['node_completed', 'run_completed', 'artifact_created'].includes(event.event_type) ? '✓' : event.event_type.includes('failed') ? '!' : '●' }}</span>
           <span>{{ activityText(event) }}</span>
         </div>
       </div>
-      <WorkflowActivity v-if="run" :run="run" @open="$emit('openRun', $event)" />
-      <ErrorRecoveryPanel v-if="error" :message="error" @retry="$emit('retry')" />
+      <figure v-if="!homeMode && imageUrl" class="chat-generated-image"><img :src="imageUrl" alt="已生成的图片" /><figcaption>{{ run?.status === 'completed' ? '生成结果 · 已完成' : '生成结果 · 等待人工审核后归档' }}</figcaption></figure>
+      <WorkflowActivity v-if="!homeMode && run" :run="run" @open="$emit('openRun', $event)" />
+      <ErrorRecoveryPanel v-if="!homeMode && error" :message="error" @retry="$emit('retry')" />
     </div>
-    <button v-if="!atBottom" type="button" class="back-bottom" @click="bottom"><ArrowDown :size="14" />回到底部</button>
+    <button v-if="!atBottom" type="button" class="back-bottom" @click="bottom(true)"><ArrowDown :size="14" />回到底部</button>
   </div>
 </template>

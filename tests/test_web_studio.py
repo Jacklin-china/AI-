@@ -2,9 +2,12 @@
 
 import json
 import re
+import socket
 import threading
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,11 +15,19 @@ from types import SimpleNamespace
 import pytest
 from test_image_gen import _settings
 
+from kantoku.capabilities import creative
 from kantoku.config import ToolError, logging_setup
 from kantoku.core import budget
-from kantoku.core.conversations import ConversationMessageRecord, MessageRole, MessageType
+from kantoku.core.conversations import (
+    ConversationMessageRecord,
+    MediaJobStatus,
+    MessageRole,
+    MessageType,
+)
+from kantoku.core.runtime.models import ArtifactType
 from kantoku.domains.comic import services as comic_services
 from kantoku.perception import report, review
+from kantoku.schemas.media import ImageGenerationResult
 from kantoku.schemas.qc import QcResult
 from kantoku.shells import web_studio
 from kantoku.tools import archive, studio
@@ -30,6 +41,8 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
         prompt_max_chars=1000, force_single=True, model="test", width=100, height=100
     )
     settings.llm = SimpleNamespace(model_chat="text-test", model_vision="vision-test")
+    settings.budget.autonomous_image_auto_cny = Decimal("0.30")
+    settings.budget.image_conversation_cny = Decimal("5.00")
     for module in (web_studio, studio, budget):
         monkeypatch.setattr(module, "get_settings", lambda: settings)
     for module in (review, report, archive):
@@ -37,6 +50,11 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
     monkeypatch.setattr(archive, "_archive_root", lambda: tmp_path / "archive")
     provider = LocalFakeImageProvider(tmp_path / "output", model_id="test", actual_fen=30)
     monkeypatch.setattr(web_studio, "_provider", lambda: provider)
+    monkeypatch.setattr(web_studio, "_brief_deltas", lambda brief: iter([brief]))
+    monkeypatch.setattr(
+        web_studio, "_image_result_summary",
+        lambda requirement, _prompt, _trace: f"已按你的要求生成一张{requirement}。",
+    )
     return web_studio.StudioApplication()
 
 
@@ -561,3 +579,745 @@ def test_execution_confirmation_needs_short_phrase_and_prior_guidance() -> None:
     assert web_studio._is_execution_confirmed("可以", user_only) is False
     assert web_studio._is_execution_confirmed("可以" * 40, assistant) is False
     assert web_studio._is_execution_confirmed("帮我做一张图", assistant) is False
+
+
+def test_home_image_chat_generates_conversation_artifact_without_run_or_studio_task(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_studio, "_enhance_prompt", lambda text, _trace: text)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    request = {
+        "content": "生成一个蜡笔小新头像",
+        "generation_request_id": "generation-home-test-1",
+    }
+    events = list(app.stream_conversation(conversation["id"], request))
+    assert not any(name == "run" for name, _ in events)
+    assert not app.runtime_store.list_runs()
+    assert not app.list_core_runs()
+    assert not studio.list_tasks()
+    assert not app.runtime_store.list_approvals()
+    message = next(payload for name, payload in events
+                   if name == "message" and payload["type"] == "artifact")
+    assert message["type"] == "artifact"
+    artifact = app.runtime_store.get_artifact(message["artifact_id"])
+    assert artifact.conversation_id == conversation["id"]
+    assert artifact.run_id is None
+    assert not app.query_core_artifacts()
+    assert Path(str(artifact.location)).is_file()
+    assert app.runtime_store.get_conversation(conversation["id"]).active_run_id is None
+    reservation = budget.get_reservation(request["generation_request_id"])
+    assert reservation is not None
+    assert reservation.conversation_id == conversation["id"]
+    assert reservation.run_id is None
+    assert reservation.artifact_id == artifact.id
+    assert reservation.status == "settled"
+    restored = type(app.runtime_store)(app.runtime_store.path)
+    restored_messages = restored.list_conversation_messages(conversation["id"])
+    assert any(item.artifact_id == artifact.id for item in restored_messages)
+    assert restored_messages[-1].event_id == "generation-summary:generation-home-test-1"
+    replay = list(app.stream_conversation(conversation["id"], request))
+    assert next(payload for name, payload in replay
+                if name == "message" and payload["type"] == "artifact")["id"] == message["id"]
+    assert app.image_service.provider.submit_count == 1
+
+
+def test_home_natural_image_request_skips_parameter_questions_and_preserves_subject(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    subject = "请给我一张蜡笔小新中正男的卡通图片"
+    monkeypatch.setattr(web_studio, "_enhance_prompt", lambda text, _trace: f"原始主体：{text}")
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": subject, "generation_request_id": "generation-home-natural-language",
+    }))
+
+    assert next(payload for name, payload in events if name == "intent")["tool"] == "image.generate"
+    names = [name for name, _ in events]
+    assert names.index("prompt_prepared") < names.index("image_generating")
+    assert names.index("image_generating") < names.index("image_ready")
+    assert names.index("image_ready") < names.index("image_summary")
+    prepared = next(payload for name, payload in events
+                    if name == "message" and payload["event_id"].startswith("generation-prompt:"))
+    assert "正男" in prepared["content"]
+    message = next(payload for name, payload in events
+                   if name == "message" and payload["type"] == "artifact")
+    assert message["type"] == "artifact"
+    assert subject in app.runtime_store.get_conversation_generation(
+        "generation-home-natural-language"
+    )["prompt"]
+    assert not app.runtime_store.list_runs()
+    assert not app.runtime_store.list_approvals()
+
+
+def test_home_image_followups_generate_again_without_clarification(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_studio, "_enhance_prompt", lambda text, _trace: text)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    for index, (content, expected_action) in enumerate((
+        ("帮我生成一张干物妹小埋中的海老名卡通图片", "image.generate"),
+        ("再帮我生成小埋", "image.generate"),
+        ("换成海老名", "image.edit"),
+    )):
+        request_id = f"generation-followup-{index}"
+        events = list(app.stream_conversation(conversation["id"], {
+            "content": content, "generation_request_id": request_id,
+        }))
+        intent = next(payload for name, payload in events if name == "intent")
+        assert intent["tool"] == expected_action
+        assert any(name == "message" and payload["type"] == "artifact" for name, payload in events)
+        assert not any(
+            "确认" in payload.get("content", "")
+            for name, payload in events if name == "message"
+        )
+        assert content in app.runtime_store.get_conversation_generation(request_id)["prompt"]
+    assert app.image_service.provider.submit_count == 3
+    assert not app.runtime_store.list_runs()
+    assert not app.runtime_store.list_approvals()
+
+
+def test_image_brief_streams_before_provider_submission(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        web_studio, "_brief_deltas",
+        lambda brief: (brief[i:i + 5] for i in range(0, len(brief), 5)),
+    )
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    events = []
+    for name, payload in app.stream_conversation(conversation["id"], {
+        "content": "帮我生成小埋卡通头像", "generation_request_id": "generation-brief-chunks",
+    }):
+        events.append((name, payload))
+        if name == "delta":
+            assert app.image_service.provider.submit_count == 0
+    chunks = [payload["content"] for name, payload in events if name == "delta"]
+    assert len(chunks) > 1
+    assert all(len(chunk) <= 5 for chunk in chunks)
+    assert "小埋" in "".join(chunks)
+    assert app.image_service.provider.submit_count == 1
+    assert "小埋" in app.runtime_store.get_conversation_generation(
+        "generation-brief-chunks"
+    )["prompt"]
+
+
+def test_generic_image_followup_reuses_subject_instead_of_inventing_one(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_studio, "_enhance_prompt", lambda text, _trace: text)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    app.runtime_store.add_conversation_message(
+        conversation["id"], role=MessageRole.USER, type=MessageType.TEXT,
+        content="请给我一张蜡笔小新中正男的卡通图片",
+    )
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": "生成图片", "generation_request_id": "generation-home-context-followup",
+    }))
+    assert any(name == "message" and payload["type"] == "artifact" for name, payload in events)
+    assert "正男" in app.runtime_store.get_conversation_generation(
+        "generation-home-context-followup"
+    )["prompt"]
+
+
+def test_home_creative_followup_uses_completed_artifact_as_real_reference(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    submitted: list[tuple[str, tuple[str, ...]]] = []
+    original_submit = provider.submit
+
+    def capture_submit(**kwargs: object) -> str:
+        submitted.append((str(kwargs["prompt"]), tuple(kwargs["reference_urls"])))
+        return original_submit(**kwargs)
+
+    monkeypatch.setattr(provider, "submit", capture_submit)
+    monkeypatch.setattr(creative, "chat", lambda *_args, **_kwargs: SimpleNamespace(
+        content=(
+            '{"action":"image.edit","subject":"熊二","style":"写实",'
+            '"composition":"半身头像","background":"树林","use_reference":true}'
+        ),
+    ))
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    first = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成熊大的写实头像", "generation_request_id": "generation-creative-first",
+    }))
+    first_artifact = next(payload["artifact_id"] for name, payload in first
+                          if name == "image_ready")
+    second = list(app.stream_conversation(conversation["id"], {
+        "content": "把熊二的卡通照片跟熊大的一样给我就行",
+        "generation_request_id": "generation-creative-second",
+    }))
+    assert any(name == "image_ready" for name, _ in second)
+    assert provider.submit_count == 2
+    assert not submitted[0][1]
+    assert submitted[1][1][0].startswith("data:image/png;base64,")
+    assert "把熊二的卡通照片跟熊大的一样给我就行" in submitted[1][0]
+    saved = app.runtime_store.get_conversation_generation("generation-creative-second")
+    assert saved["reference_artifact_id"] == first_artifact
+    assert json.loads(saved["context_json"])["subject"] == "熊二"
+    second_artifact = app.runtime_store.list_artifacts(conversation_id=conversation["id"])[0]
+    assert second_artifact.metadata["parent_artifact_id"] == first_artifact
+    assert not app.runtime_store.list_runs()
+    replay = list(app.stream_conversation(conversation["id"], {
+        "content": "把熊二的卡通照片跟熊大的一样给我就行",
+        "generation_request_id": "generation-creative-second",
+    }))
+    assert any(name == "image_ready" for name, _ in replay)
+    assert provider.submit_count == 2
+
+    before = provider.submit_count
+    reminder = list(app.stream_conversation(conversation["id"], {"content": "图片在哪里"}))
+    assert provider.submit_count == before
+    assert any(name == "message" and payload["artifact_id"] == second_artifact.id
+               for name, payload in reminder)
+
+
+@pytest.mark.parametrize(("suffix", "image_bytes", "mime"), [
+    ("png", b"\x89PNG\r\n\x1a\nlegacy-image", "image/png"),
+    ("jpg", b"\xff\xd8\xfflegacy-image", "image/jpeg"),
+    ("webp", b"RIFF\x10\x00\x00\x00WEBPlegacy-image", "image/webp"),
+])
+def test_home_recovers_legacy_image_context_without_media_job(
+    app: web_studio.StudioApplication, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, suffix: str, image_bytes: bytes, mime: str,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    app.runtime_store.add_conversation_message(
+        conversation["id"], role=MessageRole.USER, type=MessageType.TEXT,
+        content="帮我生成熊大的卡通头像",
+    )
+    image_path = tmp_path / f"legacy.{suffix}"
+    image_path.write_bytes(image_bytes)
+    artifact = app.runtime_store.create_artifact(
+        type=ArtifactType.IMAGE, conversation_id=conversation["id"],
+        node_id="image.generate", source="conversation.image.generate",
+        location=str(image_path),
+    )
+    app.runtime_store.add_conversation_message(
+        conversation["id"], role=MessageRole.ASSISTANT, type=MessageType.ARTIFACT,
+        content="图片已生成", artifact_id=artifact.id,
+    )
+    context = app._recent_image_context(conversation["id"])
+    assert context is not None
+    assert context.artifact_id == artifact.id
+    assert "熊大" in context.subject
+    provider = app.image_service.provider
+    original_submit = provider.submit
+    references: list[tuple[str, ...]] = []
+
+    def capture_submit(**kwargs: object) -> str:
+        references.append(tuple(kwargs["reference_urls"]))
+        return original_submit(**kwargs)
+
+    monkeypatch.setattr(provider, "submit", capture_submit)
+    monkeypatch.setattr(creative, "chat", lambda *_args, **_kwargs: SimpleNamespace(
+        content='{"action":"image.edit","subject":"熊二","use_reference":true}',
+    ))
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": "把熊二做成和熊大一样", "generation_request_id": f"legacy-{suffix}",
+    }))
+    assert any(name == "image_ready" for name, _ in events)
+    assert references[0][0].startswith(f"data:{mime};base64,")
+
+
+def test_prompt_enhancer_cannot_replace_user_character(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = "请给我一张蜡笔小新中正男的卡通图片"
+    monkeypatch.setattr(
+        web_studio, "chat", lambda _messages: SimpleNamespace(content="古镇雨巷里的白衣女子"),
+    )
+    prompt = web_studio._enhance_prompt(original, "trace-preserve-subject")
+    assert original in prompt
+    assert "白衣女子" not in prompt
+    assert "古镇雨巷" not in prompt
+
+
+def test_home_image_brief_and_model_summary_keep_the_requested_subject(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = "帮我生成鬼灭之刃无一郎的卡通头像"
+    prompt = f"严格遵照用户原始要求：{requirement}。主体居中，轮廓清晰。"
+    monkeypatch.setattr(
+        web_studio, "chat",
+        lambda _messages: SimpleNamespace(content=json.dumps({
+            "elements": "无一郎", "style": "卡通", "composition": "主体居中",
+        })),
+    )
+    brief = web_studio._image_brief(requirement)
+    summary = web_studio._image_result_summary(requirement, prompt, "trace-summary")
+    assert brief.startswith("我会生成一张鬼灭之刃无一郎的卡通头像")
+    assert "无一郎" in summary and "卡通" in summary and "主体居中" in summary
+    assert "白衣女子" not in summary
+
+
+def test_home_image_summary_ignores_unverified_model_details(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    requirement = "请给我一张蜡笔小新中正男的卡通图片"
+    monkeypatch.setattr(
+        web_studio, "chat",
+        lambda _messages: SimpleNamespace(content=json.dumps({
+            "elements": "白衣女子", "style": "油画", "composition": "雨巷",
+        })),
+    )
+    summary = web_studio._image_result_summary(requirement, requirement, "trace-summary")
+    assert "正男" in summary
+    assert "白衣女子" not in summary
+    assert "雨巷" not in summary
+
+
+def test_home_image_flow_ignores_unrelated_model_prompt_text(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    original = "请给我一张蜡笔小新中正男的卡通图片"
+    monkeypatch.setattr(
+        web_studio, "chat", lambda _messages: SimpleNamespace(content="古镇雨巷里的白衣女子"),
+    )
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": original, "generation_request_id": "generation-preserve-character",
+    }))
+    assert any(name == "message" and payload["type"] == "artifact" for name, payload in events)
+    saved = app.runtime_store.get_conversation_generation("generation-preserve-character")
+    assert saved is not None
+    prompt = saved["prompt"]
+    assert original in prompt
+    assert "白衣女子" not in prompt
+
+
+def test_home_video_intent_does_not_start_mock_generation(
+    app: web_studio.StudioApplication,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我制作一段猫咪奔跑的视频",
+    }))
+    assert next(payload for name, payload in events if name == "intent")["tool"] == "video.generate"
+    message = next(payload for name, payload in events if name == "message")
+    assert "尚未接入真实视频生成服务" in message["content"]
+    assert not app.runtime_store.list_runs()
+    assert not app.runtime_store.list_artifacts(conversation_id=conversation["id"])
+
+
+def test_home_image_http_stream_returns_real_artifact_only_in_chat(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+    try:
+        connection.request(
+            "POST", "/api/conversations",
+            body=json.dumps({"interaction_mode": "autonomous"}), headers=headers,
+        )
+        response = connection.getresponse()
+        conversation = json.loads(response.read())
+        assert response.status == 201
+        connection.request(
+            "POST", f"/api/conversations/{conversation['id']}/messages/stream",
+            body=json.dumps({
+                "content": "生成一个蜡笔小新头像",
+                "generation_request_id": "generation-http-home-test",
+            }),
+            headers=headers,
+        )
+        response = connection.getresponse()
+        stream = response.read().decode("utf-8")
+        assert response.status == 200
+        assert "event: prompt_prepared" in stream
+        assert "event: image_generating" in stream
+        assert "event: image_ready" in stream
+        assert "event: image_summary" in stream
+        assert "event: run" not in stream
+        assert "event: error" not in stream
+        assert "event: approval" not in stream
+        assert "\"type\": \"artifact\"" in stream
+        artifact = app.runtime_store.list_artifacts(conversation_id=conversation["id"])[0]
+        connection.request(
+            "GET", f"/api/artifacts/{artifact.id}/content",
+            headers={"X-Studio-Token": app.token},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert response.read().startswith(b"\x89PNG")
+        connection.request("GET", "/api/runs", headers={"X-Studio-Token": app.token})
+        response = connection.getresponse()
+        assert json.loads(response.read())["runs"] == []
+        connection.request("GET", "/api/state", headers={"X-Studio-Token": app.token})
+        response = connection.getresponse()
+        assert json.loads(response.read())["tasks"] == []
+    finally:
+        connection.close()
+
+
+def test_another_conversation_replies_while_image_generation_is_waiting(
+    server: int, app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    image_chat = app.create_conversation({"interaction_mode": "autonomous"})
+    ordinary_chat = app.create_conversation({"interaction_mode": "autonomous"})
+    generating = threading.Event()
+    release = threading.Event()
+    image_response: list[str] = []
+    original_generate = app.image_service.generate
+
+    def slow_generate(**kwargs: object) -> ConversationMessageRecord:
+        generating.set()
+        assert release.wait(5)
+        return original_generate(**kwargs)
+
+    monkeypatch.setattr(app.image_service, "generate", slow_generate)
+    monkeypatch.setattr(
+        web_studio, "stream_chat", lambda *_args, **_kwargs: iter(["普通聊天已回复"]),
+    )
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request_image() -> None:
+        connection = HTTPConnection("127.0.0.1", server, timeout=8)
+        try:
+            connection.request(
+                "POST", f"/api/conversations/{image_chat['id']}/messages/stream",
+                body=json.dumps({
+                    "content": "帮我生成一张小埋卡通图片",
+                    "generation_request_id": "generation-concurrent-image",
+                }), headers=headers,
+            )
+            image_response.append(connection.getresponse().read().decode("utf-8"))
+        finally:
+            connection.close()
+
+    thread = threading.Thread(target=request_image, daemon=True)
+    thread.start()
+    try:
+        assert generating.wait(5)
+        connection = HTTPConnection("127.0.0.1", server, timeout=2)
+        try:
+            connection.request(
+                "POST", f"/api/conversations/{ordinary_chat['id']}/messages/stream",
+                body=json.dumps({"content": "你好"}), headers=headers,
+            )
+            response = connection.getresponse()
+            body = response.read().decode("utf-8")
+            assert response.status == 200
+            assert "普通聊天已回复" in body
+            assert not image_response
+        finally:
+            connection.close()
+    finally:
+        release.set()
+        thread.join(8)
+    assert image_response and "event: image_ready" in image_response[0]
+
+
+def test_two_chats_generate_images_and_reopen_recovers_persisted_state(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    original_query = provider.query
+    first_query = threading.Event()
+    second_query = threading.Event()
+    release = threading.Event()
+    query_lock = threading.Lock()
+    query_count = 0
+
+    def waiting_query(provider_job_id: str) -> ImageGenerationResult:
+        nonlocal query_count
+        with query_lock:
+            query_count += 1
+            (first_query if query_count == 1 else second_query).set()
+        assert release.wait(5)
+        return original_query(provider_job_id)
+
+    monkeypatch.setattr(provider, "query", waiting_query)
+    chat_a = app.create_conversation({"interaction_mode": "autonomous"})
+    chat_b = app.create_conversation({"interaction_mode": "autonomous"})
+    stream_a = app.stream_conversation(chat_a["id"], {
+        "content": "帮我生成熊二图片", "generation_request_id": "generation-bear-a",
+    })
+    while next(stream_a)[0] != "image_generating":
+        pass
+    assert first_query.wait(5)
+    stream_a.close()  # Simulate leaving/closing the original chat stream.
+    responses_b: list[tuple[str, dict[str, object]]] = []
+    thread = threading.Thread(target=lambda: responses_b.extend(app.stream_conversation(
+        chat_b["id"], {
+            "content": "帮我生成一只蓝色小鸟图片",
+            "generation_request_id": "generation-bird-b",
+        },
+    )), daemon=True)
+    thread.start()
+    try:
+        assert second_query.wait(5), "B must reach the provider while A is still generating"
+        reopened = type(app.runtime_store)(app.runtime_store.path)
+        assert reopened.get_media_job("generation-bear-a").status == MediaJobStatus.GENERATING
+        assert reopened.get_media_job("generation-bird-b").status == MediaJobStatus.GENERATING
+        assert app.conversation(chat_a["id"])["media_jobs"][0]["status"] == "generating"
+        assert any(
+            message["event_id"] == "generation-prompt:generation-bear-a"
+            for message in app.conversation(chat_a["id"])["messages"]
+        )
+    finally:
+        release.set()
+        thread.join(8)
+    assert not thread.is_alive()
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if reopened.get_media_job("generation-bear-a").status == MediaJobStatus.COMPLETED:
+            break
+        time.sleep(0.02)
+    assert reopened.get_media_job("generation-bear-a").status == MediaJobStatus.COMPLETED
+    assert reopened.get_media_job("generation-bird-b").status == MediaJobStatus.COMPLETED
+    assert provider.submit_count == 2
+    assert len(reopened.list_artifacts(conversation_id=chat_a["id"])) == 1
+    assert len(reopened.list_artifacts(conversation_id=chat_b["id"])) == 1
+    assert any(name == "image_ready" for name, _ in responses_b)
+    assert not reopened.list_runs()
+
+
+def test_media_job_cannot_claim_completion_without_real_artifact(
+    app: web_studio.StudioApplication,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    user = app.runtime_store.add_conversation_message(
+        conversation["id"], role=MessageRole.USER,
+        type=MessageType.TEXT, content="生成一张熊二图片",
+    )
+    app.runtime_store.create_media_job("generation-missing-artifact", conversation["id"], user.id)
+    with pytest.raises(ToolError, match="真实 Artifact"):
+        app.runtime_store.update_media_job(
+            "generation-missing-artifact", MediaJobStatus.COMPLETED,
+            artifact_id="artifact-does-not-exist",
+        )
+    assert app.runtime_store.get_media_job("generation-missing-artifact").status == (
+        MediaJobStatus.PENDING
+    )
+
+
+def test_home_image_over_auto_budget_never_submits(
+    app: web_studio.StudioApplication,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": "生成两张蜡笔小新头像",
+        "generation_request_id": "generation-over-auto-test",
+    }))
+    assert not any(name in {"run", "activity"} for name, _ in events)
+    assert next(payload for name, payload in events if name == "message")["type"] == "text"
+    assert app.image_service.provider.submit_count == 0
+    assert not app.runtime_store.list_runs()
+    assert not app.runtime_store.list_artifacts(conversation_id=conversation["id"])
+
+
+def test_home_image_budget_identity_is_conversation_not_project_shot(
+    app: web_studio.StudioApplication,
+) -> None:
+    settings = web_studio.get_settings()
+    settings.budget.image_project_cny = Decimal("0.01")
+    settings.budget.image_episode_cny = Decimal("0.01")
+    settings.budget.image_shot_cny = Decimal("0.01")
+    for index in range(2):
+        conversation = app.create_conversation({"interaction_mode": "autonomous"})
+        request_id = f"generation-independent-chat-{index}"
+        events = list(app.stream_conversation(conversation["id"], {
+            "content": "生成一个蜡笔小新头像",
+            "generation_request_id": request_id,
+        }))
+        assert any(name == "message" and payload["type"] == "artifact" for name, payload in events)
+        reservation = budget.get_reservation(request_id)
+        assert reservation is not None and reservation.conversation_id == conversation["id"]
+    assert app.image_service.provider.submit_count == 2
+
+
+def test_home_image_restart_queries_old_provider_job_without_second_submit(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    original_query = provider.query
+    query_count = 0
+
+    def pending_once(provider_job_id: str) -> ImageGenerationResult:
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            return ImageGenerationResult(
+                path=None, provider_job_id=provider_job_id,
+                status="unknown", actual_fen=None, error="still pending",
+            )
+        return original_query(provider_job_id)
+
+    monkeypatch.setattr(provider, "query", pending_once)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    request = {
+        "content": "生成一个蜡笔小新头像",
+        "generation_request_id": "generation-restart-same-job",
+    }
+    first = list(app.stream_conversation(conversation["id"], request))
+    assert any(name == "message" and payload["type"] == "status" for name, payload in first)
+    assert not any(name == "image_failed" for name, _ in first)
+    assert app.runtime_store.get_media_job(
+        request["generation_request_id"]
+    ).status == MediaJobStatus.GENERATING
+    saved = budget.get_reservation(request["generation_request_id"])
+    assert saved is not None and saved.provider_job_id is not None
+    assert saved.status == "unknown"
+
+    restarted = web_studio.StudioApplication()
+    second = list(restarted.stream_conversation(conversation["id"], request))
+    assert any(name == "message" and payload["type"] == "artifact" for name, payload in second)
+    assert provider.submit_count == 1
+    assert query_count == 2
+    assert budget.get_reservation(request["generation_request_id"]).status == "settled"
+    assert restarted.runtime_store.get_media_job(
+        request["generation_request_id"]
+    ).status == MediaJobStatus.COMPLETED
+    assert not restarted.runtime_store.list_runs()
+
+
+def test_home_image_edit_restart_preserves_reference_without_resubmission(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    first = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成熊大的卡通头像",
+        "generation_request_id": "generation-edit-restart-original",
+    }))
+    reference_id = next(payload["artifact_id"] for name, payload in first
+                        if name == "image_ready")
+    monkeypatch.setattr(creative, "chat", lambda *_args, **_kwargs: SimpleNamespace(
+        content='{"action":"image.edit","subject":"熊二","use_reference":true}',
+    ))
+    original_query = provider.query
+    query_count = 0
+
+    def pending_once(provider_job_id: str) -> ImageGenerationResult:
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            return ImageGenerationResult(
+                path=None, provider_job_id=provider_job_id,
+                status="unknown", actual_fen=None, error="still pending",
+            )
+        return original_query(provider_job_id)
+
+    monkeypatch.setattr(provider, "query", pending_once)
+    request = {
+        "content": "把熊二做成和熊大一样",
+        "generation_request_id": "generation-edit-restart-followup",
+    }
+    pending = list(app.stream_conversation(conversation["id"], request))
+    assert not any(name == "image_ready" for name, _ in pending)
+    saved = app.runtime_store.get_conversation_generation(request["generation_request_id"])
+    assert saved is not None and saved["reference_artifact_id"] == reference_id
+
+    restarted = web_studio.StudioApplication()
+    completed = list(restarted.stream_conversation(conversation["id"], request))
+    artifact_id = next(payload["artifact_id"] for name, payload in completed
+                       if name == "image_ready")
+    artifact = restarted.runtime_store.get_artifact(artifact_id)
+    assert artifact.metadata["parent_artifact_id"] == reference_id
+    assert provider.submit_count == 2  # one original, one edit; restart only queried
+    assert query_count == 2
+
+
+def test_task_history_hides_legacy_home_run_but_keeps_guided_run(
+    app: web_studio.StudioApplication,
+) -> None:
+    title = "旧首页图片请求"
+    home = app.create_conversation({"interaction_mode": "autonomous", "title": title})
+    app.runtime_store.add_conversation_message(
+        home["id"], role=MessageRole.USER, type=MessageType.TEXT, content="生成图片",
+    )
+    legacy = app.runtime_store.create_run(
+        "comic", "comic.v1", {"project": title}, "prepare",
+    )
+    guided = app.create_conversation({
+        "interaction_mode": "guided", "domain": "comic", "title": title,
+    })
+    app.runtime_store.add_conversation_message(
+        guided["id"], role=MessageRole.USER, type=MessageType.TEXT, content="生成图片",
+    )
+    professional = app.runtime_store.create_run(
+        "comic", "comic.v1", {"project": title}, "prepare",
+    )
+    visible = {run["id"] for run in app.list_core_runs()}
+    assert legacy.id not in visible
+    assert professional.id in visible
+    assert app.runtime_store.get_run(legacy.id).id == legacy.id
+
+
+def test_guided_image_chat_waits_for_explicit_start(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.runner, "submit", lambda execute: execute())
+    monkeypatch.setattr(
+        web_studio, "stream_chat",
+        lambda *_args, **_kwargs: iter(["请确认风格与比例，回复开始后提交。"]),
+    )
+    conversation = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})
+    first = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成一个写实版的大耳朵图图",
+    }))
+    assert not any(name == "run" for name, _ in first)
+    assert first[-1] == ("done", {"run_id": None})
+    second = list(app.stream_conversation(conversation["id"], {"content": "开始"}))
+    run = next(payload for name, payload in second if name == "run")
+    assert app.runtime_store.get_run(run["id"]).status.value == "waiting"
+    assert "大耳朵图图" in run["state"]["prompt"]
+
+def test_port_guard_blocks_second_instance() -> None:
+    blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    blocker.bind(("127.0.0.1", 0))
+    blocker.listen(5)  #  backlog 太小会让第二次探测被拒，绕过守卫
+    port = blocker.getsockname()[1]
+    try:
+        assert web_studio._port_already_serving(port) is True
+        assert web_studio.serve(port=port, open_browser=False) == 2
+    finally:
+        blocker.close()
+    assert web_studio._port_already_serving(port) is False
+
+
+def test_startup_logs_loaded_config_and_image_settings(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    base_url = "https://ws-example.cn-beijing.maas.aliyuncs.com/compatible-mode/v1"
+    settings = SimpleNamespace(
+        app=SimpleNamespace(name="Kantoku"),
+        llm=SimpleNamespace(
+            chat_api_key=lambda: "configured", model_chat="deepseek-chat",
+            vision_api_key=lambda: "configured", model_vision="qwen3-vl-plus",
+        ),
+        image=SimpleNamespace(
+            provider="alibaba-qwen-image", base_url=base_url, model="qwen-image-3.0",
+            api_key=lambda: "configured",
+        ),
+    )
+    messages: list[str] = []
+
+    class CaptureLogger:
+        def bind(self, **_extra: str) -> "CaptureLogger":
+            return self
+
+        def info(self, template: str, *args: object) -> None:
+            messages.append(template.format(*args))
+
+    monkeypatch.setattr(web_studio.os, "chdir", lambda _path: None)
+    monkeypatch.setattr(web_studio, "_port_already_serving", lambda _port: False)
+    monkeypatch.setattr(web_studio, "get_settings", lambda: settings)
+    monkeypatch.setattr(web_studio, "StudioApplication", lambda: SimpleNamespace(
+        runtime_store=SimpleNamespace(path=tmp_path / "db.sqlite"),
+        runner=SimpleNamespace(close=lambda: None),
+    ))
+    monkeypatch.setattr(web_studio, "make_server", lambda _app, _port: SimpleNamespace(
+        server_port=8001, serve_forever=lambda: None, server_close=lambda: None,
+    ))
+    monkeypatch.setattr(web_studio, "logger", CaptureLogger())
+
+    assert web_studio.serve(port=8001, open_browser=False) == 0
+    assert "config_path=" in messages[0]
+    assert str(web_studio.CONFIG_PATH.resolve()) in messages[0]
+    assert "image_provider=alibaba-qwen-image" in messages[0]
+    assert f"image_base_url={base_url}" in messages[0]
+    assert "image_model=qwen-image-3.0" in messages[0]
+    assert "Qwen Image" in capsys.readouterr().out

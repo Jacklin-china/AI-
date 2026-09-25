@@ -199,7 +199,7 @@ onBeforeUnmount(() => { if (timer !== undefined) window.clearInterval(timer) })
           <td class="table-actions"><button class="text-action" @click="navigate({ name: 'workspace_run', domain: run.domain, runId: run.id })">打开</button><button class="text-action danger-text" :disabled="busy" @click="cancelOne(run)">取消</button></td>
         </tr></tbody>
       </table></div>
-      <EmptyState v-if="!liveRuns.length" title="没有运行中的任务" description="在首页或 Domain Workspace 创建任务后会出现在这里。" />
+      <EmptyState v-if="!liveRuns.length" title="没有运行中的任务" description="在专业创作域提交工作流后，任务会出现在这里。" />
     </section>
 
     <section v-else-if="active === 'waiting'" class="task-list">

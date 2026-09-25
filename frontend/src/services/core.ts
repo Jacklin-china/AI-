@@ -111,8 +111,8 @@ export async function getRun(runId: string): Promise<CoreRun | null> {
   return coreGet<CoreRun>(`/api/runs/${encodeURIComponent(runId)}`, `run:${runId}`)
 }
 
-export async function getApprovals(): Promise<CoreApproval[] | null> {
-  const result = await coreGet<{ approvals: CoreApproval[] }>('/api/approvals', 'approvals')
+export async function getApprovals(scope = 'approvals'): Promise<CoreApproval[] | null> {
+  const result = await coreGet<{ approvals: CoreApproval[] }>('/api/approvals', scope)
   return result?.approvals ?? null
 }
 
@@ -125,6 +125,19 @@ export async function getArtifacts(runId?: string): Promise<CoreArtifact[] | nul
 export async function getArtifactContentUrl(artifactId: string): Promise<string | null> {
   await ensureToken()
   const response = await fetch(api(`/api/artifacts/${encodeURIComponent(artifactId)}/content`), {
+    headers: { 'X-Studio-Token': token },
+  })
+  if (!response.ok) return null
+  return URL.createObjectURL(await response.blob())
+}
+
+export async function getArtifact(artifactId: string): Promise<CoreArtifact | null> {
+  return coreGet<CoreArtifact>(`/api/artifacts/${encodeURIComponent(artifactId)}`, `artifact:${artifactId}`)
+}
+
+export async function getTaskImageUrl(requestId: string): Promise<string | null> {
+  await ensureToken()
+  const response = await fetch(api(`/media/${encodeURIComponent(requestId)}`), {
     headers: { 'X-Studio-Token': token },
   })
   if (!response.ok) return null
@@ -256,6 +269,15 @@ export async function getConversation(id: string): Promise<Conversation | null> 
   return coreGet<Conversation>(`/api/conversations/${encodeURIComponent(id)}`, `conversation:${id}`)
 }
 
+export type ImageGenerationEventName = 'prompt_prepared' | 'image_generating' | 'image_ready' | 'image_summary' | 'image_failed'
+export interface ImageGenerationEvent {
+  generation_request_id: string
+  message_id?: string
+  artifact_id?: string
+  width?: number
+  height?: number
+}
+
 export async function streamConversationMessage(
   id: string,
   content: string,
@@ -265,15 +287,18 @@ export async function streamConversationMessage(
     onDelta: (content: string) => void
     onMessage?: (message: ConversationMessage) => void
     onRun?: (run: CoreRun) => void
+    onActivity?: (activity: { generation_request_id: string; status: string; label: string }) => void
+    onImageEvent?: (name: ImageGenerationEventName, payload: ImageGenerationEvent) => void
   },
   dataMode?: 'demo' | 'production',
   enhancePrompt?: boolean,
+  generationRequestId?: string,
 ): Promise<void> {
   await ensureToken()
   const response = await fetch(api(`/api/conversations/${encodeURIComponent(id)}/messages/stream`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Studio-Token': token },
-    body: JSON.stringify({ content, domain_hint: domainHint, data_mode: dataMode, enhance_prompt: enhancePrompt === true }),
+    body: JSON.stringify({ content, domain_hint: domainHint, data_mode: dataMode, enhance_prompt: enhancePrompt === true, generation_request_id: generationRequestId }),
   })
   if (!response.ok || !response.body) {
     throw await apiFailure(response, '消息发送失败')
@@ -295,6 +320,10 @@ export async function streamConversationMessage(
       else if (event === 'intent') handlers.onIntent?.(payload as unknown as IntentPlan)
       else if (event === 'message') handlers.onMessage?.(payload as unknown as ConversationMessage)
       else if (event === 'run') handlers.onRun?.(payload as unknown as CoreRun)
+      else if (event === 'activity') handlers.onActivity?.(payload as { generation_request_id: string; status: string; label: string })
+      else if (['prompt_prepared', 'image_generating', 'image_ready', 'image_summary', 'image_failed'].includes(event)) {
+        handlers.onImageEvent?.(event as ImageGenerationEventName, payload as unknown as ImageGenerationEvent)
+      }
       else if (event === 'error') {
         throw new CoreApiError(
           String(payload.safe_message ?? '操作未完成'), response.status,

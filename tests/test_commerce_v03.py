@@ -5,11 +5,14 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+import pytest
+
 from kantoku.adapters.commerce import (
     CoreProductImageCapability,
     MockMarketplaceAdapter,
     MockSourceAdapter,
     MockTranslationAdapter,
+    product_image,
 )
 from kantoku.config.settings import ROOT
 from kantoku.core.approval import ApprovalService
@@ -139,7 +142,10 @@ class NeverCalledProvider:
         raise AssertionError("budget preflight must block before submit")
 
 
-def test_real_product_image_budget_preflight_blocks_before_provider() -> None:
+def test_real_product_image_budget_preflight_blocks_before_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(product_image, "estimate_image_fen", lambda **kwargs: 300)
     capability = CoreProductImageCapability(NeverCalledProvider(), max_fen=30)  # type: ignore[arg-type]
     brief = ProductImageBrief(
         product_name="Lamp", sku="SKU-1", marketplace="Ozon", locale="ru-RU",

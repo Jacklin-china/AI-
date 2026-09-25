@@ -10,7 +10,7 @@ from pydantic import ValidationError
 
 from kantoku.config import ConfigError
 from kantoku.config import settings as settings_module
-from kantoku.config.settings import AppSettings, LlmSettings, get_settings
+from kantoku.config.settings import AppSettings, ImageSettings, LlmSettings, get_settings
 
 VALID_YAML = """
 app:
@@ -89,6 +89,22 @@ def test_required_fields_have_no_python_defaults() -> None:
         AppSettings()
     assert LlmSettings.model_fields["base_url"].is_required()
     assert LlmSettings.model_fields["timeout_s"].annotation is float
+
+
+def test_qwen_image_settings_need_no_volcengine_signing_fields(tmp_path: Path) -> None:
+    settings = ImageSettings.model_validate({
+        "provider": "alibaba-qwen-image",
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen-image-3.0",
+        "api_key_env": "DASHSCOPE_API_KEY",
+        "width": 2560, "height": 1440, "force_single": True,
+        "prompt_max_chars": 4000, "timeout_s": 600,
+        "query_retry": 2, "query_backoff_s": 2,
+        "output_dir": tmp_path,
+    })
+    assert settings.access_key_env == ""
+    assert settings.secret_key_env == ""
+    assert settings.api_key_env == "DASHSCOPE_API_KEY"
 
 
 def test_require_env_returns_value_and_rejects_missing(monkeypatch: pytest.MonkeyPatch) -> None:

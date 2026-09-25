@@ -20,6 +20,8 @@ from kantoku.core.conversations import (
     ConversationMessageRecord,
     ConversationRecord,
     InteractionMode,
+    MediaJobRecord,
+    MediaJobStatus,
     MessageRole,
     MessageType,
 )
@@ -161,6 +163,92 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
             ON conversations(deleted_at, updated_at DESC);
         """,
     ),
+    (
+        7,
+        """
+        CREATE TABLE artifacts_conversation (
+            id TEXT PRIMARY KEY, type TEXT NOT NULL, run_id TEXT,
+            conversation_id TEXT, node_id TEXT NOT NULL, source TEXT NOT NULL,
+            status TEXT NOT NULL, created_at TEXT NOT NULL,
+            metadata_json TEXT NOT NULL DEFAULT '{}', location TEXT,
+            version INTEGER NOT NULL DEFAULT 1,
+            FOREIGN KEY (run_id) REFERENCES runs(id),
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+            CHECK (run_id IS NOT NULL OR conversation_id IS NOT NULL)
+        );
+        INSERT INTO artifacts_conversation
+            (id,type,run_id,conversation_id,node_id,source,status,created_at,
+             metadata_json,location,version)
+        SELECT id,type,run_id,NULL,node_id,source,status,created_at,
+               metadata_json,location,version FROM artifacts;
+        DROP TABLE artifacts;
+        ALTER TABLE artifacts_conversation RENAME TO artifacts;
+        CREATE INDEX idx_artifacts_run ON artifacts(run_id, created_at);
+        CREATE INDEX idx_artifacts_conversation
+            ON artifacts(conversation_id, created_at);
+        ALTER TABLE conversation_messages ADD COLUMN artifact_id TEXT
+            REFERENCES artifacts(id);
+        ALTER TABLE runs ADD COLUMN interaction_mode TEXT NOT NULL DEFAULT 'guided';
+        UPDATE runs SET interaction_mode='autonomous'
+        WHERE id IN (
+            SELECT active_run_id FROM conversations
+            WHERE interaction_mode='autonomous' AND active_run_id IS NOT NULL
+            UNION
+            SELECT messages.run_id FROM conversation_messages AS messages
+            JOIN conversations AS conversations
+                ON conversations.id=messages.conversation_id
+            WHERE conversations.interaction_mode='autonomous'
+                AND messages.run_id IS NOT NULL
+        );
+        """,
+    ),
+    (
+        8,
+        """
+        CREATE TABLE conversation_generation_requests (
+            generation_request_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            user_message_id TEXT NOT NULL,
+            prompt TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+            FOREIGN KEY (user_message_id) REFERENCES conversation_messages(id)
+        );
+        CREATE INDEX idx_conversation_generations
+            ON conversation_generation_requests(conversation_id, created_at);
+        """,
+    ),
+    (
+        9,
+        """
+        CREATE TABLE media_jobs (
+            generation_request_id TEXT PRIMARY KEY,
+            conversation_id TEXT NOT NULL,
+            user_message_id TEXT NOT NULL,
+            media_type TEXT NOT NULL,
+            status TEXT NOT NULL CHECK (status IN ('pending','generating','completed','failed')),
+            artifact_id TEXT,
+            error_id TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+            FOREIGN KEY (user_message_id) REFERENCES conversation_messages(id),
+            FOREIGN KEY (artifact_id) REFERENCES artifacts(id)
+        );
+        CREATE INDEX idx_media_jobs_conversation
+            ON media_jobs(conversation_id, created_at);
+        """,
+    ),
+    (
+        10,
+        """
+        ALTER TABLE conversation_generation_requests
+            ADD COLUMN context_json TEXT NOT NULL DEFAULT '{}';
+        ALTER TABLE conversation_generation_requests
+            ADD COLUMN reference_artifact_id TEXT REFERENCES artifacts(id);
+        """,
+    ),
 )
 
 
@@ -218,12 +306,14 @@ class RuntimeStore:
         return record
 
     def list_conversations(
-        self, limit: int = 50, *, domain: str | None = None, query: str = ""
+        self, limit: int = 50, *, domain: str | None = None, query: str = "",
+        include_deleted: bool = False,
     ) -> list[ConversationRecord]:
+        visible = "" if include_deleted else "deleted_at IS NULL AND "
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT * FROM conversations WHERE deleted_at IS NULL "
-                "AND (? IS NULL OR domain=?) AND title LIKE ? "
+                "SELECT * FROM conversations WHERE " + visible
+                + "(? IS NULL OR domain=?) AND title LIKE ? "
                 "ORDER BY updated_at DESC LIMIT ?",
                 (domain, domain, f"%{query}%", limit),
             ).fetchall()
@@ -277,40 +367,217 @@ class RuntimeStore:
         content: str,
         run_id: str | None = None,
         event_id: str | None = None,
+        artifact_id: str | None = None,
     ) -> ConversationMessageRecord:
         self.get_conversation(conversation_id)
         record = ConversationMessageRecord(
             id=f"message-{uuid4().hex}", conversation_id=conversation_id,
             role=role, type=type, content=content, run_id=run_id,
-            event_id=event_id, created_at=utc_now(),
+            event_id=event_id, artifact_id=artifact_id, created_at=utc_now(),
         )
         with self._connect() as connection:
-            connection.execute(
-                "INSERT OR IGNORE INTO conversation_messages VALUES (?,?,?,?,?,?,?,?)",
+            cursor = connection.execute(
+                "INSERT OR IGNORE INTO conversation_messages "
+                "(id,conversation_id,role,type,content,run_id,event_id,created_at,artifact_id) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (record.id, record.conversation_id, record.role.value, record.type.value,
                  record.content, record.run_id, record.event_id,
-                 record.created_at.isoformat()),
+                 record.created_at.isoformat(), record.artifact_id),
             )
             connection.execute(
                 "UPDATE conversations SET updated_at=? WHERE id=?",
                 (record.created_at.isoformat(), conversation_id),
             )
+            if cursor.rowcount == 0 and event_id is not None:
+                row = connection.execute(
+                    "SELECT * FROM conversation_messages "
+                    "WHERE conversation_id=? AND event_id=?",
+                    (conversation_id, event_id),
+                ).fetchone()
+                if row is not None:
+                    return self._message(row)
         return record
 
-    def list_conversation_messages(
-        self, conversation_id: str
-    ) -> list[ConversationMessageRecord]:
+    def get_conversation_message_by_event(
+        self, conversation_id: str, event_id: str
+    ) -> ConversationMessageRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_messages "
+                "WHERE conversation_id=? AND event_id=?",
+                (conversation_id, event_id),
+            ).fetchone()
+        return self._message(row) if row is not None else None
+
+    def save_conversation_generation(
+        self, generation_request_id: str, conversation_id: str,
+        user_message_id: str, prompt: str, *,
+        context: dict[str, str] | None = None,
+        reference_artifact_id: str | None = None,
+    ) -> str:
+        """Persist the immutable prompt before any paid provider submission."""
+        if reference_artifact_id is not None:
+            artifact = self.get_artifact(reference_artifact_id)
+            if artifact.conversation_id != conversation_id or artifact.status != "ready":
+                raise ToolError("参考图片不属于当前聊天的已完成产物")
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO conversation_generation_requests "
+                "(generation_request_id,conversation_id,user_message_id,prompt,created_at,"
+                "context_json,reference_artifact_id) VALUES (?,?,?,?,?,?,?)",
+                (generation_request_id, conversation_id, user_message_id,
+                 prompt, utc_now().isoformat(), _dump(context or {}), reference_artifact_id),
+            )
+            row = connection.execute(
+                "SELECT * FROM conversation_generation_requests "
+                "WHERE generation_request_id=?", (generation_request_id,),
+            ).fetchone()
+        if row["conversation_id"] != conversation_id or row["user_message_id"] != user_message_id:
+            raise ToolError("生成请求 ID 已属于其他对话消息")
+        if (context is not None and _load(row["context_json"]) != context) or (
+            reference_artifact_id is not None
+            and row["reference_artifact_id"] != reference_artifact_id
+        ):
+            raise ToolError("生成请求的创作上下文或参考图不可变更")
+        return str(row["prompt"])
+
+    def get_conversation_generation(self, generation_request_id: str) -> dict[str, str] | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM conversation_generation_requests "
+                "WHERE generation_request_id=?", (generation_request_id,),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def create_media_job(
+        self, generation_request_id: str, conversation_id: str, user_message_id: str,
+        *, media_type: str = "image",
+    ) -> MediaJobRecord:
+        """Persist a Conversation-owned job before provider work starts."""
         self.get_conversation(conversation_id)
+        if media_type not in {"image", "video"}:
+            raise ToolError("媒体任务类型无效")
+        now = utc_now().isoformat()
+        with self._connect() as connection:
+            connection.execute(
+                "INSERT OR IGNORE INTO media_jobs "
+                "(generation_request_id,conversation_id,user_message_id,media_type,"
+                "status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                (generation_request_id, conversation_id, user_message_id,
+                 media_type, MediaJobStatus.PENDING.value, now, now),
+            )
+            row = connection.execute(
+                "SELECT * FROM media_jobs WHERE generation_request_id=?",
+                (generation_request_id,),
+            ).fetchone()
+        job = self._media_job(row)
+        if (job.conversation_id, job.user_message_id, job.media_type) != (
+            conversation_id, user_message_id, media_type,
+        ):
+            raise ToolError("媒体任务 ID 已属于其他对话请求")
+        return job
+
+    def get_media_job(self, generation_request_id: str) -> MediaJobRecord | None:
+        with self._connect() as connection:
+            row = connection.execute(
+                "SELECT * FROM media_jobs WHERE generation_request_id=?",
+                (generation_request_id,),
+            ).fetchone()
+        return self._media_job(row) if row is not None else None
+
+    def list_media_jobs(self, conversation_id: str) -> list[MediaJobRecord]:
+        self.get_conversation(conversation_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM media_jobs WHERE conversation_id=? "
+                "ORDER BY created_at,generation_request_id",
+                (conversation_id,),
+            ).fetchall()
+        return [self._media_job(row) for row in rows]
+
+    def list_unfinished_media_jobs(self) -> list[MediaJobRecord]:
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT * FROM media_jobs WHERE status IN ('pending','generating') "
+                "ORDER BY created_at,generation_request_id"
+            ).fetchall()
+        return [self._media_job(row) for row in rows]
+
+    def update_media_job(
+        self, generation_request_id: str, status: MediaJobStatus,
+        *, artifact_id: str | None = None, error_id: str | None = None,
+        error_message: str | None = None,
+    ) -> MediaJobRecord:
+        """Advance a job; completion requires a real, owned Artifact file."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM media_jobs WHERE generation_request_id=?",
+                (generation_request_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("找不到媒体任务")
+            current = self._media_job(row)
+            if current.status in {MediaJobStatus.COMPLETED, MediaJobStatus.FAILED}:
+                if current.status != status and status not in {
+                    MediaJobStatus.PENDING, MediaJobStatus.GENERATING,
+                }:
+                    raise ToolError("已结束的媒体任务不能再次变更状态")
+                return current
+            if status == MediaJobStatus.COMPLETED:
+                artifact = connection.execute(
+                    "SELECT conversation_id,status,location FROM artifacts WHERE id=?",
+                    (artifact_id,),
+                ).fetchone()
+                if (artifact is None or artifact["conversation_id"] != current.conversation_id
+                    or artifact["status"] != "ready" or not artifact["location"]
+                    or not Path(str(artifact["location"])).is_file()):
+                    raise ToolError("图片尚未保存为当前聊天的真实 Artifact")
+            if status == MediaJobStatus.FAILED and not error_message:
+                raise ToolError("失败的媒体任务必须记录原因")
+            connection.execute(
+                "UPDATE media_jobs SET status=?,artifact_id=?,error_id=?,error_message=?,"
+                "updated_at=? WHERE generation_request_id=?",
+                (status.value, artifact_id, error_id, error_message,
+                 utc_now().isoformat(), generation_request_id),
+            )
+            updated = connection.execute(
+                "SELECT * FROM media_jobs WHERE generation_request_id=?",
+                (generation_request_id,),
+            ).fetchone()
+        return self._media_job(updated)
+
+    @staticmethod
+    def _media_job(row: sqlite3.Row) -> MediaJobRecord:
+        return MediaJobRecord(
+            generation_request_id=row["generation_request_id"],
+            conversation_id=row["conversation_id"], user_message_id=row["user_message_id"],
+            media_type=row["media_type"], status=row["status"],
+            artifact_id=row["artifact_id"], error_id=row["error_id"],
+            error_message=row["error_message"],
+            created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
+        )
+
+    def list_conversation_messages(
+        self, conversation_id: str, *, include_deleted: bool = False,
+    ) -> list[ConversationMessageRecord]:
+        if not include_deleted:
+            self.get_conversation(conversation_id)
         with self._connect() as connection:
             rows = connection.execute(
                 "SELECT * FROM conversation_messages WHERE conversation_id=? "
                 "ORDER BY created_at,id", (conversation_id,),
             ).fetchall()
-        return [ConversationMessageRecord(
+        return [self._message(row) for row in rows]
+
+    @staticmethod
+    def _message(row: sqlite3.Row) -> ConversationMessageRecord:
+        return ConversationMessageRecord(
             id=row["id"], conversation_id=row["conversation_id"], role=row["role"],
             type=row["type"], content=row["content"], run_id=row["run_id"],
-            event_id=row["event_id"], created_at=_time(row["created_at"]),
-        ) for row in rows]
+            event_id=row["event_id"], artifact_id=row["artifact_id"],
+            created_at=_time(row["created_at"]),
+        )
 
     @staticmethod
     def _conversation(row: sqlite3.Row) -> ConversationRecord:
@@ -350,11 +617,14 @@ class RuntimeStore:
             for version, script in MIGRATIONS:
                 if version in applied:
                     continue
-                connection.executescript(script)
+                # executescript commits any pending transaction first; start one
+                # inside the script so table rebuild + version marker are atomic.
+                connection.executescript("BEGIN IMMEDIATE;\n" + script)
                 connection.execute(
                     "INSERT INTO core_schema_migrations(version, applied_at) VALUES (?, ?)",
                     (version, utc_now().isoformat()),
                 )
+                connection.commit()
 
     def create_run(
         self, domain: str, workflow: str, state: dict[str, Any], current_node: str
@@ -446,6 +716,7 @@ class RuntimeStore:
         *,
         domain: str | None = None,
         status: ExecutionStatus | None = None,
+        interaction_mode: InteractionMode | None = None,
     ) -> list[RunRecord]:
         """按更新时间倒序列出 Run，可按领域与状态过滤。"""
         clauses: list[str] = []
@@ -456,6 +727,9 @@ class RuntimeStore:
         if status:
             clauses.append("status=?")
             params.append(status)
+        if interaction_mode:
+            clauses.append("interaction_mode=?")
+            params.append(interaction_mode.value)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(limit)
         with self._connect() as connection:
@@ -639,29 +913,35 @@ class RuntimeStore:
         """保存 Artifact；ID 重复会明确失败。"""
         with self._connect() as connection:
             connection.execute(
-                "INSERT INTO artifacts VALUES (?,?,?,?,?,?,?,?,?,?)",
-                (record.id, record.type, record.run_id, record.node_id, record.source,
+                "INSERT INTO artifacts "
+                "(id,type,run_id,conversation_id,node_id,source,status,created_at,"
+                "metadata_json,location,version) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+                (record.id, record.type, record.run_id, record.conversation_id,
+                 record.node_id, record.source,
                  record.status, record.created_at.isoformat(), _dump(record.metadata),
                  record.location, record.version),
             )
-        self.append_event(
-            record.run_id, RuntimeEventType.ARTIFACT_CREATED, node_id=record.node_id,
-            payload={
-                "artifact_id": record.id, "type": record.type.value,
-                "source": record.source, "location": record.location,
-                "version": record.version,
-            },
-        )
+        if record.run_id is not None:
+            self.append_event(
+                record.run_id, RuntimeEventType.ARTIFACT_CREATED, node_id=record.node_id,
+                payload={
+                    "artifact_id": record.id, "type": record.type.value,
+                    "source": record.source, "location": record.location,
+                    "version": record.version,
+                },
+            )
         return record
 
     def create_artifact(
-        self, *, type: ArtifactType, run_id: str, node_id: str, source: str,
+        self, *, type: ArtifactType, run_id: str | None = None,
+        conversation_id: str | None = None, node_id: str, source: str,
         status: str = "ready", metadata: dict[str, Any] | None = None,
         location: str | None = None, version: int = 1,
     ) -> ArtifactRecord:
         """构建并保存通用产物。"""
         return self.save_artifact(ArtifactRecord(
-            id=f"artifact-{uuid4().hex}", type=type, run_id=run_id, node_id=node_id,
+            id=f"artifact-{uuid4().hex}", type=type, run_id=run_id,
+            conversation_id=conversation_id, node_id=node_id,
             source=source, status=status, created_at=utc_now(), metadata=metadata or {},
             location=location, version=version,
         ))
@@ -682,6 +962,7 @@ class RuntimeStore:
         *,
         type: ArtifactType | None = None,
         domain: str | None = None,
+        conversation_id: str | None = None,
     ) -> list[ArtifactRecord]:
         """查询 Artifact，可按 run、type 与 domain 过滤。"""
         clauses: list[str] = []
@@ -695,10 +976,13 @@ class RuntimeStore:
         if domain:
             clauses.append("runs.domain=?")
             params.append(domain)
+        if conversation_id:
+            clauses.append("artifacts.conversation_id=?")
+            params.append(conversation_id)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
-                "SELECT artifacts.* FROM artifacts JOIN runs ON runs.id=artifacts.run_id"
+                "SELECT artifacts.* FROM artifacts LEFT JOIN runs ON runs.id=artifacts.run_id"
                 f"{where} ORDER BY artifacts.created_at DESC", params,
             ).fetchall()
         return [self._artifact(row) for row in rows]
@@ -707,6 +991,7 @@ class RuntimeStore:
     def _artifact(row: sqlite3.Row) -> ArtifactRecord:
         return ArtifactRecord(
             id=row["id"], type=ArtifactType(row["type"]), run_id=row["run_id"],
+            conversation_id=row["conversation_id"],
             node_id=row["node_id"], source=row["source"], status=row["status"],
             created_at=_time(row["created_at"]), metadata=_load(row["metadata_json"]),
             location=row["location"], version=row["version"],

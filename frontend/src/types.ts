@@ -148,7 +148,8 @@ export interface CoreApproval {
 export interface CoreArtifact {
   id: string
   type: 'image' | 'video' | 'prompt' | 'document' | 'json' | 'listing' | 'report'
-  run_id: string
+  run_id: string | null
+  conversation_id?: string | null
   node_id: string
   source: string
   status: string
@@ -201,7 +202,21 @@ export interface ConversationMessage {
   content: string
   run_id: string | null
   event_id: string | null
+  artifact_id?: string | null
   created_at: string
+}
+
+export interface MediaJob {
+  generation_request_id: string
+  conversation_id: string
+  user_message_id: string
+  media_type: 'image' | 'video'
+  status: 'pending' | 'generating' | 'completed' | 'failed'
+  artifact_id: string | null
+  error_id: string | null
+  error_message: string | null
+  created_at: string
+  updated_at: string
 }
 
 export interface Conversation {
@@ -213,6 +228,7 @@ export interface Conversation {
   created_at: string
   updated_at: string
   messages?: ConversationMessage[]
+  media_jobs?: MediaJob[]
 }
 
 export interface IntentPlan {

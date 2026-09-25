@@ -111,7 +111,8 @@ class ArtifactRecord(CoreModel):
 
     id: str
     type: ArtifactType
-    run_id: str
+    run_id: str | None = None
+    conversation_id: str | None = None
     node_id: str
     source: str
     status: str

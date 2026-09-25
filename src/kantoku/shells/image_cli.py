@@ -22,7 +22,7 @@ from kantoku.tools.image_batch import (
 )
 from kantoku.tools.image_gen import ImageProvider, gen_image, reconcile_image
 from kantoku.tools.jimeng import VolcengineJimengProvider
-from kantoku.tools.openai_image import OpenAIImageProvider
+from kantoku.tools.openai_image import AlibabaQwenImageProvider, OpenAIImageProvider
 
 
 def _positive_int(text: str) -> int:
@@ -55,6 +55,8 @@ def _provider() -> ImageProvider:
         return VolcengineJimengProvider()
     if provider == "openai-gpt-image":
         return OpenAIImageProvider()
+    if provider == "alibaba-qwen-image":
+        return AlibabaQwenImageProvider()
     raise ConfigError("当前生图供应商没有可用适配器", detail=provider)
 
 
@@ -86,7 +88,7 @@ def _preflight() -> int:
 
 
 def _doctor() -> int:
-    """查询一个不存在的任务以验证签名和服务权限，不提交或预占。"""
+    """只执行供应商支持的免计费诊断，不提交或预占。"""
     provider = _provider()
     result = provider.check_access()
     label = "即梦签名" if get_settings().image.provider == "volcengine-jimeng" else "模型访问"
@@ -201,7 +203,13 @@ def _query(request_id: str) -> int:
             _print_result(request_id, saved)
         print("任务未返回供应商 ID，请人工核对平台任务记录；本次没有重新提交。")
         return 2
-    return _print_result(request_id, reconcile_image(request_id, provider=_provider()))
+    provider = _provider()
+    if record.provider != provider.generation_identity().get("provider"):
+        raise ConfigError(
+            "原生图任务供应商与当前配置不同",
+            detail="请用原供应商配置查询旧任务；不会用新供应商查询或重新提交",
+        )
+    return _print_result(request_id, reconcile_image(request_id, provider=provider))
 
 
 def _execute_batch(batch: ImageBatch, args: argparse.Namespace) -> int:
@@ -255,7 +263,7 @@ def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="监督酱 · 单镜生图与账单核对")
     actions = parser.add_subparsers(dest="action")
     actions.add_parser("preflight", help="本地上线自检，不联网、不产生费用")
-    actions.add_parser("doctor", help="联网检查即梦鉴权，不创建生图任务")
+    actions.add_parser("doctor", help="免计费诊断生图供应商，不创建生图任务")
     generate = actions.add_parser("generate", help="预览一个镜头，确认后提交一次")
     generate.add_argument("--prompt-file", required=True, help="UTF-8 提示词文本文件")
     generate.add_argument("--project", required=True, help="单条视频固定项目 ID，返工时沿用")

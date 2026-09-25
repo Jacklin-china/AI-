@@ -5,7 +5,7 @@ import { presenterFor } from '../../domains/presenters'
 
 interface Candidate { id: string; title: string; cost_fen: number; skus: string[]; source: string }
 
-const props = defineProps<{ approval: CoreApproval; domain: string; busy: boolean }>()
+const props = defineProps<{ approval: CoreApproval; domain: string; busy: boolean; imageUrl?: string; homeMode?: boolean }>()
 const emit = defineEmits<{ decide: [action: 'approve' | 'reject' | 'revise', response: Record<string, unknown>] }>()
 
 const selected = ref<string>('')
@@ -76,14 +76,28 @@ watch(() => props.busy, (value) => { if (!value) submitting.value = null })
     </div>
 
     <div v-else-if="kind === 'cost_approval'" class="cost-approval-summary">
-      <div><span>预计费用</span><strong>{{ money(Number(approval.request.estimate_fen ?? 0)) }}</strong></div>
-      <div><span>服务</span><strong>{{ String(approval.request.provider ?? '即梦') }}</strong></div>
+      <div><span>本次预占</span><strong>{{ money(Number(approval.request.estimate_fen ?? 0)) }}</strong></div>
+      <div><span>单价</span><strong>{{ money(Number(approval.request.unit_fen ?? approval.request.estimate_fen ?? 0)) }} / 张</strong></div>
+      <div v-if="Number(approval.request.image_count ?? 1) > 1">
+        <span>需求数量</span><strong>{{ Number(approval.request.image_count) }} 张（本次先生成 1 张）</strong>
+      </div>
+      <div v-if="Number(approval.request.image_count ?? 1) > 1">
+        <span>预计总计</span><strong>{{ money(Number(approval.request.total_fen ?? approval.request.estimate_fen ?? 0)) }}</strong>
+      </div>
+      <div v-if="!homeMode"><span>服务</span><strong>{{ String(approval.request.provider ?? '即梦') }}</strong></div>
       <p>{{ String(approval.request.message ?? '批准后才会调用付费服务。') }}</p>
     </div>
 
+    <div v-else-if="kind === 'creative_review'" class="creative-review-summary">
+      <img v-if="imageUrl" :src="imageUrl" alt="待审核的生成图片" />
+      <p v-else>{{ homeMode ? '图片预览加载中，请稍后确认画面。' : '图片预览加载中；请在工作区核对画面后再决定。' }}</p>
+      <p v-if="qc">质检：{{ qc.composition_ok && !qc.broken_hands && !qc.watermark ? '通过预筛' : '发现需人工复核的问题' }} · {{ String(qc.reason ?? '') }}</p>
+    </div>
+
     <div v-else class="approval-generic">
-      <dl>
-        <div v-for="(value, key) in approval.request" :key="String(key)">
+      <p v-if="homeMode">{{ String(approval.request.message ?? '请确认是否继续。') }}</p>
+      <dl v-else>
+        <div v-for="(value, key) in approval.request" v-show="!homeMode || !['run_id', 'node_id', 'provider', 'provider_task_id', 'request_id', 'artifact_id'].includes(String(key))" :key="String(key)">
           <dt>{{ String(key) }}</dt>
           <dd>{{ typeof value === 'object' ? '（结构化数据，见原始数据）' : String(value) }}</dd>
         </div>
@@ -106,9 +120,9 @@ watch(() => props.busy, (value) => { if (!value) submitting.value = null })
           {{ submitting === 'approve' ? '提交中……' : '批准并继续' }}
         </button>
       </template>
-      <button class="text-action" @click="showRaw = !showRaw">{{ showRaw ? '隐藏' : '查看' }}原始数据</button>
+      <button v-if="!homeMode" class="text-action" @click="showRaw = !showRaw">{{ showRaw ? '隐藏' : '查看' }}原始数据</button>
     </footer>
 
-    <pre v-if="showRaw" class="raw-json">{{ JSON.stringify(approval.request, null, 2) }}</pre>
+    <pre v-if="showRaw && !homeMode" class="raw-json">{{ JSON.stringify(approval.request, null, 2) }}</pre>
   </section>
 </template>

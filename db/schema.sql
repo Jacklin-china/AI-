@@ -66,6 +66,7 @@ CREATE TABLE IF NOT EXISTS ledger (
         provider_job_id IS NULL OR length(trim(provider_job_id)) > 0
     ),
     run_id TEXT,
+    conversation_id TEXT,
     provider TEXT,
     idempotency_key TEXT,
     artifact_id TEXT,
@@ -172,7 +173,8 @@ CREATE TABLE IF NOT EXISTS node_executions (
 CREATE TABLE IF NOT EXISTS artifacts (
     id TEXT PRIMARY KEY,
     type TEXT NOT NULL,
-    run_id TEXT NOT NULL,
+    run_id TEXT,
+    conversation_id TEXT,
     node_id TEXT NOT NULL,
     source TEXT NOT NULL,
     status TEXT NOT NULL,
@@ -180,7 +182,9 @@ CREATE TABLE IF NOT EXISTS artifacts (
     metadata_json TEXT NOT NULL DEFAULT '{}',
     location TEXT,
     version INTEGER NOT NULL DEFAULT 1,
-    FOREIGN KEY (run_id) REFERENCES runs(id)
+    FOREIGN KEY (run_id) REFERENCES runs(id),
+    FOREIGN KEY (conversation_id) REFERENCES conversations(id),
+    CHECK (run_id IS NOT NULL OR conversation_id IS NOT NULL)
 );
 
 CREATE INDEX IF NOT EXISTS idx_artifacts_run ON artifacts (run_id, created_at);

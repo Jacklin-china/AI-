@@ -48,6 +48,7 @@ class BudgetReservation(BaseModel):
     model: NonBlank
     provider_job_id: NonBlank | None = None
     run_id: NonBlank | None = None
+    conversation_id: NonBlank | None = None
     provider: NonBlank | None = None
     idempotency_key: NonBlank | None = None
     artifact_id: NonBlank | None = None
@@ -72,6 +73,7 @@ class ReservationRequest(BaseModel):
     est_fen: int = Field(gt=0)
     model: NonBlank
     run_id: NonBlank | None = None
+    conversation_id: NonBlank | None = None
     provider: NonBlank | None = None
     idempotency_key: NonBlank | None = None
 
@@ -105,9 +107,13 @@ def _connect() -> sqlite3.Connection:
         existing_columns = {
             row[1] for row in connection.execute("PRAGMA table_info(ledger)")
         }
-        for column in ("run_id", "provider", "idempotency_key", "artifact_id"):
+        for column in ("run_id", "conversation_id", "provider", "idempotency_key", "artifact_id"):
             if column not in existing_columns:
                 connection.execute(f"ALTER TABLE ledger ADD COLUMN {column} TEXT")
+        connection.execute(
+            "CREATE INDEX IF NOT EXISTS idx_ledger_conversation "
+            "ON ledger(conversation_id, created_at)"
+        )
         connection.commit()
         return connection
     except (OSError, UnicodeError, sqlite3.Error):
@@ -148,8 +154,62 @@ def _accounting_day_bounds_utc() -> tuple[str, str]:
     )
 
 
-def estimate_image_fen(credits: int | None = None) -> int:
-    """按供应商配置向上估算一次生图需要预占的整数分。"""
+class ImagePriceQuote(BaseModel):
+    """一次生图需求的精确报价：单价 × 张数 = 合计，全部取整到分。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    model: NonBlank
+    unit_fen: int = Field(gt=0)
+    count: int = Field(gt=0)
+    total_fen: int = Field(gt=0)
+
+
+def _image_pricing() -> tuple[str, object] | None:
+    """读取价格表；测试桩或旧配置没有 image.pricing 时返回 None 走兜底估价。"""
+    image = getattr(get_settings(), "image", None)
+    pricing = getattr(image, "pricing", None)
+    model = getattr(image, "model", None)
+    if pricing is None or not isinstance(model, str) or not model.strip():
+        return None
+    return model.strip(), pricing
+
+
+def quote_image_price(*, model: str | None = None, count: int = 1) -> ImagePriceQuote:
+    """按价格表精确报价；价格表缺失时退回保守兜底估价。张数必须为正整数。"""
+    if type(count) is not int or count <= 0:
+        raise BudgetError("生图数量必须是正整数")
+    found = _image_pricing()
+    if found is None:
+        settings = get_settings().budget
+        fallback_model = model.strip() if isinstance(model, str) and model.strip() else "unknown"
+        unit = int((settings.image_estimated_cny_per_call * 100).to_integral_value(
+            rounding=ROUND_CEILING
+        )) if getattr(settings, "image_estimated_cny_per_call", None) is not None else int(
+            (Decimal(settings.image_estimated_credits_per_call) * settings.image_credit_cny * 100)
+            .to_integral_value(rounding=ROUND_CEILING)
+        )
+        return ImagePriceQuote(model=fallback_model, unit_fen=unit, count=count,
+                               total_fen=unit * count)
+    configured_model, pricing = found
+    model_key = model.strip() if isinstance(model, str) and model.strip() else configured_model
+    unit_cny = pricing.cny_per_image_by_model.get(model_key, pricing.default_cny_per_image)
+    unit_fen = int((unit_cny * 100).to_integral_value(rounding=ROUND_CEILING))
+    return ImagePriceQuote(model=model_key, unit_fen=unit_fen, count=count,
+                           total_fen=unit_fen * count)
+
+
+def estimate_image_fen(
+    credits: int | None = None,
+    *,
+    model: str | None = None,
+    count: int = 1,
+) -> int:
+    """估算需预占的整数分：配置价格表后按单价 × 张数精确计算，否则用保守兜底估价。"""
+    if type(count) is not int or count <= 0:
+        raise BudgetError("生图数量必须是正整数")
+    if credits is None and _image_pricing() is not None:
+        return quote_image_price(model=model, count=count).total_fen
     settings = get_settings().budget
     direct_cny = getattr(settings, "image_estimated_cny_per_call", None)
     if credits is None and direct_cny is not None:
@@ -192,6 +252,7 @@ def _assert_available(
     episode: str,
     shot_no: int,
     est_fen: int,
+    conversation_id: str | None = None,
     exclude_reservation_id: str | None = None,
 ) -> None:
     budget = get_settings().budget
@@ -203,20 +264,21 @@ def _assert_available(
             "created_at >= ? AND created_at < ?",
             (day_start, day_end),
         ),
-        ("项目", budget.image_project_cny, "project = ?", (project,)),
-        (
-            "单集",
-            budget.image_episode_cny,
-            "project = ? AND episode = ?",
-            (project, episode),
-        ),
-        (
-            "单镜",
-            budget.image_shot_cny,
-            "project = ? AND episode = ? AND shot_no = ?",
-            (project, episode, shot_no),
-        ),
     ]
+    if conversation_id is not None:
+        scopes.append((
+            "对话", getattr(budget, "image_conversation_cny", None),
+            "conversation_id = ?", (conversation_id,),
+        ))
+    else:
+        scopes.extend([
+            ("项目", budget.image_project_cny, "project = ?", (project,)),
+            ("单集", budget.image_episode_cny,
+             "project = ? AND episode = ?", (project, episode)),
+            ("单镜", budget.image_shot_cny,
+             "project = ? AND episode = ? AND shot_no = ?",
+             (project, episode, shot_no)),
+        ])
     for label, configured_limit, where, params in scopes:
         if configured_limit is None:
             continue
@@ -244,6 +306,7 @@ def reserve(
     est_fen: int,
     model: str,
     run_id: str | None = None,
+    conversation_id: str | None = None,
     provider: str | None = None,
     idempotency_key: str | None = None,
 ) -> BudgetReservation:
@@ -259,6 +322,7 @@ def reserve(
             est_fen=est_fen,
             model=model,
             run_id=run_id,
+            conversation_id=conversation_id,
             provider=provider,
             idempotency_key=idempotency_key,
         )
@@ -321,7 +385,7 @@ def _reserve_one(
         )
         if immutable != incoming:
             raise BudgetError("预算请求 ID 已被其他任务使用")
-        for name in ("run_id", "provider", "idempotency_key"):
+        for name in ("run_id", "conversation_id", "provider", "idempotency_key"):
             previous = getattr(reservation, name)
             supplied = getattr(requested, name)
             if previous is not None and supplied is not None and previous != supplied:
@@ -332,7 +396,7 @@ def _reserve_one(
                     (supplied, requested.reservation_id),
                 )
         if any(getattr(reservation, name) is None and getattr(requested, name) is not None
-               for name in ("run_id", "provider", "idempotency_key")):
+               for name in ("run_id", "conversation_id", "provider", "idempotency_key")):
             return _require_reservation(connection, requested.reservation_id)
         return reservation
 
@@ -342,14 +406,15 @@ def _reserve_one(
         episode=requested.episode,
         shot_no=requested.shot_no,
         est_fen=requested.est_fen,
+        conversation_id=requested.conversation_id,
     )
     connection.execute(
         """
             INSERT INTO ledger (
                 reservation_id, job, project, episode, shot_no, kind,
                 est_fen, actual_fen, model, provider_job_id, status,
-                run_id, provider, idempotency_key
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'reserved', ?, ?, ?)
+                run_id, conversation_id, provider, idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, NULL, 'reserved', ?, ?, ?, ?)
             """,
         (
             requested.reservation_id,
@@ -361,6 +426,7 @@ def _reserve_one(
             requested.est_fen,
             requested.model,
             requested.run_id,
+            requested.conversation_id,
             requested.provider,
             requested.idempotency_key,
         ),
@@ -451,6 +517,7 @@ def claim_submission(reservation_id: str) -> bool:
                 episode=current.episode,
                 shot_no=current.shot_no,
                 est_fen=current.est_fen,
+                conversation_id=current.conversation_id,
                 exclude_reservation_id=current.reservation_id,
             )
             previous_overrun = connection.execute(
@@ -460,12 +527,20 @@ def claim_submission(reservation_id: str) -> bool:
             ).fetchone()[0]
             if previous_overrun is not None and previous_overrun > current.est_fen:
                 raise BudgetError("历史实扣高于本次估价，请核价并重新预占后继续")
-            active = connection.execute(
-                "SELECT COUNT(*) FROM ledger WHERE kind = ? AND status IN ('submitted', 'unknown')",
-                (current.kind,),
-            ).fetchone()[0]
+            if current.conversation_id is not None:
+                active = connection.execute(
+                    "SELECT COUNT(*) FROM ledger WHERE kind=? "
+                    "AND status IN ('submitted','unknown') AND conversation_id=?",
+                    (current.kind, current.conversation_id),
+                ).fetchone()[0]
+            else:
+                active = connection.execute(
+                    "SELECT COUNT(*) FROM ledger WHERE kind=? "
+                    "AND status IN ('submitted','unknown') AND conversation_id IS NULL",
+                    (current.kind,),
+                ).fetchone()[0]
             if active >= get_settings().budget.image_max_concurrency:
-                raise BudgetError("已有生图任务执行中或状态未知，请先查询或对账")
+                raise BudgetError("当前对话已有生图任务执行中或状态未知，请先查询或对账")
             connection.execute(
                 "UPDATE ledger SET status = 'submitted', updated_at = CURRENT_TIMESTAMP "
                 "WHERE reservation_id = ? AND status = 'reserved'",

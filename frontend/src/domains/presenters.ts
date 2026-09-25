@@ -147,7 +147,7 @@ const comic: DomainPresenter = {
   artifactName: (source) =>
     ({ 'comic.archive': '成片归档', 'comic.image': '分镜图' } as Record<string, string>)[source] ??
     fallbackName(source),
-  approvalTitle: () => '需要你审核当前画面',
+  approvalTitle: (kind) => (kind === 'cost_approval' ? '生成前费用确认' : '需要你审核当前画面'),
 }
 
 const studio: DomainPresenter = {

@@ -42,7 +42,14 @@ def run_doctor(*, live: bool = False) -> list[Check]:
             "Ark Vision", settings.llm.vision_api_key_env,
             settings.llm.model_vision, settings.llm.vision_api_key,
         ),
-        ("Jimeng", settings.image.access_key_env, settings.image.model, settings.image.access_key),
+        (
+            "Jimeng" if settings.image.provider == "volcengine-jimeng" else "Qwen Image",
+            (settings.image.access_key_env if settings.image.provider == "volcengine-jimeng"
+             else settings.image.api_key_env),
+            settings.image.model,
+            (settings.image.access_key if settings.image.provider == "volcengine-jimeng"
+             else settings.image.api_key),
+        ),
     )
     for name, env_name, model, credential in provider_checks:
         try:
@@ -51,7 +58,15 @@ def run_doctor(*, live: bool = False) -> list[Check]:
             configured = False
         detail = f"{model} · {'凭据已配置' if configured else f'缺少 {env_name}'}"
         status = "READY" if configured else "BLOCKED"
-        if live and configured:
+        if name == "Qwen Image" and configured:
+            try:
+                _provider().validate_request(
+                    prompt="配置检查", shot_no=1, reference_urls=(), seed=None,
+                )
+            except Exception as error:
+                status = "BLOCKED"
+                detail += f" · 业务空间地址未就绪 ({type(error).__name__})"
+        if live and status == "READY":
             try:
                 if name == "DeepSeek":
                     list(stream_chat(
@@ -67,7 +82,11 @@ def run_doctor(*, live: bool = False) -> list[Check]:
                     access = _provider().check_access()
                     if access.authenticated is False:
                         raise RuntimeError("provider authentication rejected")
-                    detail += " · live query completed, no generation"
+                    if not access.service_ready:
+                        status = "BLOCKED"
+                        detail += " · no reliable free generation probe"
+                    else:
+                        detail += " · live query completed, no generation"
             except Exception as error:
                 status = "BLOCKED"
                 detail += f" · live {type(error).__name__}"

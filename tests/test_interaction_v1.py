@@ -32,6 +32,40 @@ def test_explicit_production_request_selects_existing_domain() -> None:
     assert plan.confidence > 0.8
 
 
+def test_home_image_request_with_character_name_starts_visual_work() -> None:
+    planner = IntentPlanner()
+    for request in (
+        "帮我生成一个写实版的大耳朵图图",
+        "帮我生成一个写实的蜡笔小新照片",
+        "画一张雨夜里的猫",
+        "请给我一张蜡笔小新中正男的卡通图片",
+        "生成蜡笔小新头像",
+        "画一个赛博朋克城市",
+    ):
+        plan = planner.plan(request)
+        assert plan.needs_execution is True
+        assert plan.intent == "image.generate"
+        assert plan.suggested_domain == "studio"
+    assert planner.plan("如何生成图片").needs_execution is False
+    assert planner.plan("图片生成有哪些技巧").needs_execution is False
+    assert planner.plan("给我介绍一下生成图片的方法").needs_execution is False
+
+
+def test_image_followups_use_chat_context_without_affecting_new_chats() -> None:
+    planner = IntentPlanner()
+    for request in ("再帮我生成小埋", "再生成一个小埋", "换成小埋", "改成海老名"):
+        assert planner.plan(request, image_context=True).intent == "image.generate"
+    assert planner.plan("再帮我生成小埋").intent != "image.generate"
+    assert planner.plan("换成视频", image_context=True).intent != "image.generate"
+    assert planner.plan("如何生成小埋图片", image_context=True).needs_execution is False
+
+
+def test_video_request_has_distinct_intent_without_pretending_provider_is_ready() -> None:
+    plan = IntentPlanner().plan("帮我制作一段猫咪奔跑的视频")
+    assert plan.intent == "video.generate"
+    assert plan.needs_execution is True
+
+
 def test_domain_hint_is_optional_and_only_routes_explicit_work() -> None:
     planner = IntentPlanner()
     assert planner.plan("你好", domain_hint="comic").needs_execution is False
@@ -68,6 +102,26 @@ def test_unconfirmed_comic_waits_for_cost_before_provider(tmp_path: Path) -> Non
     assert services.generated == 0
     approval = store.list_approvals(pending_only=True)[0]
     assert approval.request["kind"] == "cost_approval"
+    assert approval.request["unit_fen"] == 30
+    assert approval.request["image_count"] == 1
+    assert approval.request["total_fen"] == 30
+
+
+def test_cost_approval_breakdown_scales_with_image_count(tmp_path: Path) -> None:
+    store = RuntimeStore(tmp_path / "cost-count.db")
+    services = FakeComicServices()
+    runtime = GraphRuntime(store)
+    workflow = build_comic_workflow(services)
+    runtime.register(workflow)
+    waiting = runtime.start(workflow.id, ComicState(
+        project="chat", prompt="image", shot_no=1, estimate_fen=20,
+        image_count=4, confirmed=False,
+    ))
+    assert waiting.current_node == "cost_approval"
+    approval = store.list_approvals(pending_only=True)[0]
+    assert approval.request["estimate_fen"] == 20
+    assert approval.request["image_count"] == 4
+    assert approval.request["total_fen"] == 80
 
 
 def test_run_can_be_persisted_before_background_execution(tmp_path: Path) -> None:

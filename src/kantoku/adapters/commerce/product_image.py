@@ -44,7 +44,7 @@ class CoreProductImageCapability:
         *,
         request_id: str,
     ) -> ProductImageResult:
-        estimated_fen = estimate_image_fen()
+        estimated_fen = estimate_image_fen(model=self.provider.model_id)
         identity = self.provider.generation_identity()
         provider_name = str(identity.get("provider", "configured-image-provider"))
         if estimated_fen > self.max_fen:

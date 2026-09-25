@@ -181,6 +181,31 @@ def _unknown_result(provider_job_id: str | None, error: BaseException) -> ImageG
     )
 
 
+def _submit_rejected(error: BaseException) -> bool:
+    """供应商明确返回失败响应（HTTP 4xx 或业务错误码）才视为确定未创建任务；
+    网络中断等无法确认请求是否到达的情况不算。"""
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        status = getattr(current, "status_code", None)
+        if isinstance(status, int) and 400 <= status < 500:
+            return True
+        current = current.__cause__
+    return isinstance(error, ToolError) and "提交未确认" in error.message
+
+
+def _rejected_result(error: BaseException) -> ImageGenerationResult:
+    detail = str(error) if isinstance(error, ToolError) else type(error).__name__
+    return ImageGenerationResult(
+        path=None,
+        provider_job_id=None,
+        status="failed",
+        actual_fen=0,
+        error=f"供应商拒绝请求：{detail}",
+    )
+
+
 def _record_result(
     reservation_id: str,
     provider_job_id: str,
@@ -213,10 +238,11 @@ def prepare_image_reservation(
     prompt: str,
     shot_no: int,
     *,
-    project: str,
-    episode: str,
+    project: str | None = None,
+    episode: str | None = None,
     client_request_id: str,
     provider: ImageProvider,
+    conversation_id: str | None = None,
     est_fen: int | None = None,
     reference_urls: Sequence[str] = (),
     seed: int | None = None,
@@ -230,7 +256,16 @@ def prepare_image_reservation(
         reference_urls=reference_urls,
         seed=seed,
     )
-    estimated_fen = estimate_image_fen() if est_fen is None else est_fen
+    estimated_fen = (
+        estimate_image_fen(model=provider.model_id) if est_fen is None else est_fen
+    )
+    if conversation_id is not None:
+        if not conversation_id.strip():
+            raise ToolError("对话 ID 不能为空")
+        # 旧台账的非空项目列仅作兼容存储；首页额度与幂等身份只看对话/生成请求。
+        project, episode, shot_no = "__conversation__", client_request_id, 1
+    elif not project or not episode:
+        raise ToolError("专业生图需要项目和集标识")
     try:
         fingerprint_payload = {
             "generation": dict(provider.generation_identity()),
@@ -259,6 +294,7 @@ def prepare_image_reservation(
             est_fen=estimated_fen,
             model=provider.model_id,
             run_id=current_run_id(),
+            conversation_id=conversation_id,
             provider=str(provider.generation_identity().get("provider", "unknown")),
             idempotency_key=client_request_id,
         )
@@ -270,10 +306,11 @@ def gen_image(
     prompt: str,
     shot_no: int,
     *,
-    project: str,
-    episode: str,
+    project: str | None = None,
+    episode: str | None = None,
     client_request_id: str,
     provider: ImageProvider,
+    conversation_id: str | None = None,
     est_fen: int | None = None,
     reference_urls: Sequence[str] = (),
     seed: int | None = None,
@@ -286,6 +323,7 @@ def gen_image(
         episode=episode,
         client_request_id=client_request_id,
         provider=provider,
+        conversation_id=conversation_id,
         est_fen=est_fen,
         reference_urls=reference_urls,
         seed=seed,
@@ -337,12 +375,24 @@ def gen_image(
         mark_submitted(client_request_id, provider_job_id=provider_job_id)
         event.bind(provider_task_id=provider_job_id).info("submitted")
     except (Exception, KeyboardInterrupt) as error:
+        if isinstance(error, KeyboardInterrupt):
+            mark_outcome(client_request_id, "unknown")
+            save_generation_result(client_request_id, _unknown_result(None, error))
+            raise
+        if _submit_rejected(error):
+            mark_outcome(client_request_id, "failed")
+            event.warning("submit rejected by provider detail={}", str(error)[:200])
+            rejected = _rejected_result(error)
+            save_generation_result(client_request_id, rejected)
+            release(client_request_id)
+            return rejected
         mark_outcome(client_request_id, "unknown")
-        event.warning("submit outcome unknown exception={}", type(error).__name__)
+        event.warning(
+            "submit outcome unknown exception={} detail={}",
+            type(error).__name__, str(error)[:200],
+        )
         result = _unknown_result(None, error)
         save_generation_result(client_request_id, result)
-        if isinstance(error, KeyboardInterrupt):
-            raise
         return result
 
     try:

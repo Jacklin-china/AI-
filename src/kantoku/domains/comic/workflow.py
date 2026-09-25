@@ -96,6 +96,9 @@ def build_comic_workflow(
             approval_when=lambda state: not state.confirmed,
             approval_request=lambda state: {
                 "kind": "cost_approval", "estimate_fen": state.estimate_fen,
+                "unit_fen": state.estimate_fen,
+                "image_count": state.image_count,
+                "total_fen": state.estimate_fen * state.image_count,
                 "project": state.project, "provider": "Jimeng",
                 "message": (
                     "批准后才会调用付费生图服务。"

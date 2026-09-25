@@ -61,37 +61,37 @@ llm:
   fallback_max_tokens_parameter: max_tokens
 
 image:
-  provider: volcengine-jimeng
-  base_url: https://visual.volcengineapi.com
-  model: high_aes_general_v40
-  region: cn-north-1
-  service: cv
-  api_version: "2022-08-31"
-  submit_action: CVSync2AsyncSubmitTask
-  query_action: CVSync2AsyncGetResult
-  access_key_env: VOLC_ACCESSKEY
-  secret_key_env: VOLC_SECRETKEY
-  api_key_env: VOLC_ACCESSKEY
+  provider: alibaba-qwen-image
+  # 将 workspace-id-required 替换成百炼控制台的真实业务空间 ID；通用地址不支持此模型。
+  base_url:  https://ws-043re2e5ss4pje8w.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
+  model: qwen-image-3.0
+  api_key_env: DASHSCOPE_API_KEY
   quality: medium
   output_format: png
-  width: 2560                   # 官方推荐的 2K 16:9 尺寸
+  width: 2560                   # 总像素低于 Qwen 3.0 的 2048×2048 上限
   height: 1440
   force_single: true            # 防止一次返回多张而扩大账单
   prompt_max_chars: 4000        # 长提示词需为定向返工保留上下文，由具体供应商最终校验
-  timeout_s: 60
+  timeout_s: 600                # Qwen OpenAI 兼容接口同步返回图片 URL
   query_retry: 2                # 只重试查询；付费提交永不自动重提
   query_backoff_s: 2
   output_dir: data/images
+  pricing:                     # 精准计价：每张图的公示单价（元），按模型区分；审批卡片按此 × 张数展示
+    default_cny_per_image: 0.18        # 北京地域 Qwen 标准版文生图公示价；以控制台账单为准
+    cny_per_image_by_model:
+      qwen-image-3.0: 0.18
 
 budget:                        # 成本红线：任何付费调用前必须检查（docs/01 §5）
   accounting_utc_offset_hours: 8  # 单日预算按北京时间自然日计算
-  image_credit_cny: 0.10       # 即梦估算口径；价格变动时只改配置并以实际扣分结算
-  image_estimated_credits_per_call: 3  # 普通图按截图区间上限预占；高质量模式须传真实估算
-  image_estimated_cny_per_call: 3.00  # 上线前按控制台实价调整；真实调用仍要求人工确认上界
+  image_credit_cny: 0.10       # 兜底估价口径：1 积分按 0.10 元（仅在 image.pricing 未配置时使用）
+  image_estimated_credits_per_call: 3  # 兜底：普通图按截图区间上限预占；高质量模式须传真实估算
+  image_estimated_cny_per_call: 3.00  # 兜底保守估价：仅在 image.pricing 未配置时生效；真实调用仍要求人工确认上界
   image_daily_cny: 20.0        # 当前单条视频硬上限；同日只跑一条时等于视频上限
   image_project_cny: 20.0      # 单视频项目上限
   image_episode_cny: 20.0      # 当前一条视频按一集核算
   image_shot_cny: 3.0          # 单次保守上界；项目总预算仍限制为 20 元
+  image_conversation_cny: 5.0  # 首页聊天额度；不沿用专业项目/单镜预算身份
+  autonomous_image_auto_cny: 0.30  # 首页单次小额生成静默执行阈值
   image_max_concurrency: 1     # W4 先串行；确认限流与整批预占正确后才调高
   token_daily_limit: 200000    # token 单日上限，防跑飞
 

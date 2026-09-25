@@ -7,14 +7,15 @@ import MessageComposer from '../components/chat/MessageComposer.vue'
 import SystemStatusInline from '../components/chat/SystemStatusInline.vue'
 import { presenterFor } from '../domains/presenters'
 import { navigate } from '../router'
-import { createConversation, decideApproval, deleteConversation, getApprovals, getConversation, getConversations, getEvents, getRun, renameConversation, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
-import type { Conversation, ConversationMessage, CoreApproval, CoreRun } from '../types'
+import { createConversation, decideApproval, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
+import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../types'
 
 const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreApproval[]; busy?: boolean; domain?: string; embedded?: boolean; initialRunId?: string }>(), { runs: () => [], approvals: () => [], busy: false, embedded: false })
 const emit = defineEmits<{ refresh: []; runCreated: [run: CoreRun]; chatting: [active: boolean] }>()
 const conversations = ref<Conversation[]>([])
 const conversationId = ref('')
 const messages = ref<ConversationMessage[]>([])
+const mediaJobs = ref<MediaJob[]>([])
 const streaming = ref('')
 const sending = ref(false)
 const error = ref('')
@@ -26,8 +27,28 @@ const composer = ref<{ fill: (text: string) => void } | null>(null)
 const activities = ref<RuntimeEvent[]>([])
 const localApprovals = ref<CoreApproval[]>([])
 const lastContent = ref('')
+const imageUrl = ref('')
+interface InlineRunState { run: CoreRun; activities: RuntimeEvent[]; approval: CoreApproval | null; artifact: CoreArtifact | null; imageUrl: string; videoUrl: string }
+interface QueuedMessage { id: string; conversationId: string; content: string; domainHint: string | null }
+const inlineRuns = ref<Record<string, InlineRunState>>({})
+const pendingMessages = ref<Record<string, 'queued' | 'replying' | 'failed'>>({})
+const activityByMessage = ref<Record<string, string>>({})
+const messageMedia = ref<Record<string, { type: 'image' | 'video'; url: string }>>({})
+const messageMediaErrors = ref<Record<string, boolean>>({})
+const imagePhases = ref<Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>>({})
+const streamingByMessage = ref<Record<string, string>>({})
+const errorMessageId = ref('')
+const deciding = ref(false)
+const homeStops = new Map<string, () => void>()
+const runAnchors = new Map<string, string>()
+const loadingMedia = new Set<string>()
+const unavailableMedia = new Set<string>()
+let localMessageCounter = 0
 let stopEvents: (() => void) | null = null
 let lastSequence = 0
+let imageLoadVersion = 0
+let mediaPollTimer: ReturnType<typeof setInterval> | null = null
+let selectionVersion = 0
 const pendingApproval = computed(() => [...props.approvals, ...localApprovals.value].find((item) => item.run_id === activeRun.value?.id && item.decision === 'pending') ?? null)
 
 async function refreshConversations(): Promise<void> {
@@ -36,16 +57,116 @@ async function refreshConversations(): Promise<void> {
 }
 
 async function selectConversation(id: string): Promise<void> {
+  const currentSelection = ++selectionVersion
+  if (mediaPollTimer) { clearInterval(mediaPollTimer); mediaPollTimer = null }
   stopEvents?.(); stopEvents = null
+  for (const stop of homeStops.values()) stop()
+  for (const state of Object.values(inlineRuns.value)) {
+    if (state.imageUrl) URL.revokeObjectURL(state.imageUrl)
+    if (state.videoUrl) URL.revokeObjectURL(state.videoUrl)
+  }
+  for (const media of Object.values(messageMedia.value)) URL.revokeObjectURL(media.url)
+  messageMedia.value = {}
+  messageMediaErrors.value = {}
+  imagePhases.value = {}
+  mediaJobs.value = []
+  activityByMessage.value = {}
+  streamingByMessage.value = {}
+  homeStops.clear(); runAnchors.clear(); inlineRuns.value = {}
   const detail = await getConversation(id)
-  if (!detail) return
+  if (!detail || currentSelection !== selectionVersion) return
   conversationId.value = id
   messages.value = detail.messages ?? []
+  restoreMediaJobs(detail.media_jobs ?? [])
+  if (mediaJobs.value.some((job) => job.status === 'pending' || job.status === 'generating')) {
+    mediaPollTimer = setInterval(() => { void refreshActiveMedia(id) }, 1200)
+  }
+  for (const message of messages.value) if (message.artifact_id) void loadMessageMedia(message, id)
   streaming.value = ''
   error.value = ''
+  errorMessageId.value = ''
   activities.value = []
-  activeRun.value = detail.active_run_id ? await getRun(detail.active_run_id) : null
-  if (activeRun.value) followRun(activeRun.value.id)
+  const restoredRun = detail.active_run_id ? await getRun(detail.active_run_id) : null
+  if (currentSelection !== selectionVersion) return
+  activeRun.value = restoredRun
+  if (activeRun.value) {
+    if (props.domain) followRun(activeRun.value.id)
+    else {
+      const anchor = [...messages.value].reverse().find((item) => item.run_id === activeRun.value?.id)?.id
+        ?? [...messages.value].reverse().find((item) => item.role === 'assistant')?.id
+        ?? messages.value.at(-1)?.id
+      if (anchor) followHomeRun(activeRun.value, anchor)
+    }
+  }
+}
+
+function restoreMediaJobs(jobs: MediaJob[]): void {
+  mediaJobs.value = jobs
+  const phases = { ...imagePhases.value }
+  for (const job of jobs) {
+    if (job.media_type !== 'image') continue
+    phases[job.generation_request_id] = {
+      status: job.status === 'completed' ? 'ready'
+        : job.status === 'failed' ? 'failed'
+          : job.status === 'generating' ? 'generating' : 'prepared',
+      width: phases[job.generation_request_id]?.width ?? 1,
+      height: phases[job.generation_request_id]?.height ?? 1,
+    }
+  }
+  imagePhases.value = phases
+}
+
+async function refreshActiveMedia(ownerId: string): Promise<void> {
+  try {
+    const detail = await getConversation(ownerId)
+    if (!detail || conversationId.value !== ownerId) return
+    restoreMediaJobs(detail.media_jobs ?? [])
+    const persisted = detail.messages ?? []
+    const pendingLocal = messages.value.filter((message) =>
+      message.id.startsWith('local-') && pendingMessages.value[message.id]
+      && !persisted.some((item) => item.event_id === `generation-user:${message.id}`),
+    )
+    messages.value = [...persisted, ...pendingLocal]
+    for (const message of persisted) {
+      if (message.artifact_id && !messageMedia.value[message.id] && !messageMediaErrors.value[message.id]) {
+        void loadMessageMedia(message, ownerId)
+      }
+    }
+    if (!mediaJobs.value.some((job) => job.status === 'pending' || job.status === 'generating') && mediaPollTimer) {
+      clearInterval(mediaPollTimer)
+      mediaPollTimer = null
+    }
+  } catch (pollError) {
+    if (conversationId.value === ownerId) error.value = pollError instanceof Error ? pollError.message : '无法更新图片状态'
+  }
+}
+
+async function loadMessageMedia(message: ConversationMessage, ownerId: string): Promise<void> {
+  if (!message.artifact_id) return
+  const loadingKey = `conversation:${message.id}`
+  if (loadingMedia.has(loadingKey) || messageMedia.value[message.id]) return
+  loadingMedia.add(loadingKey)
+  try {
+    const [artifact, url] = await Promise.all([
+      getArtifact(message.artifact_id).catch(() => null),
+      getArtifactContentUrl(message.artifact_id).catch(() => null),
+    ])
+    if (!url) {
+      if (conversationId.value === ownerId) messageMediaErrors.value = { ...messageMediaErrors.value, [message.id]: true }
+      return
+    }
+    if (conversationId.value !== ownerId || artifact?.conversation_id !== ownerId ||
+        !['image', 'video'].includes(artifact.type)) {
+      URL.revokeObjectURL(url)
+      return
+    }
+    messageMedia.value = {
+      ...messageMedia.value,
+      [message.id]: { type: artifact.type as 'image' | 'video', url },
+    }
+  } finally {
+    loadingMedia.delete(loadingKey)
+  }
 }
 
 async function newConversation(): Promise<void> {
@@ -77,14 +198,185 @@ async function initialize(): Promise<void> {
     else await newConversation()
     if (props.initialRunId && activeRun.value?.id !== props.initialRunId) {
       activeRun.value = await getRun(props.initialRunId)
-      if (activeRun.value) followRun(activeRun.value.id)
+      if (activeRun.value) {
+        if (props.domain) followRun(activeRun.value.id)
+        else {
+          const anchor = messages.value.at(-1)?.id
+          if (anchor) followHomeRun(activeRun.value, anchor)
+        }
+      }
     }
   } catch (taskError) {
     error.value = taskError instanceof Error ? taskError.message : '无法载入对话'
   }
 }
 
+function updateInline(runId: string, patch: Partial<InlineRunState>): void {
+  const anchor = runAnchors.get(runId)
+  if (!anchor || !inlineRuns.value[anchor]) return
+  inlineRuns.value = { ...inlineRuns.value, [anchor]: { ...inlineRuns.value[anchor], ...patch } }
+}
+
+async function refreshInlineRun(runId: string, includeDetails = true): Promise<void> {
+  const [run, approvals, artifacts] = await Promise.all([
+    getRun(runId).catch(() => null),
+    includeDetails ? getApprovals(`home-approvals:${runId}`).catch(() => null) : Promise.resolve(null),
+    includeDetails ? getArtifacts(runId).catch(() => null) : Promise.resolve(null),
+  ])
+  if (run) {
+    activeRun.value = run
+    updateInline(runId, { run })
+  }
+  const artifact = artifacts?.find((item) => item.type === 'image' || item.type === 'video') ?? null
+  const patch: Partial<InlineRunState> = {}
+  if (approvals) patch.approval = approvals.find((item) => item.run_id === runId && item.decision === 'pending') ?? null
+  if (artifacts) patch.artifact = artifact
+  updateInline(runId, patch)
+  const mediaKey = `${runId}:${artifact?.id ?? ''}`
+  const current = inlineRuns.value[runAnchors.get(runId) ?? '']
+  if (artifact && !loadingMedia.has(mediaKey) && !unavailableMedia.has(mediaKey) && !(artifact.type === 'image' ? current?.imageUrl : current?.videoUrl)) {
+    loadingMedia.add(mediaKey)
+    const media = await getArtifactContentUrl(artifact.id).catch(() => null)
+    if (media && inlineRuns.value[runAnchors.get(runId) ?? '']) {
+      updateInline(runId, artifact.type === 'image' ? { imageUrl: media } : { videoUrl: media })
+    } else if (media) URL.revokeObjectURL(media)
+    else unavailableMedia.add(mediaKey)
+    loadingMedia.delete(mediaKey)
+  }
+  const state = run?.state ?? inlineRuns.value[runAnchors.get(runId) ?? '']?.run.state
+  const requestId = state?.request_id
+  const currentImage = inlineRuns.value[runAnchors.get(runId) ?? '']?.imageUrl
+  if (!currentImage && typeof requestId === 'string' && typeof state?.image_path === 'string' && state.image_path) {
+    const url = await getTaskImageUrl(requestId).catch(() => null)
+    const anchor = runAnchors.get(runId)
+    if (url && anchor && inlineRuns.value[anchor]) {
+      const old = inlineRuns.value[anchor].imageUrl
+      updateInline(runId, { imageUrl: url })
+      if (old) URL.revokeObjectURL(old)
+    } else if (url) URL.revokeObjectURL(url)
+  }
+}
+
+function followHomeRun(run: CoreRun, anchor: string): void {
+  homeStops.get(run.id)?.()
+  runAnchors.set(run.id, anchor)
+  inlineRuns.value = {
+    ...inlineRuns.value,
+    [anchor]: inlineRuns.value[anchor] ?? { run, activities: [], approval: null, artifact: null, imageUrl: '', videoUrl: '' },
+  }
+  void getEvents(run.id).then((events) => {
+    const current = inlineRuns.value[runAnchors.get(run.id) ?? '']
+    if (!current) return
+    const merged = new Map([...events, ...current.activities].map((event) => [event.sequence, event]))
+    updateInline(run.id, { activities: [...merged.values()].sort((a, b) => a.sequence - b.sequence) })
+  }).catch(() => {})
+  void refreshInlineRun(run.id).catch(() => {})
+  let lastSeen = 0
+  const stop = subscribeRunEvents(run.id, 0, {
+    onEvent: (event) => {
+      if (event.sequence <= lastSeen) return
+      lastSeen = event.sequence
+      const current = inlineRuns.value[runAnchors.get(run.id) ?? '']
+      if (current) updateInline(run.id, { activities: [...current.activities.filter((item) => item.sequence !== event.sequence), event].sort((a, b) => a.sequence - b.sequence) })
+      void refreshInlineRun(run.id, ['approval_required', 'approval_resolved', 'artifact_created', 'run_completed', 'run_failed', 'run_cancelled'].includes(event.event_type)).catch(() => {})
+      emit('refresh')
+    },
+    onEnd: () => { homeStops.get(run.id)?.(); homeStops.delete(run.id); void refreshInlineRun(run.id).catch(() => {}) },
+  })
+  homeStops.set(run.id, stop)
+}
+
+async function runHomeMessage(task: QueuedMessage): Promise<void> {
+  pendingMessages.value = { ...pendingMessages.value, [task.id]: 'replying' }
+  let anchor = task.id
+  try {
+    await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
+        onDelta: (delta) => {
+          if (conversationId.value === task.conversationId) {
+            streamingByMessage.value = {
+              ...streamingByMessage.value,
+              [task.id]: (streamingByMessage.value[task.id] ?? '') + delta,
+            }
+          }
+        },
+        onMessage: (message) => {
+          if (conversationId.value !== task.conversationId) return
+          const index = messages.value.findIndex((item) => item.id === anchor)
+          if (!messages.value.some((item) => item.id === message.id)) {
+            messages.value.splice(index < 0 ? messages.value.length : index + 1, 0, message)
+          }
+          if (message.artifact_id) void loadMessageMedia(message, task.conversationId)
+          const nextActivity = { ...activityByMessage.value }
+          delete nextActivity[task.id]
+          activityByMessage.value = nextActivity
+          for (const [runId, id] of runAnchors) {
+            if (id !== anchor) continue
+            runAnchors.set(runId, message.id)
+            inlineRuns.value = { ...inlineRuns.value, [message.id]: inlineRuns.value[anchor] }
+            const copy = { ...inlineRuns.value }; delete copy[anchor]; inlineRuns.value = copy
+          }
+          anchor = message.id
+          const nextStreaming = { ...streamingByMessage.value }
+          delete nextStreaming[task.id]
+          streamingByMessage.value = nextStreaming
+          void refreshConversations()
+        },
+        onRun: (run) => {
+          if (conversationId.value === task.conversationId) {
+            activeRun.value = run
+            followHomeRun(run, anchor)
+            emit('refresh'); emit('runCreated', run)
+          }
+        },
+        onActivity: (activity) => {
+          if (conversationId.value === task.conversationId && activity.generation_request_id === task.id) {
+            activityByMessage.value = { ...activityByMessage.value, [task.id]: activity.label }
+          }
+        },
+        onImageEvent: (name, event) => {
+          if (conversationId.value !== task.conversationId || event.generation_request_id !== task.id) return
+          if (name === 'prompt_prepared' || name === 'image_generating') {
+            imagePhases.value = { ...imagePhases.value, [task.id]: {
+              status: name === 'prompt_prepared' ? 'prepared' : 'generating',
+              width: event.width ?? imagePhases.value[task.id]?.width ?? 1,
+              height: event.height ?? imagePhases.value[task.id]?.height ?? 1,
+            } }
+          } else if (name === 'image_ready' || name === 'image_summary' || name === 'image_failed') {
+            const previous = imagePhases.value[task.id] ?? { width: 1, height: 1 }
+            imagePhases.value = { ...imagePhases.value, [task.id]: {
+              ...previous,
+              status: name === 'image_failed' ? 'failed' : name === 'image_summary' ? 'summarized' : 'ready',
+            } }
+          }
+        },
+      }, dataMode.value, enhancePrompt.value, task.id)
+    const next = { ...pendingMessages.value }; delete next[task.id]; pendingMessages.value = next
+  } catch (taskError) {
+    if (conversationId.value === task.conversationId) {
+      error.value = taskError instanceof Error ? taskError.message : '消息没有发送成功'
+      errorMessageId.value = task.id
+    }
+    pendingMessages.value = { ...pendingMessages.value, [task.id]: 'failed' }
+    if (imagePhases.value[task.id]) imagePhases.value = { ...imagePhases.value, [task.id]: { ...imagePhases.value[task.id], status: 'failed' } }
+    const nextActivity = { ...activityByMessage.value }; delete nextActivity[task.id]; activityByMessage.value = nextActivity
+  } finally {
+    const nextStreaming = { ...streamingByMessage.value }
+    delete nextStreaming[task.id]
+    streamingByMessage.value = nextStreaming
+    if (conversationId.value === task.conversationId) void refreshConversations()
+  }
+}
+
 async function send(content: string): Promise<void> {
+  if (!props.domain) {
+    if (!conversationId.value) await initialize()
+    if (!conversationId.value) return
+    const id = `local-${Date.now()}-${++localMessageCounter}`
+    messages.value.push({ id, conversation_id: conversationId.value, role: 'user', type: 'text', content, run_id: null, event_id: null, created_at: new Date().toISOString() })
+    pendingMessages.value = { ...pendingMessages.value, [id]: 'replying' }
+    void runHomeMessage({ id, content, conversationId: conversationId.value, domainHint: domainHint.value })
+    return
+  }
   if (sending.value) return
   if (!conversationId.value) await initialize()
   lastContent.value = content
@@ -97,7 +389,7 @@ async function send(content: string): Promise<void> {
       onDelta: (delta) => { streaming.value += delta },
       onMessage: (message) => { messages.value.push(message); streaming.value = ''; void refreshConversations() },
       onRun: (run) => { activeRun.value = run; followRun(run.id); emit('refresh'); emit('runCreated', run) },
-    }, dataMode.value, props.domain ? enhancePrompt.value : false)
+    }, dataMode.value, enhancePrompt.value)
   } catch (taskError) {
     error.value = taskError instanceof Error ? taskError.message : '消息没有发送成功'
   } finally { sending.value = false }
@@ -107,6 +399,7 @@ function followRun(runId: string): void {
   stopEvents?.()
   lastSequence = 0
   void getEvents(runId).then((events) => { activities.value = events })
+  void getApprovals().then((items) => { localApprovals.value = items ?? [] })
   stopEvents = subscribeRunEvents(runId, 0, {
     onEvent: (event) => {
       if (event.sequence <= lastSequence) return
@@ -125,16 +418,55 @@ async function decide(action: 'approve' | 'reject' | 'revise', response: Record<
   sending.value = true
   try {
     activeRun.value = await decideApproval(pendingApproval.value.id, action, response)
+    localApprovals.value = await getApprovals() ?? []
+    if (activeRun.value) followRun(activeRun.value.id)
     emit('refresh')
   } catch (taskError) {
     error.value = taskError instanceof Error ? taskError.message : '审批没有提交成功'
   } finally { sending.value = false }
 }
 
+async function decideInline(messageId: string, action: 'approve' | 'reject' | 'revise', response: Record<string, unknown>): Promise<void> {
+  const approval = inlineRuns.value[messageId]?.approval
+  if (!approval || deciding.value) return
+  deciding.value = true
+  try {
+    const run = await decideApproval(approval.id, action, response)
+    updateInline(run.id, { run, approval: null })
+    followHomeRun(run, messageId)
+    emit('refresh')
+  } catch (taskError) {
+    error.value = taskError instanceof Error ? taskError.message : '确认没有提交成功'
+    errorMessageId.value = messageId
+  } finally { deciding.value = false }
+}
+
 function openRun(run: CoreRun): void { navigate({ name: 'workspace_run', domain: run.domain, runId: run.id }) }
 onMounted(initialize)
-onBeforeUnmount(() => stopEvents?.())
+onBeforeUnmount(() => {
+  if (mediaPollTimer) clearInterval(mediaPollTimer)
+  stopEvents?.()
+  for (const stop of homeStops.values()) stop()
+  for (const state of Object.values(inlineRuns.value)) {
+    if (state.imageUrl) URL.revokeObjectURL(state.imageUrl)
+    if (state.videoUrl) URL.revokeObjectURL(state.videoUrl)
+  }
+  for (const media of Object.values(messageMedia.value)) URL.revokeObjectURL(media.url)
+  if (imageUrl.value) URL.revokeObjectURL(imageUrl.value)
+})
 watch(() => props.domain, (value) => { domainHint.value = value ?? null })
+watch(
+  () => [activeRun.value?.id, activeRun.value?.state?.request_id, activeRun.value?.state?.image_path] as const,
+  async ([, requestId, imagePath]) => {
+    const version = ++imageLoadVersion
+    if (imageUrl.value) URL.revokeObjectURL(imageUrl.value)
+    imageUrl.value = ''
+    if (typeof requestId !== 'string' || typeof imagePath !== 'string' || !imagePath) return
+    const loaded = await getTaskImageUrl(requestId).catch(() => null)
+    if (version !== imageLoadVersion) { if (loaded) URL.revokeObjectURL(loaded); return }
+    imageUrl.value = loaded ?? ''
+  },
+)
 watch(
   () => [messages.value.length, activeRun.value?.id] as const,
   ([count, runId]) => emit('chatting', count > 0 && !runId),
@@ -143,20 +475,16 @@ watch(
 
 <template>
   <main class="chat-shell" :class="{ embedded }">
-    <ConversationHistory :conversations="conversations" :active-id="conversationId" :busy="sending" @create="newConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" />
+    <ConversationHistory :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" />
     <div class="chat-home" :class="{ embedded }">
     <header class="chat-home-head">
-      <div><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>直接提问或描述制作任务。需要执行时先给计划，再显示真实进度。</p></div>
-      <SystemStatusInline :label="sending ? 'DeepSeek 正在响应' : 'Core 已连接'" :tone="sending ? 'active' : 'neutral'" />
+      <div><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>{{ domain ? '描述目标，逐步确认制作细节与结果。' : '直接提问或描述你想制作的内容，结果会留在当前聊天。' }}</p></div>
+      <SystemStatusInline :label="sending || Object.keys(streamingByMessage).length ? 'Kantoku 正在回复' : '就绪'" :tone="sending || Object.keys(streamingByMessage).length ? 'active' : 'neutral'" />
     </header>
-    <div v-if="!domain" class="domain-hints" aria-label="可选领域提示">
-      <span>可选提示</span>
-      <button v-for="item in [{ id: 'commerce', label: '电商' }, { id: 'comic', label: '漫剧' }, { id: 'studio', label: '视觉创作' }]" :key="item.id" type="button" :aria-pressed="domainHint === item.id" @click="domainHint = domainHint === item.id ? null : item.id">{{ item.label }}</button>
-    </div>
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
-    <ChatMessageList :messages="messages" :streaming="streaming" :run="activeRun" :activities="activities" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" @retry="lastContent && send(lastContent)" @open-run="openRun" @example="(text) => composer?.fill(text)" />
-    <div v-if="pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" @decide="decide" /></div>
-    <div class="composer-dock"><MessageComposer ref="composer" :disabled="sending" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先把需求改写为详细生图提示词，再进入执行。' : '领域选择不是必填。Kantoku 会识别普通对话与生产任务。' }}</p></div>
+    <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @example="(text) => composer?.fill(text)" />
+    <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
+    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
     </div>
   </main>
 </template>

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed } from 'vue'
 
-const props = defineProps<{ content: string }>()
+const props = defineProps<{ content: string; live?: boolean }>()
 
 function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
@@ -87,5 +87,5 @@ const rendered = computed(() => markdown(props.content))
 </script>
 
 <template>
-  <div class="chat-row assistant"><div class="assistant-mark">K</div><div class="assistant-copy"><div class="assistant-rich" v-html="rendered"></div></div></div>
+  <div class="chat-row assistant"><div class="assistant-mark" :class="{ live }">K</div><div class="assistant-copy"><div class="assistant-rich" v-html="rendered"></div><span v-if="live" class="stream-caret" aria-label="正在回复"></span></div></div>
 </template>

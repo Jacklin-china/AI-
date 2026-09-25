@@ -85,6 +85,12 @@ class VolcengineJimengProvider:
 
     def _configure_client(self, *, load_credentials: bool) -> None:
         self._validate_output_geometry()
+        if not all((
+            self.settings.region, self.settings.service, self.settings.api_version,
+            self.settings.submit_action, self.settings.query_action,
+            self.settings.access_key_env, self.settings.secret_key_env,
+        )):
+            raise ConfigError("即梦签名参数不完整")
         endpoint = urlsplit(self.settings.base_url)
         if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
             raise ConfigError("生图 API 地址不合法")

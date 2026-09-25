@@ -1,2 +1,5 @@
-<script setup lang="ts">defineProps<{ content: string }>()</script>
-<template><div class="chat-row assistant"><div class="assistant-mark live">K</div><div class="assistant-copy"><p>{{ content }}<span class="stream-caret"></span></p></div></div></template>
+<script setup lang="ts">
+import AssistantMessageBlock from './AssistantMessageBlock.vue'
+defineProps<{ content: string }>()
+</script>
+<template><AssistantMessageBlock :content="content" live /></template>

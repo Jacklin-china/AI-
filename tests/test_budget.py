@@ -101,6 +101,43 @@ def test_direct_provider_estimate_takes_priority_for_default_call(
     assert budget.estimate_image_fen(1) == 10
 
 
+def test_price_table_quotes_per_model_and_count(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path / "pricing.db")
+    settings.image = SimpleNamespace(
+        model="model-a",
+        pricing=SimpleNamespace(
+            default_cny_per_image=Decimal("0.50"),
+            cny_per_image_by_model={"model-a": Decimal("0.20")},
+        ),
+    )
+    monkeypatch.setattr(budget, "get_settings", lambda: settings)
+
+    assert budget.estimate_image_fen() == 20
+    assert budget.estimate_image_fen(count=4) == 80
+    assert budget.estimate_image_fen(model="unknown-model") == 50
+    assert budget.estimate_image_fen(1) == 10
+    quote = budget.quote_image_price(count=3)
+    assert (quote.model, quote.unit_fen, quote.count, quote.total_fen) == (
+        "model-a", 20, 3, 60,
+    )
+    with pytest.raises(BudgetError):
+        budget.estimate_image_fen(count=0)
+
+
+def test_price_table_missing_falls_back_to_conservative_estimate(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = _settings(tmp_path / "no-pricing.db")
+    settings.image = SimpleNamespace(model="model-a", pricing=None)
+    monkeypatch.setattr(budget, "get_settings", lambda: settings)
+
+    assert budget.estimate_image_fen() == 30
+    quote = budget.quote_image_price(model="model-a", count=2)
+    assert (quote.unit_fen, quote.total_fen) == (30, 60)
+
+
 def test_reserve_is_idempotent_and_rejects_request_id_collision() -> None:
     first = _reserve("same")
     second = _reserve("same")
@@ -229,6 +266,24 @@ def test_submission_claim_honors_concurrency_and_unknown_tasks() -> None:
         budget.claim_submission("second")
     budget.settle("first", 30)
     assert budget.claim_submission("second") is True
+
+
+def test_home_image_concurrency_is_isolated_by_conversation() -> None:
+    for request_id, conversation_id in (
+        ("chat-a-image-1", "conversation-a"),
+        ("chat-b-image-1", "conversation-b"),
+        ("chat-a-image-2", "conversation-a"),
+    ):
+        budget.reserve(
+            reservation_id=request_id, job=f"job-{request_id}",
+            project="__conversation__", episode=request_id, shot_no=1,
+            kind="image", est_fen=30, model="configured-image-model",
+            conversation_id=conversation_id,
+        )
+    assert budget.claim_submission("chat-a-image-1") is True
+    assert budget.claim_submission("chat-b-image-1") is True
+    with pytest.raises(BudgetError, match="当前对话已有生图任务"):
+        budget.claim_submission("chat-a-image-2")
 
 
 def test_conflicting_concurrent_settlements_preserve_one_bill() -> None:
