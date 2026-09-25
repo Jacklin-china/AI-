@@ -1,12 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { ArrowDown } from 'lucide-vue-next'
+import { ArrowDown, Download, RotateCcw, X } from 'lucide-vue-next'
 import type { ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../../types'
 import { presenterFor } from '../../domains/presenters'
 import type { RuntimeEvent } from '../../services/core'
 import ApprovalCard from '../approval/ApprovalCard.vue'
 import AssistantMessageBlock from './AssistantMessageBlock.vue'
 import AssistantStreamingBlock from './AssistantStreamingBlock.vue'
+import ChatImageAttachment from './ChatImageAttachment.vue'
 import ErrorRecoveryPanel from './ErrorRecoveryPanel.vue'
 import UserMessageBubble from './UserMessageBubble.vue'
 import WorkflowActivity from './WorkflowActivity.vue'
@@ -39,13 +40,63 @@ defineEmits<{
 const scroller = ref<HTMLElement | null>(null)
 const previewDialog = ref<HTMLDialogElement | null>(null)
 const previewImage = ref<{ url: string; filename: string } | null>(null)
+const previewStage = ref<HTMLElement | null>(null)
+const previewElement = ref<HTMLImageElement | null>(null)
+const previewScale = ref(1)
+const previewX = ref(0)
+const previewY = ref(0)
+const dragging = ref(false)
+let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 }
 const atBottom = ref(true)
 async function openImage(media: { url: string; filename: string }): Promise<void> {
+  resetPreview()
   previewImage.value = media
   await nextTick()
   previewDialog.value?.showModal()
 }
-function closeImage(): void { previewDialog.value?.close(); previewImage.value = null }
+function resetPreview(): void {
+  previewScale.value = 1
+  previewX.value = 0
+  previewY.value = 0
+  dragging.value = false
+}
+function closeImage(): void { previewDialog.value?.close(); previewImage.value = null; resetPreview() }
+function boundPan(): void {
+  const image = previewElement.value
+  const stage = previewStage.value
+  if (!image || !stage || previewScale.value <= 1) {
+    previewX.value = 0
+    previewY.value = 0
+    return
+  }
+  const maxX = Math.max(0, (image.offsetWidth * previewScale.value - stage.clientWidth) / 2)
+  const maxY = Math.max(0, (image.offsetHeight * previewScale.value - stage.clientHeight) / 2)
+  previewX.value = Math.max(-maxX, Math.min(maxX, previewX.value))
+  previewY.value = Math.max(-maxY, Math.min(maxY, previewY.value))
+}
+function zoomPreview(event: WheelEvent): void {
+  const next = Math.max(1, Math.min(5, previewScale.value * (event.deltaY < 0 ? 1.15 : 1 / 1.15)))
+  previewScale.value = Math.abs(next - 1) < 0.01 ? 1 : next
+  boundPan()
+}
+function beginDrag(event: PointerEvent): void {
+  if (event.button !== 0 || previewScale.value <= 1) return
+  dragging.value = true
+  dragStart = { x: event.clientX, y: event.clientY, offsetX: previewX.value, offsetY: previewY.value }
+  ;(event.currentTarget as HTMLElement).setPointerCapture(event.pointerId)
+  event.preventDefault()
+}
+function moveDrag(event: PointerEvent): void {
+  if (!dragging.value) return
+  previewX.value = dragStart.offsetX + event.clientX - dragStart.x
+  previewY.value = dragStart.offsetY + event.clientY - dragStart.y
+  boundPan()
+}
+function endDrag(event: PointerEvent): void {
+  dragging.value = false
+  const target = event.currentTarget as HTMLElement
+  if (target.hasPointerCapture(event.pointerId)) target.releasePointerCapture(event.pointerId)
+}
 watch(() => props.messageMedia, (media) => {
   if (previewImage.value && !Object.values(media ?? {}).some((item) => item.url === previewImage.value?.url)) closeImage()
 })
@@ -219,10 +270,7 @@ function activityText(event: RuntimeEvent): string {
         <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" />
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
           <template v-if="imageResult(imageRequestId(message)!)?.artifact_id">
-            <figure v-if="messageMedia?.[imageResult(imageRequestId(message)!)!.id]" class="chat-generated-image">
-              <button type="button" class="chat-image-open" aria-label="放大查看生成的图片" @click="openImage(messageMedia[imageResult(imageRequestId(message)!)!.id])"><img :src="messageMedia[imageResult(imageRequestId(message)!)!.id].url" alt="此聊天生成的图片" /></button>
-              <figcaption class="chat-image-actions"><span>生成的图片</span><a :href="messageMedia[imageResult(imageRequestId(message)!)!.id].url" :download="messageMedia[imageResult(imageRequestId(message)!)!.id].filename">下载原图</a></figcaption>
-            </figure>
+            <ChatImageAttachment v-if="messageMedia?.[imageResult(imageRequestId(message)!)!.id]" :media="messageMedia[imageResult(imageRequestId(message)!)!.id]" @open="openImage" />
             <p v-else-if="messageMediaErrors?.[imageResult(imageRequestId(message)!)!.id]" class="chat-image-load-error" role="alert">图片已保存，但预览暂时无法加载。</p>
             <div v-else class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="status" aria-label="正在载入图片"></div>
           </template>
@@ -235,10 +283,10 @@ function activityText(event: RuntimeEvent): string {
           <p v-else-if="imagePhases?.[imageRequestId(message)!]?.status === 'failed' && !hasFailureMessage(imageRequestId(message)!)" class="chat-inline-error" role="alert">{{ mediaJobs?.find((job) => job.generation_request_id === imageRequestId(message))?.error_message ?? '图片生成未完成，请查看错误记录。' }}</p>
         </div>
         <p v-if="homeMode && activityByMessage?.[message.id]" class="chat-inline-status chat-direct-status">{{ activityByMessage[message.id] }}</p>
-        <figure v-if="homeMode && messageMedia?.[message.id] && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
-          <button v-if="messageMedia[message.id].type === 'image'" type="button" class="chat-image-open" aria-label="放大查看生成的图片" @click="openImage(messageMedia[message.id])"><img :src="messageMedia[message.id].url" alt="此聊天生成的图片" /></button>
-          <video v-else :src="messageMedia[message.id].url" controls preload="metadata" />
-          <figcaption class="chat-image-actions"><span>{{ messageMedia[message.id].type === 'image' ? '生成的图片' : '生成的视频' }}</span><a v-if="messageMedia[message.id].type === 'image'" :href="messageMedia[message.id].url" :download="messageMedia[message.id].filename">下载原图</a></figcaption>
+        <ChatImageAttachment v-if="homeMode && messageMedia?.[message.id]?.type === 'image' && !isHomeImageArtifact(message)" :media="messageMedia[message.id]" @open="openImage" />
+        <figure v-else-if="homeMode && messageMedia?.[message.id]?.type === 'video' && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
+          <video :src="messageMedia[message.id].url" controls preload="metadata" />
+          <figcaption>生成的视频</figcaption>
         </figure>
         <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" />
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
@@ -276,10 +324,16 @@ function activityText(event: RuntimeEvent): string {
       <ErrorRecoveryPanel v-if="!homeMode && error" :message="error" @retry="$emit('retry')" />
     </div>
     <button v-if="!atBottom" type="button" class="back-bottom" @click="bottom(true)"><ArrowDown :size="14" />回到底部</button>
-    <dialog ref="previewDialog" class="chat-image-preview" aria-label="图片预览" @close="previewImage = null" @click="($event.target === $event.currentTarget) && closeImage()">
+    <dialog ref="previewDialog" class="chat-image-preview" aria-label="图片预览" @close="previewImage = null; resetPreview()" @click="($event.target === $event.currentTarget) && closeImage()">
       <div v-if="previewImage" class="chat-image-preview-inner">
-        <header><span>图片预览</span><div><a :href="previewImage.url" :download="previewImage.filename">下载原图</a><button type="button" aria-label="关闭预览" @click="closeImage">关闭</button></div></header>
-        <img :src="previewImage.url" alt="生成图片的放大预览" />
+        <header><span>图片预览 <small>{{ Math.round(previewScale * 100) }}%</small></span><div>
+          <button type="button" aria-label="恢复适应窗口" @click="resetPreview"><RotateCcw :size="18" aria-hidden="true" /><span>适应窗口</span></button>
+          <a :href="previewImage.url" :download="previewImage.filename" aria-label="下载原图"><Download :size="18" aria-hidden="true" /><span class="chat-image-tooltip" role="tooltip">下载原图</span></a>
+          <button type="button" aria-label="关闭预览" @click="closeImage"><X :size="19" aria-hidden="true" /></button>
+        </div></header>
+        <div ref="previewStage" class="chat-image-preview-stage" @wheel.prevent="zoomPreview" @click.self="closeImage">
+          <img ref="previewElement" :src="previewImage.url" alt="生成图片的放大预览" :class="{ 'can-drag': previewScale > 1, dragging }" :style="{ transform: `translate(${previewX}px, ${previewY}px) scale(${previewScale})` }" draggable="false" @pointerdown="beginDrag" @pointermove="moveDrag" @pointerup="endDrag" @pointercancel="endDrag" />
+        </div>
       </div>
     </dialog>
   </div>
