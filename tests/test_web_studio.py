@@ -20,6 +20,7 @@ from kantoku.config import ToolError, logging_setup
 from kantoku.core import budget
 from kantoku.core.conversations import (
     ConversationMessageRecord,
+    InteractionMode,
     MediaJobStatus,
     MessageRole,
     MessageType,
@@ -1391,6 +1392,120 @@ def test_guided_image_chat_waits_for_explicit_start(
     run = next(payload for name, payload in second if name == "run")
     assert app.runtime_store.get_run(run["id"]).status.value == "waiting"
     assert "大耳朵图图" in run["state"]["prompt"]
+
+
+def test_home_fast_domain_persists_and_uses_shared_image_capability(
+    app: web_studio.StudioApplication,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    conversation_id = conversation["id"]
+    selected = app.set_fast_domain(conversation_id, "studio")
+    assert selected["domain"] == "studio"
+    assert app.conversation(conversation_id)["domain"] == "studio"
+
+    events = list(app.stream_conversation(conversation_id, {
+        "content": "帮我生成一张森林中的卡通小熊",
+    }))
+    assert next(payload for name, payload in events if name == "intent")["tool"] == "image.generate"
+    assert any(name == "image_ready" for name, _ in events)
+    assert app.runtime_store.list_runs(interaction_mode=InteractionMode.AUTONOMOUS) == []
+    detail = app.conversation(conversation_id)
+    assert any(message["artifact_id"] for message in detail["messages"])
+    assert detail["media_jobs"][0]["status"] == "completed"
+    assert app.set_fast_domain(conversation_id, None)["domain"] is None
+    with pytest.raises(ToolError):
+        app.set_fast_domain(conversation_id, "unknown")
+
+
+def test_home_fast_commerce_reuses_workflow_without_professional_approvals(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.runner, "submit", lambda execute: execute())
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    conversation_id = conversation["id"]
+    app.set_fast_domain(conversation_id, "commerce")
+
+    events = list(app.stream_conversation(conversation_id, {
+        "content": "帮我制作一个便携阅读灯的 Ozon 商品 Listing",
+    }))
+    intent = next(payload for name, payload in events if name == "intent")
+    assert intent["tool"] == "workflow.start"
+    run = next(payload for name, payload in events if name == "run")
+    stored = app.runtime_store.get_run(run["id"])
+    assert run["id"] in {
+        item.id for item in app.runtime_store.list_runs(
+            interaction_mode=InteractionMode.AUTONOMOUS,
+        )
+    }
+    assert stored.status.value == "completed"
+    assert stored.state["execution_mode"] == "fast"
+    assert stored.state["data_mode"] == "demo"
+    assert stored.state["marketplace_draft"]["mock"] is True
+    assert app.runtime_store.approval_for_node(run["id"], "candidate_approval") is None
+    assert app.runtime_store.approval_for_node(run["id"], "publish_approval") is None
+    assert run["id"] not in {item["id"] for item in app.list_core_runs()}
+    assert any(
+        message["run_id"] == run["id"]
+        for message in app.conversation(conversation_id)["messages"]
+    )
+    assert any("Mock" in payload["content"] for name, payload in events if name == "message"
+               and payload["role"] == "assistant")
+
+
+def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confirmation(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.runner, "submit", lambda _execute: None)
+    monkeypatch.setattr(
+        web_studio, "plan_creative_turn",
+        lambda content, _prior, **_kwargs: creative.CreativeDecision(
+            action="chat", request=content,
+        ),
+    )
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    app.set_fast_domain(conversation["id"], "comic")
+    events = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我制作三镜头的漫剧",
+    }))
+    assert next(payload for name, payload in events if name == "intent")["tool"] == "workflow.start"
+    run = next(payload for name, payload in events if name == "run")
+    assert run["workflow"] == "comic.production.v1"
+    assert run["state"]["confirmed"] is False
+    assert run["id"] in {
+        item.id for item in app.runtime_store.list_runs(
+            interaction_mode=InteractionMode.AUTONOMOUS,
+        )
+    }
+    assert run["id"] not in {item["id"] for item in app.list_core_runs()}
+    assert any("当前聊天" in payload["content"] for name, payload in events
+               if name == "message" and payload["role"] == "assistant")
+
+
+def test_fast_domain_http_switch_and_guided_rejection(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    home = app.create_conversation({"interaction_mode": "autonomous"})
+    guided = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    try:
+        for domain in ("comic", "commerce", "studio", None):
+            connection.request(
+                "PATCH", f"/api/conversations/{home['id']}",
+                body=json.dumps({"fast_domain": domain}), headers=headers,
+            )
+            response = connection.getresponse()
+            assert response.status == 200
+            assert json.loads(response.read())["domain"] == domain
+        connection.request(
+            "PATCH", f"/api/conversations/{guided['id']}",
+            body=json.dumps({"fast_domain": "commerce"}), headers=headers,
+        )
+        response = connection.getresponse()
+        assert response.status == 400
+        response.read()
+    finally:
+        connection.close()
 
 def test_port_guard_blocks_second_instance() -> None:
     blocker = socket.socket(socket.AF_INET, socket.SOCK_STREAM)

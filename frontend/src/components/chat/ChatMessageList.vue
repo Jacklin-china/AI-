@@ -149,7 +149,7 @@ function imagePlaceholderRatio(requestId: string): string {
 }
 
 function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
-  if (run.status === 'completed') return '已完成'
+  if (run.status === 'completed') return run.domain === 'commerce' && run.state.execution_mode === 'fast' ? '模拟电商草稿已完成' : '已完成'
   if (run.status === 'failed') return '这次没有完成'
   if (run.status === 'cancelled') return '已取消'
   const approvalKind = String(approval?.request.kind ?? '')
@@ -163,6 +163,15 @@ function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
     asset_generation: '正在制作素材', localize: '正在整理内容',
   }
   return labels[run.current_node] ?? '正在处理'
+}
+
+function fastCommerceSummary(run: CoreRun): string {
+  if (run.domain !== 'commerce' || run.state.execution_mode !== 'fast' || run.status !== 'completed') return ''
+  const listing = run.state.localized_listing
+  if (!listing || typeof listing !== 'object' || Array.isArray(listing)) return '模拟电商任务已完成；产物保存在当前任务中。'
+  const draft = listing as Record<string, unknown>
+  const title = typeof draft.title === 'string' ? draft.title : '商品 Listing'
+  return `Mock 数据 · ${title}。已完成选品、定价、Listing、素材与 QC；Marketplace 草稿也是模拟结果。`
 }
 
 function homeError(state: InlineRunState): string {
@@ -292,6 +301,7 @@ function activityText(event: RuntimeEvent): string {
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
         <section v-if="homeMode && inlineRuns?.[message.id]" class="chat-inline-activity" aria-live="polite">
           <p class="chat-inline-status">{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</p>
+          <p v-if="fastCommerceSummary(inlineRuns[message.id].run)" class="chat-inline-qc">{{ fastCommerceSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>
           <figure v-if="inlineRuns[message.id].imageUrl" class="chat-generated-image"><img :src="inlineRuns[message.id].imageUrl" alt="生成的图片" /><figcaption>{{ inlineRuns[message.id].artifact ? '图片已保存' : '图片已生成，等待审核' }}</figcaption></figure>

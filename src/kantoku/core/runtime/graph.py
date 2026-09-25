@@ -11,6 +11,7 @@ from pydantic import ValidationError
 
 from kantoku.config import BudgetError, ExternalJobPending, ToolError
 from kantoku.config.observability import public_error, run_trace
+from kantoku.core.conversations import InteractionMode
 from kantoku.core.state import RunState
 
 from .models import (
@@ -138,7 +139,8 @@ class GraphRuntime:
         return self._execute(run, workflow, state)
 
     def create(
-        self, workflow_id: str, initial_state: RunState | Mapping[str, Any]
+        self, workflow_id: str, initial_state: RunState | Mapping[str, Any],
+        *, interaction_mode: InteractionMode = InteractionMode.GUIDED,
     ) -> RunRecord:
         """Create a durable pending Run without executing its first node."""
         workflow = self.workflow(workflow_id)
@@ -148,7 +150,8 @@ class GraphRuntime:
             raise ToolError("Workflow 初始 State 不合法", detail=workflow_id) from error
         first = self._next(workflow, START, state)
         run = self.store.create_run(
-            workflow.domain, workflow.id, state.model_dump(mode="json"), first
+            workflow.domain, workflow.id, state.model_dump(mode="json"), first,
+            interaction_mode=interaction_mode,
         )
         self.store.append_event(
             run.id, RuntimeEventType.RUN_STARTED,

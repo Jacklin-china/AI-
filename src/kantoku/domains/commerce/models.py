@@ -130,6 +130,7 @@ class CommerceState(RunState):
     """Commerce Pack v0.1 的完整可恢复状态。"""
 
     requirement: str
+    execution_mode: Literal["fast", "professional"] = "professional"
     data_mode: Literal["demo", "production"] = "demo"
     locale: Literal["zh-CN", "ru-RU"] = "zh-CN"
     candidates: list[dict[str, Any]] = Field(default_factory=list)

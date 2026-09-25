@@ -133,7 +133,10 @@ def build_commerce_workflow(
         return {"analysis": payload}
 
     def candidate_approval(state: CommerceState, context: RuntimeContext) -> dict[str, Any]:
-        decision = context.approval_decision
+        auto_mock = state.execution_mode == "fast" and state.data_mode == "demo"
+        decision = context.approval_decision or (
+            ApprovalDecision.APPROVE if auto_mock else None
+        )
         if decision is None:
             raise RuntimeError("candidate approval decision is missing")
         update: dict[str, Any] = {"candidate_decision": decision.value}
@@ -324,7 +327,10 @@ def build_commerce_workflow(
         }
 
     def publish_approval(state: CommerceState, context: RuntimeContext) -> dict[str, Any]:
-        decision = context.approval_decision
+        auto_mock = state.execution_mode == "fast" and state.data_mode == "demo"
+        decision = context.approval_decision or (
+            ApprovalDecision.APPROVE if auto_mock else None
+        )
         if decision is None:
             raise RuntimeError("publish approval decision is missing")
         update: dict[str, Any] = {"publish_decision": decision.value}
@@ -367,6 +373,9 @@ def build_commerce_workflow(
         "candidate_analysis": WorkflowNode("candidate_analysis", candidate_analysis),
         "candidate_approval": WorkflowNode(
             "candidate_approval", candidate_approval, requires_approval=True,
+            approval_when=lambda state: not (
+                state.execution_mode == "fast" and state.data_mode == "demo"
+            ),
             approval_request=lambda state: {
                 "kind": "candidate_approval", "candidates": state.candidates,
                 "analysis": state.analysis, "revision": state.candidate_revision,
@@ -382,6 +391,9 @@ def build_commerce_workflow(
         "rework": WorkflowNode("rework", rework),
         "publish_approval": WorkflowNode(
             "publish_approval", publish_approval, requires_approval=True,
+            approval_when=lambda state: not (
+                state.execution_mode == "fast" and state.data_mode == "demo"
+            ),
             approval_request=lambda state: {
                 "kind": "publish_approval", "listing": state.localized_listing,
                 "image": state.product_image, "qc": state.qc_result,

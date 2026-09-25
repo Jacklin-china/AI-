@@ -19,16 +19,20 @@ class ConversationAction(StrEnum):
 def route_conversation(
     conversation: ConversationRecord, plan: IntentPlan, *, confirmed: bool,
 ) -> ConversationAction:
-    """Only an explicit Guided domain can start a professional Graph Run."""
+    """Autonomous uses direct media or an explicitly selected Domain workflow."""
     if not plan.needs_execution:
         return ConversationAction.CHAT
     if conversation.interaction_mode is InteractionMode.AUTONOMOUS:
-        if conversation.domain is None and plan.intent == "image.generate":
+        if plan.intent == "image.generate":
             return ConversationAction.IMAGE_GENERATE
-        if conversation.domain is None and plan.intent == "image.edit":
+        if plan.intent == "image.edit":
             return ConversationAction.IMAGE_EDIT
-        if conversation.domain is None and plan.intent == "video.generate":
+        if plan.intent == "video.generate":
             return ConversationAction.VIDEO_GENERATE
+        if (conversation.domain == "comic" and plan.intent == "comic_production") or (
+            conversation.domain == "commerce" and plan.intent == "commerce_production"
+        ):
+            return ConversationAction.WORKFLOW_START
         return ConversationAction.CHOOSE_DOMAIN
     if confirmed and conversation.domain in {"comic", "commerce"}:
         return ConversationAction.WORKFLOW_START

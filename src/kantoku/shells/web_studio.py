@@ -634,6 +634,18 @@ class StudioApplication:
             conversation_id, title=cleaned,
         ).model_dump(mode="json")
 
+    def set_fast_domain(
+        self, conversation_id: str, domain: str | None,
+    ) -> dict[str, Any]:
+        conversation = self.runtime_store.get_conversation(conversation_id)
+        if conversation.interaction_mode is not InteractionMode.AUTONOMOUS:
+            raise ToolError("专业创作域不能在首页切换快捷模式")
+        if domain not in {None, "comic", "commerce", "studio"}:
+            raise ToolError("不支持的首页创作域快捷模式")
+        return self.runtime_store.set_conversation_domain(
+            conversation_id, domain,
+        ).model_dump(mode="json")
+
     def delete_conversation(self, conversation_id: str) -> dict[str, bool]:
         self.runtime_store.delete_conversation(conversation_id)
         return {"deleted": True}
@@ -643,8 +655,7 @@ class StudioApplication:
         # A reopened home chat keeps querying its persisted provider job. The
         # idempotent image service only reconciles an already submitted request.
         jobs = (self.runtime_store.list_media_jobs(conversation_id)
-                if conversation.interaction_mode == InteractionMode.AUTONOMOUS
-                and conversation.domain is None else [])
+                if conversation.interaction_mode == InteractionMode.AUTONOMOUS else [])
         for job in jobs:
             if job.status not in {MediaJobStatus.PENDING, MediaJobStatus.GENERATING}:
                 continue
@@ -676,7 +687,6 @@ class StudioApplication:
         if not content:
             raise ToolError("消息内容不能为空")
         if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
-                and conversation.domain is None
                 and content.strip().rstrip("。！! ") in {"继续任务", "继续生图", "继续刚才的任务"}):
             yield from self._resume_home_image(conversation_id, content)
             return
@@ -691,8 +701,7 @@ class StudioApplication:
         )
         creative_decision: CreativeDecision | None = None
         prior_image: CreativeContext | None = None
-        if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
-                and conversation.domain is None):
+        if conversation.interaction_mode == InteractionMode.AUTONOMOUS:
             prior_image = self._recent_image_context(conversation_id)
             creative_decision = plan_creative_turn(
                 content, prior_image, trace_id=trace_id,
@@ -929,7 +938,6 @@ class StudioApplication:
             yield "done", {"generation_request_id": generation_request_id}
             return
         if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
-                and conversation.domain is None
                 and action is ConversationAction.CHAT
                 and any(cue in content for cue in (
                     "图片在哪里", "图片在哪", "图在哪里", "图在哪", "刚才的图呢",
@@ -964,7 +972,13 @@ class StudioApplication:
             yield "done", {"run_id": None}
             return
         if action is ConversationAction.CHOOSE_DOMAIN:
-            text = "这项专业制作需要先进入相应创作域；首页不会擅自启动完整工作流。"
+            text = (
+                "这项需求不属于当前快捷模式。可在输入框左下角的“+”切换到相应创作域；"
+                "需要逐步控制时再进入专业创作页。"
+                if not guided and conversation.domain else
+                "可在输入框左下角的“+”选择创作域快捷模式，留在当前聊天继续；"
+                "需要逐步控制时再进入专业创作页。"
+            )
             message = self.runtime_store.add_conversation_message(
                 conversation_id, role=MessageRole.ASSISTANT,
                 type=MessageType.TEXT, content=text,
@@ -974,19 +988,25 @@ class StudioApplication:
             yield "done", {"run_id": None}
             return
         history = self.runtime_store.list_conversation_messages(conversation_id)[-16:]
-        # 只有 Guided 域能进入 Graph；首页简单生图已在上方直接交给共享能力。
+        # 首页简单生图走共享能力；选定领域的复杂请求复用同一个 Graph。
         target_domain = conversation.domain
         execute = action is ConversationAction.WORKFLOW_START
         run: dict[str, Any] | None = None
         if execute and target_domain:
             requirement = _guided_requirement(history) if guided else content
             if target_domain == "commerce":
-                requested_mode = str(data.get("data_mode") or self.commerce_settings.data_mode)
+                requested_mode = (
+                    "demo" if not guided else
+                    str(data.get("data_mode") or self.commerce_settings.data_mode)
+                )
                 if requested_mode not in {"demo", "production"}:
                     raise ToolError("电商数据模式无效")
+                if not guided and self.commerce_settings.image_mode != "mock":
+                    raise ToolError("电商快速体验暂不支持自动执行真实付费生图")
                 state: dict[str, Any] = {
                     "requirement": requirement, "locale": "ru-RU",
                     "data_mode": requested_mode,
+                    "execution_mode": "professional" if guided else "fast",
                 }
                 domain = "commerce"
             else:
@@ -1000,16 +1020,39 @@ class StudioApplication:
                     "prompt": prompt, "shot_no": 1,
                     "estimate_fen": budget.estimate_image_fen(),
                     "image_count": _image_count(requirement),
+                    # Comic Graph is a professional multi-step production, not
+                    # the single-image home capability. Its paid step still
+                    # needs the existing cost approval in either mode.
                     "confirmed": False,
                 }
                 domain = "comic"
-            run = self.enqueue_core_run({"domain": domain, "state": state})
+            run = self.enqueue_core_run({
+                "domain": domain, "state": state,
+                "interaction_mode": "guided" if guided else "autonomous",
+            })
             self.runtime_store.update_conversation(
                 conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
             )
             yield "run", run
         model_history = history[-1:] if execute else history
-        if execute:
+        if execute and not guided:
+            status = (
+                "已在当前聊天启动电商快速体验（Mock 商品与 Marketplace）。"
+                "实际进度和产物会显示在这里。"
+                if target_domain == "commerce" else
+                "已在当前聊天启动漫剧快速创作。实际进度和产物会显示在这里。"
+            )
+            for delta in _brief_deltas(status):
+                yield "delta", {"content": delta}
+            assistant = self.runtime_store.add_conversation_message(
+                conversation_id, role=MessageRole.ASSISTANT,
+                type=MessageType.PLAN, content=status,
+                run_id=run["id"] if run else None,
+            )
+            yield "message", assistant.model_dump(mode="json")
+            yield "done", {"run_id": run["id"] if run else None}
+            return
+        elif execute:
             instruction = (
                 "本次需求已创建真实生产任务。"
                 "用一两句话说明接下来会发生什么：需要付费的步骤会弹出审批卡片，"
@@ -1057,6 +1100,7 @@ class StudioApplication:
         message_type = MessageType.PLAN if execute else MessageType.TEXT
         assistant = self.runtime_store.add_conversation_message(
             conversation_id, role=MessageRole.ASSISTANT, type=message_type, content=complete,
+            run_id=run["id"] if run else None,
         )
         yield "message", assistant.model_dump(mode="json")
         yield "done", {"run_id": run["id"] if run else None}
@@ -1377,15 +1421,20 @@ class StudioApplication:
     def enqueue_core_run(self, data: dict[str, Any]) -> dict[str, Any]:
         """Create a visible Run immediately and execute it on the bounded worker pool."""
         domain = str(data.get("domain", "")).strip().lower()
+        interaction_mode = InteractionMode(str(data.get("interaction_mode", "guided")))
         if domain == "comic":
             state = ComicState.model_validate(data.get("state", data))
-            run = self.runtime.create(COMIC_WORKFLOW_ID, state)
+            run = self.runtime.create(
+                COMIC_WORKFLOW_ID, state, interaction_mode=interaction_mode,
+            )
         elif domain == "commerce":
             raw_state = dict(data.get("state", data))
             raw_state.setdefault("max_reworks", self.runtime_settings.max_reworks)
             raw_state.setdefault("data_mode", self.commerce_settings.data_mode)
             state = CommerceState.model_validate(raw_state)
-            run = self.runtime.create(COMMERCE_WORKFLOW_ID, state)
+            run = self.runtime.create(
+                COMMERCE_WORKFLOW_ID, state, interaction_mode=interaction_mode,
+            )
         else:
             raise ToolError("不支持的 Domain Pack", detail=domain)
 
@@ -1909,7 +1958,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         or not 0 < length <= 4096:
                     raise ToolError("请求格式不合法")
                 data = json.loads(self.rfile.read(length))
-                self.json_reply(200, app.rename_conversation(parts[2], str(data["title"])))
+                if set(data) == {"fast_domain"}:
+                    self.json_reply(200, app.set_fast_domain(parts[2], data["fast_domain"]))
+                elif set(data) == {"title"}:
+                    self.json_reply(200, app.rename_conversation(parts[2], str(data["title"])))
+                else:
+                    raise ToolError("对话更新字段不合法")
             except (ValueError, KeyError, KantokuError) as error:
                 self.error_reply(400, error)
 

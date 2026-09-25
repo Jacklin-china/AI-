@@ -349,6 +349,18 @@ class RuntimeStore:
             )
         return self.get_conversation(conversation_id)
 
+    def set_conversation_domain(
+        self, conversation_id: str, domain: str | None,
+    ) -> ConversationRecord:
+        """Change only the selected context; keep the conversation and its history."""
+        self.get_conversation(conversation_id)
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET domain=?,updated_at=? WHERE id=?",
+                (domain, utc_now().isoformat(), conversation_id),
+            )
+        return self.get_conversation(conversation_id)
+
     def delete_conversation(self, conversation_id: str) -> None:
         """Hide only the conversation; Runs, artifacts and ledgers remain untouched."""
         self.get_conversation(conversation_id)
@@ -627,7 +639,8 @@ class RuntimeStore:
                 connection.commit()
 
     def create_run(
-        self, domain: str, workflow: str, state: dict[str, Any], current_node: str
+        self, domain: str, workflow: str, state: dict[str, Any], current_node: str,
+        *, interaction_mode: InteractionMode = InteractionMode.GUIDED,
     ) -> RunRecord:
         """创建待执行 Run。"""
         now = utc_now()
@@ -639,9 +652,10 @@ class RuntimeStore:
         with self._connect() as connection:
             connection.execute(
                 "INSERT INTO runs(id,domain,workflow,status,state_json,current_node,"
-                "started_at,updated_at,cost_fen) VALUES (?,?,?,?,?,?,?,?,?)",
+                "started_at,updated_at,cost_fen,interaction_mode) "
+                "VALUES (?,?,?,?,?,?,?,?,?,?)",
                 (record.id, domain, workflow, record.status, _dump(state), current_node,
-                 now.isoformat(), now.isoformat(), 0),
+                 now.isoformat(), now.isoformat(), 0, interaction_mode.value),
             )
         return record
 

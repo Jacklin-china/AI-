@@ -257,6 +257,19 @@ export async function renameConversation(id: string, title: string): Promise<Con
   return response.json() as Promise<Conversation>
 }
 
+export async function setConversationFastDomain(
+  id: string, domain: 'comic' | 'commerce' | 'studio' | null,
+): Promise<Conversation> {
+  await ensureToken()
+  const response = await fetch(api(`/api/conversations/${encodeURIComponent(id)}`), {
+    method: 'PATCH',
+    headers: { 'Content-Type': 'application/json', 'X-Studio-Token': token },
+    body: JSON.stringify({ fast_domain: domain }),
+  })
+  if (!response.ok) throw await apiFailure(response, '切换快捷模式失败')
+  return response.json() as Promise<Conversation>
+}
+
 export async function deleteConversation(id: string): Promise<void> {
   await ensureToken()
   const response = await fetch(api(`/api/conversations/${encodeURIComponent(id)}`), {
