@@ -60,6 +60,7 @@ from kantoku.core.conversations import (
     IntentPlan,
     IntentPlanner,
     InteractionMode,
+    MediaJobRecord,
     MediaJobStatus,
     MessageRole,
     MessageType,
@@ -382,6 +383,7 @@ class StudioApplication:
         self.runner = TaskRunner(max_workers=2)
         self._media_futures: dict[str, Any] = {}
         self._media_futures_lock = threading.Lock()
+        self._media_poll_at: dict[str, float] = {}
         self.intent_planner = IntentPlanner()
         self._legacy_home_run_ids: set[str] | None = None
         self._recover_media_jobs()
@@ -464,41 +466,106 @@ class StudioApplication:
                 self._media_futures[generation_request_id] = future
             return future
 
+    def _recover_media_job(self, job: MediaJobRecord) -> None:
+        """Resume one persisted request, retaining its provider job and budget identity."""
+        saved = self.runtime_store.get_conversation_generation(job.generation_request_id)
+        reservation = budget.get_reservation(job.generation_request_id)
+        if saved is None and reservation is not None:
+            self.runtime_store.update_media_job(
+                job.generation_request_id, MediaJobStatus.FAILED,
+                error_message="提交记录缺少原始提示词，需要人工对账；不会重新付费提交。",
+            )
+            return
+        history = self.runtime_store.list_conversation_messages(
+            job.conversation_id, include_deleted=True,
+        )
+        user = next((item for item in history if item.id == job.user_message_id), None)
+        requirement = _image_requirement(user.content, history) if user else None
+        if saved is not None:
+            saved_context = json.loads(saved["context_json"])
+            if isinstance(saved_context, dict) and saved_context.get("subject"):
+                requirement = str(saved_context["subject"])
+        if requirement is None:
+            self.runtime_store.update_media_job(
+                job.generation_request_id, MediaJobStatus.FAILED,
+                error_message="原生图需求缺失；请查看日志，不会重复提交。",
+            )
+            return
+        estimate_fen = reservation.est_fen if reservation else budget.quote_image_price(
+            count=1
+        ).total_fen
+        self._start_media_job(
+            job.conversation_id, job.user_message_id, job.generation_request_id,
+            requirement, saved["prompt"] if saved else None, estimate_fen,
+            f"trace-recovery-{uuid4().hex[:12]}",
+            saved["reference_artifact_id"] if saved else None,
+        )
+
     def _recover_media_jobs(self) -> None:
         """Restart only the same idempotent request; never invent a new paid submission."""
         for job in self.runtime_store.list_unfinished_media_jobs():
-            saved = self.runtime_store.get_conversation_generation(job.generation_request_id)
-            reservation = budget.get_reservation(job.generation_request_id)
-            if saved is None and reservation is not None:
-                self.runtime_store.update_media_job(
-                    job.generation_request_id, MediaJobStatus.FAILED,
-                    error_message="提交记录缺少原始提示词，需要人工对账；不会重新付费提交。",
-                )
-                continue
-            history = self.runtime_store.list_conversation_messages(
-                job.conversation_id, include_deleted=True,
+            self._recover_media_job(job)
+
+    def _resume_home_image(self, conversation_id: str, content: str) -> Any:
+        """Report or resume the latest Conversation image without creating another job."""
+        jobs = [job for job in self.runtime_store.list_media_jobs(conversation_id)
+                if job.media_type == "image"]
+        unfinished = next((job for job in reversed(jobs) if job.status in {
+            MediaJobStatus.PENDING, MediaJobStatus.GENERATING,
+        }), None)
+        job = unfinished or (jobs[-1] if jobs else None)
+        self.runtime_store.add_conversation_message(
+            conversation_id, role=MessageRole.USER, type=MessageType.TEXT, content=content,
+        )
+        yield "intent", IntentPlan(
+            intent="image.resume", needs_execution=False, confidence=1,
+        ).model_dump(mode="json")
+        if job is None:
+            message = self.runtime_store.add_conversation_message(
+                conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
+                content="这个聊天里没有待继续的图片任务。直接描述想画的内容即可。",
             )
-            user = next((item for item in history if item.id == job.user_message_id), None)
-            requirement = _image_requirement(user.content, history) if user else None
-            if saved is not None:
-                saved_context = json.loads(saved["context_json"])
-                if isinstance(saved_context, dict) and saved_context.get("subject"):
-                    requirement = str(saved_context["subject"])
-            if requirement is None:
-                self.runtime_store.update_media_job(
-                    job.generation_request_id, MediaJobStatus.FAILED,
-                    error_message="原生图需求缺失；请查看日志，不会重复提交。",
+            yield "message", message.model_dump(mode="json")
+            yield "done", {"generation_request_id": None}
+            return
+        if unfinished is not None:
+            self._recover_media_job(job)
+            job = self.runtime_store.get_media_job(job.generation_request_id)
+            if job is not None and job.status in {
+                MediaJobStatus.PENDING, MediaJobStatus.GENERATING,
+            }:
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT, type=MessageType.STATUS,
+                    content="正在继续查询之前的图片任务，完成后会显示在当前聊天。",
                 )
-                continue
-            estimate_fen = reservation.est_fen if reservation else budget.quote_image_price(
-                count=1
-            ).total_fen
-            self._start_media_job(
-                job.conversation_id, job.user_message_id, job.generation_request_id,
-                requirement, saved["prompt"] if saved else None, estimate_fen,
-                f"trace-recovery-{uuid4().hex[:12]}",
-                saved["reference_artifact_id"] if saved else None,
-            )
+                yield "image_generating", {"generation_request_id": job.generation_request_id}
+                yield "message", message.model_dump(mode="json")
+                yield "done", {"generation_request_id": job.generation_request_id}
+                return
+        if job is not None and job.status == MediaJobStatus.COMPLETED and job.artifact_id:
+            artifact = self.runtime_store.get_artifact(job.artifact_id)
+            if (artifact.conversation_id == conversation_id and artifact.status == "ready"
+                    and artifact.location and Path(artifact.location).is_file()):
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.ARTIFACT, artifact_id=artifact.id,
+                    content="这是之前任务生成的图片。",
+                )
+                yield "image_ready", {
+                    "generation_request_id": job.generation_request_id,
+                    "artifact_id": artifact.id,
+                }
+                yield "message", message.model_dump(mode="json")
+                yield "done", {"generation_request_id": job.generation_request_id}
+                return
+        message = self.runtime_store.add_conversation_message(
+            conversation_id, role=MessageRole.ASSISTANT, type=MessageType.ERROR,
+            content=(job.error_message if job and job.error_message else
+                     "之前的图片任务未能完成；不会自动重新付费提交。"),
+        )
+        yield "image_failed", {"generation_request_id": job.generation_request_id}
+        yield "message", message.model_dump(mode="json")
+        yield "done", {"generation_request_id": job.generation_request_id}
 
     def _recent_image_context(self, conversation_id: str) -> CreativeContext | None:
         """Use only a completed, local Artifact from this conversation as visual context."""
@@ -572,7 +639,23 @@ class StudioApplication:
         return {"deleted": True}
 
     def conversation(self, conversation_id: str) -> dict[str, Any]:
-        result = self.runtime_store.get_conversation(conversation_id).model_dump(mode="json")
+        conversation = self.runtime_store.get_conversation(conversation_id)
+        # A reopened home chat keeps querying its persisted provider job. The
+        # idempotent image service only reconciles an already submitted request.
+        jobs = (self.runtime_store.list_media_jobs(conversation_id)
+                if conversation.interaction_mode == InteractionMode.AUTONOMOUS
+                and conversation.domain is None else [])
+        for job in jobs:
+            if job.status not in {MediaJobStatus.PENDING, MediaJobStatus.GENERATING}:
+                continue
+            now = time.monotonic()
+            with self._media_futures_lock:
+                last_poll = self._media_poll_at.get(job.generation_request_id, 0.0)
+                if now - last_poll < 3.0:
+                    continue
+                self._media_poll_at[job.generation_request_id] = now
+            self._recover_media_job(job)
+        result = conversation.model_dump(mode="json")
         result["messages"] = [
             item.model_dump(mode="json")
             for item in self.runtime_store.list_conversation_messages(conversation_id)
@@ -592,6 +675,11 @@ class StudioApplication:
         content = str(data.get("content", "")).strip()
         if not content:
             raise ToolError("消息内容不能为空")
+        if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
+                and conversation.domain is None
+                and content.strip().rstrip("。！! ") in {"继续任务", "继续生图", "继续刚才的任务"}):
+            yield from self._resume_home_image(conversation_id, content)
+            return
         hint = str(data.get("domain_hint") or conversation.domain or "") or None
         conversation_history = self.runtime_store.list_conversation_messages(conversation_id)
         history_before = conversation_history[-16:]

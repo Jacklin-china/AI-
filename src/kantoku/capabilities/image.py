@@ -79,7 +79,9 @@ class ConversationImageService:
                 conversation_id, role=MessageRole.ASSISTANT,
                 type=MessageType.STATUS if unknown else MessageType.ERROR,
                 content=(
-                    "原生成请求仍待查询或对账；不会重复提交或扣费。"
+                    ("原请求状态未知且缺少供应商任务 ID，需要人工对账；不会重复提交或扣费。"
+                     if not result.provider_job_id else
+                     "原生成请求仍在查询，稍后可说‘继续任务’；不会重复提交或扣费。")
                     if unknown else "这次生图未完成；不会自动重新付费提交。"
                 ),
                 event_id=f"generation-status:{generation_request_id}:{result.status}",

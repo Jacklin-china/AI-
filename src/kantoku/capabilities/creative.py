@@ -51,8 +51,12 @@ class CreativeDecision:
 _FOLLOWUP = (
     "再来", "再画", "再生成", "重新生成", "换成", "改成", "换个", "换一", "保持",
     "不变", "一样", "类似", "参考上一", "沿用", "把", "做成", "重做",
+    "我是说", "我说的是", "应该是",
 )
-_REFERENCE = ("一样", "类似", "保持", "不变", "参考", "沿用", "改", "换", "把")
+_REFERENCE = (
+    "一样", "类似", "保持", "不变", "参考", "沿用", "改", "换", "把",
+    "我是说", "我说的是", "应该是",
+)
 _QUESTION = ("哪里", "在哪", "为什么", "是什么", "什么意思", "怎么", "如何", "吗？", "吗?")
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
 
@@ -78,7 +82,7 @@ def _text(value: Any) -> str:
 
 def _initial_subject(request: str) -> str:
     subject = re.sub(
-        r"^(?:请|麻烦)?(?:再|重新)?(?:帮我|给我|为我)?"
+        r"^(?:(?:我是说|我说的是|应该是)|(?:请|麻烦)?(?:再|重新)?(?:帮我|给我|为我)?)"
         r"(?:生成|画|绘制|制作|来|给)?(?:一张|一个|一幅|张)?",
         "", request.strip(), count=1,
     ).strip("，。！! ")
@@ -168,14 +172,19 @@ def plan_creative_turn(
     explicit_change = re.search(r"(?:换成|改成)([^，。；;]{1,40})", request)
     if not explicit_change:
         explicit_change = re.search(r"把([^，。；;]{1,30}?)(?:的|做成|改成|换成)", request)
+    if not explicit_change:
+        explicit_change = re.search(r"(?:我是说|我说的是|应该是)([^，。；;]{1,50})", request)
     change_subject = _text(explicit_change.group(1)) if explicit_change else ""
     if any(cue in request for cue in ("换个人物", "换一个人物", "换个人")):
         change_subject = "与上一张不同的新人物"
-    subject = (
-        proposed_subject if proposed_subject and (
-            proposed_subject in request or (previous and proposed_subject == previous.subject)
-        ) else change_subject or inherited.subject or request.strip()[:180]
-    )
+    if change_subject:
+        subject = change_subject
+    elif proposed_subject and (
+        proposed_subject in request or (previous and proposed_subject == previous.subject)
+    ):
+        subject = proposed_subject
+    else:
+        subject = inherited.subject or _initial_subject(request)[:180]
     background_change = re.search(
         r"背景(?:换成|改成|设为|变成|为|是)([^，。；;]{1,32})", request,
     )
@@ -237,6 +246,21 @@ def compile_image_prompt(
 
 
 def creative_brief(decision: CreativeDecision) -> str:
+    """Describe the planned image in user language, without parroting the command."""
+    subject = decision.subject.strip() or _initial_subject(decision.request)
     if decision.use_reference:
-        return f"我会参考当前聊天中的上一张图片，按你的要求调整：{decision.request.strip()}。"
-    return f"我会直接生成图片：{decision.request.strip()}。"
+        opening = f"我会沿用上一张图的画面基础，以{subject}为这次的主体"
+    else:
+        opening = f"我理解这次要呈现的是{subject}"
+    details = []
+    if decision.style:
+        details.append(f"采用{decision.style}画风")
+    elif any(word in subject for word in ("角色", "国王", "动画", "动漫", "卡通")):
+        details.append("突出角色辨识度与卡通感")
+    else:
+        details.append("保持主体清楚、画面自然")
+    if decision.composition:
+        details.append(f"以{decision.composition}呈现")
+    if decision.background:
+        details.append(f"背景保留{decision.background}")
+    return f"{opening}，{'，'.join(details)}。"

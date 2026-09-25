@@ -33,7 +33,7 @@ interface QueuedMessage { id: string; conversationId: string; content: string; d
 const inlineRuns = ref<Record<string, InlineRunState>>({})
 const pendingMessages = ref<Record<string, 'queued' | 'replying' | 'failed'>>({})
 const activityByMessage = ref<Record<string, string>>({})
-const messageMedia = ref<Record<string, { type: 'image' | 'video'; url: string }>>({})
+const messageMedia = ref<Record<string, { type: 'image' | 'video'; url: string; filename: string }>>({})
 const messageMediaErrors = ref<Record<string, boolean>>({})
 const imagePhases = ref<Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>>({})
 const streamingByMessage = ref<Record<string, string>>({})
@@ -79,7 +79,7 @@ async function selectConversation(id: string): Promise<void> {
   messages.value = detail.messages ?? []
   restoreMediaJobs(detail.media_jobs ?? [])
   if (mediaJobs.value.some((job) => job.status === 'pending' || job.status === 'generating')) {
-    mediaPollTimer = setInterval(() => { void refreshActiveMedia(id) }, 1200)
+    startMediaPolling(id)
   }
   for (const message of messages.value) if (message.artifact_id) void loadMessageMedia(message, id)
   streaming.value = ''
@@ -98,6 +98,10 @@ async function selectConversation(id: string): Promise<void> {
       if (anchor) followHomeRun(activeRun.value, anchor)
     }
   }
+}
+
+function startMediaPolling(ownerId: string): void {
+  if (!mediaPollTimer) mediaPollTimer = setInterval(() => { void refreshActiveMedia(ownerId) }, 1200)
 }
 
 function restoreMediaJobs(jobs: MediaJob[]): void {
@@ -120,6 +124,7 @@ async function refreshActiveMedia(ownerId: string): Promise<void> {
   try {
     const detail = await getConversation(ownerId)
     if (!detail || conversationId.value !== ownerId) return
+    if (error.value === '连接中断，正在恢复图片任务状态。') error.value = ''
     restoreMediaJobs(detail.media_jobs ?? [])
     const persisted = detail.messages ?? []
     const pendingLocal = messages.value.filter((message) =>
@@ -137,7 +142,7 @@ async function refreshActiveMedia(ownerId: string): Promise<void> {
       mediaPollTimer = null
     }
   } catch (pollError) {
-    if (conversationId.value === ownerId) error.value = pollError instanceof Error ? pollError.message : '无法更新图片状态'
+    if (conversationId.value === ownerId && !error.value) error.value = pollError instanceof Error ? pollError.message : '无法更新图片状态'
   }
 }
 
@@ -162,7 +167,10 @@ async function loadMessageMedia(message: ConversationMessage, ownerId: string): 
     }
     messageMedia.value = {
       ...messageMedia.value,
-      [message.id]: { type: artifact.type as 'image' | 'video', url },
+      [message.id]: {
+        type: artifact.type as 'image' | 'video', url,
+        filename: `kantoku-${artifact.id}.${artifact.location?.match(/\.(png|jpe?g|webp)$/i)?.[1]?.toLowerCase() ?? 'png'}`,
+      },
     }
   } finally {
     loadingMedia.delete(loadingKey)
@@ -334,7 +342,9 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
           }
         },
         onImageEvent: (name, event) => {
-          if (conversationId.value !== task.conversationId || event.generation_request_id !== task.id) return
+          if (conversationId.value !== task.conversationId) return
+          if (name === 'image_generating') startMediaPolling(task.conversationId)
+          if (event.generation_request_id !== task.id) return
           if (name === 'prompt_prepared' || name === 'image_generating') {
             imagePhases.value = { ...imagePhases.value, [task.id]: {
               status: name === 'prompt_prepared' ? 'prepared' : 'generating',
@@ -352,12 +362,13 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
       }, dataMode.value, enhancePrompt.value, task.id)
     const next = { ...pendingMessages.value }; delete next[task.id]; pendingMessages.value = next
   } catch (taskError) {
+    const imageStarted = imagePhases.value[task.id]?.status === 'prepared' || imagePhases.value[task.id]?.status === 'generating'
     if (conversationId.value === task.conversationId) {
-      error.value = taskError instanceof Error ? taskError.message : '消息没有发送成功'
+      error.value = imageStarted ? '连接中断，正在恢复图片任务状态。' : taskError instanceof Error ? taskError.message : '消息没有发送成功'
       errorMessageId.value = task.id
     }
-    pendingMessages.value = { ...pendingMessages.value, [task.id]: 'failed' }
-    if (imagePhases.value[task.id]) imagePhases.value = { ...imagePhases.value, [task.id]: { ...imagePhases.value[task.id], status: 'failed' } }
+    pendingMessages.value = { ...pendingMessages.value, [task.id]: imageStarted ? 'replying' : 'failed' }
+    if (imageStarted) startMediaPolling(task.conversationId)
     const nextActivity = { ...activityByMessage.value }; delete nextActivity[task.id]; activityByMessage.value = nextActivity
   } finally {
     const nextStreaming = { ...streamingByMessage.value }

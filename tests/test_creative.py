@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from kantoku.capabilities.creative import (
     CreativeContext,
     compile_image_prompt,
+    creative_brief,
     plan_creative_turn,
 )
 
@@ -75,3 +76,21 @@ def test_untemplated_first_request_can_be_understood_as_image() -> None:
     )
     assert decision.action == "image.generate"
     assert "想看一座赛博朋克城市" in compile_image_prompt(decision, None)
+
+
+def test_correction_brief_explains_interpretation_instead_of_echoing_request() -> None:
+    previous = CreativeContext(subject="另一只动物", artifact_id="artifact-prior")
+    decision = plan_creative_turn(
+        "我是说熊出没的吉吉国王", previous, trace_id="trace-brief-correction",
+        classify=lambda *_args, **_kwargs: SimpleNamespace(content=(
+            '{"action":"image.edit","subject":"其他人物",'
+            '"style":"卡通动画","use_reference":true}'
+        )),
+    )
+    brief = creative_brief(decision)
+    assert decision.action == "image.edit"
+    assert decision.subject == "熊出没的吉吉国王"
+    assert "吉吉国王" in brief and "卡通动画" in brief
+    assert "我是说熊出没的吉吉国王" not in brief
+    assert "其他人物" not in brief
+    assert "我是说熊出没的吉吉国王" in compile_image_prompt(decision, previous)

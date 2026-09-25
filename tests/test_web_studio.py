@@ -1220,6 +1220,133 @@ def test_home_image_edit_restart_preserves_reference_without_resubmission(
     assert query_count == 2
 
 
+def test_continue_task_resumes_same_image_job_and_reopens_real_artifact(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    original_query = provider.query
+    allow_query = threading.Event()
+    query_count = 0
+
+    def pending_then_complete(provider_job_id: str) -> ImageGenerationResult:
+        nonlocal query_count
+        query_count += 1
+        if query_count == 1:
+            return ImageGenerationResult(
+                path=None, provider_job_id=provider_job_id,
+                status="unknown", actual_fen=None, error="still processing",
+            )
+        assert allow_query.wait(5)
+        return original_query(provider_job_id)
+
+    monkeypatch.setattr(provider, "query", pending_then_complete)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    first = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成熊大的卡通头像",
+        "generation_request_id": "generation-resume-command",
+    }))
+    assert not any(name == "image_ready" for name, _ in first)
+    resumed = list(app.stream_conversation(conversation["id"], {"content": "继续任务"}))
+    assert any(name == "image_generating" for name, _ in resumed)
+    assert provider.submit_count == 1
+    assert len(app.runtime_store.list_media_jobs(conversation["id"])) == 1
+    allow_query.set()
+    for _ in range(50):
+        if app.runtime_store.get_media_job("generation-resume-command").status == (
+            MediaJobStatus.COMPLETED
+        ):
+            break
+        time.sleep(0.05)
+    completed = list(app.stream_conversation(conversation["id"], {"content": "继续任务"}))
+    artifact_id = next(payload["artifact_id"] for name, payload in completed
+                       if name == "image_ready")
+    assert app.runtime_store.get_artifact(artifact_id).location is not None
+    assert provider.submit_count == 1
+    assert len(app.runtime_store.list_media_jobs(conversation["id"])) == 1
+
+
+def test_continue_task_reports_persisted_failure_without_resubmitting(
+    app: web_studio.StudioApplication,
+) -> None:
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    user = app.runtime_store.add_conversation_message(
+        conversation["id"], role=MessageRole.USER, type=MessageType.TEXT,
+        content="帮我生成一张头像",
+    )
+    app.runtime_store.create_media_job("generation-failed-resume", conversation["id"], user.id)
+    app.runtime_store.update_media_job(
+        "generation-failed-resume", MediaJobStatus.FAILED,
+        error_message="供应商返回失败；没有生成图片。",
+    )
+    resumed = list(app.stream_conversation(conversation["id"], {"content": "继续任务"}))
+    assert any(name == "image_failed" for name, _ in resumed)
+    assert any(name == "message" and "供应商返回失败" in payload["content"]
+               for name, payload in resumed)
+    assert app.image_service.provider.submit_count == 0
+
+
+def test_continue_task_never_resubmits_unknown_provider_request_without_task_id(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    submits = 0
+
+    def uncertain_submit(**_kwargs: object) -> str:
+        nonlocal submits
+        submits += 1
+        raise TimeoutError("provider response lost")
+
+    monkeypatch.setattr(provider, "submit", uncertain_submit)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    first = list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成一张头像",
+        "generation_request_id": "generation-resume-unknown-id",
+    }))
+    assert any(name == "image_failed" for name, _ in first)
+    resumed = list(app.stream_conversation(conversation["id"], {"content": "继续任务"}))
+    assert any(name == "image_failed" for name, _ in resumed)
+    assert any(name == "message" and "人工对账" in payload["content"]
+               for name, payload in resumed)
+    assert submits == 1
+
+
+def test_reopened_chat_keeps_polling_existing_provider_job_until_ready(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = app.image_service.provider
+    original_query = provider.query
+    query_count = 0
+
+    def processing_twice(provider_job_id: str) -> ImageGenerationResult:
+        nonlocal query_count
+        query_count += 1
+        if query_count < 3:
+            return ImageGenerationResult(
+                path=None, provider_job_id=provider_job_id,
+                status="unknown", actual_fen=None, error="still processing",
+            )
+        return original_query(provider_job_id)
+
+    monkeypatch.setattr(provider, "query", processing_twice)
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    request_id = "generation-auto-poll"
+    list(app.stream_conversation(conversation["id"], {
+        "content": "帮我生成熊大的卡通头像", "generation_request_id": request_id,
+    }))
+    assert app.runtime_store.get_media_job(request_id).status == MediaJobStatus.GENERATING
+    app.conversation(conversation["id"])
+    app._media_futures[request_id].result(timeout=5)
+    assert app.runtime_store.get_media_job(request_id).status == MediaJobStatus.GENERATING
+    app._media_poll_at[request_id] = 0.0  # Advance the test past the polling throttle.
+    app.conversation(conversation["id"])
+    app._media_futures[request_id].result(timeout=5)
+    detail = app.conversation(conversation["id"])
+    assert detail["media_jobs"][0]["status"] == "completed"
+    assert any(message["artifact_id"] for message in detail["messages"])
+    assert provider.submit_count == 1
+    assert query_count == 3
+
+
 def test_task_history_hides_legacy_home_run_but_keeps_guided_run(
     app: web_studio.StudioApplication,
 ) -> None:

@@ -26,7 +26,7 @@ const props = defineProps<{
   pendingMessages?: Record<string, 'queued' | 'replying' | 'failed'>
   activityByMessage?: Record<string, string>
   imagePhases?: Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>
-  messageMedia?: Record<string, { type: 'image' | 'video'; url: string }>
+  messageMedia?: Record<string, { type: 'image' | 'video'; url: string; filename: string }>
   messageMediaErrors?: Record<string, boolean>
   mediaJobs?: MediaJob[]
   inlineRuns?: Record<string, InlineRunState>
@@ -37,7 +37,18 @@ defineEmits<{
   decideInline: [messageId: string, action: 'approve' | 'reject' | 'revise', response: Record<string, unknown>]
 }>()
 const scroller = ref<HTMLElement | null>(null)
+const previewDialog = ref<HTMLDialogElement | null>(null)
+const previewImage = ref<{ url: string; filename: string } | null>(null)
 const atBottom = ref(true)
+async function openImage(media: { url: string; filename: string }): Promise<void> {
+  previewImage.value = media
+  await nextTick()
+  previewDialog.value?.showModal()
+}
+function closeImage(): void { previewDialog.value?.close(); previewImage.value = null }
+watch(() => props.messageMedia, (media) => {
+  if (previewImage.value && !Object.values(media ?? {}).some((item) => item.url === previewImage.value?.url)) closeImage()
+})
 function check(): void { const el = scroller.value; if (el) atBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 72 }
 function bottom(smooth = false): void { scroller.value?.scrollTo({ top: scroller.value.scrollHeight, behavior: smooth ? 'smooth' : 'auto' }) }
 
@@ -209,7 +220,8 @@ function activityText(event: RuntimeEvent): string {
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
           <template v-if="imageResult(imageRequestId(message)!)?.artifact_id">
             <figure v-if="messageMedia?.[imageResult(imageRequestId(message)!)!.id]" class="chat-generated-image">
-              <img :src="messageMedia[imageResult(imageRequestId(message)!)!.id].url" alt="此聊天生成的图片" />
+              <button type="button" class="chat-image-open" aria-label="放大查看生成的图片" @click="openImage(messageMedia[imageResult(imageRequestId(message)!)!.id])"><img :src="messageMedia[imageResult(imageRequestId(message)!)!.id].url" alt="此聊天生成的图片" /></button>
+              <figcaption class="chat-image-actions"><span>生成的图片</span><a :href="messageMedia[imageResult(imageRequestId(message)!)!.id].url" :download="messageMedia[imageResult(imageRequestId(message)!)!.id].filename">下载原图</a></figcaption>
             </figure>
             <p v-else-if="messageMediaErrors?.[imageResult(imageRequestId(message)!)!.id]" class="chat-image-load-error" role="alert">图片已保存，但预览暂时无法加载。</p>
             <div v-else class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="status" aria-label="正在载入图片"></div>
@@ -224,9 +236,9 @@ function activityText(event: RuntimeEvent): string {
         </div>
         <p v-if="homeMode && activityByMessage?.[message.id]" class="chat-inline-status chat-direct-status">{{ activityByMessage[message.id] }}</p>
         <figure v-if="homeMode && messageMedia?.[message.id] && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
-          <img v-if="messageMedia[message.id].type === 'image'" :src="messageMedia[message.id].url" alt="此聊天生成的图片" />
+          <button v-if="messageMedia[message.id].type === 'image'" type="button" class="chat-image-open" aria-label="放大查看生成的图片" @click="openImage(messageMedia[message.id])"><img :src="messageMedia[message.id].url" alt="此聊天生成的图片" /></button>
           <video v-else :src="messageMedia[message.id].url" controls preload="metadata" />
-          <figcaption>{{ messageMedia[message.id].type === 'image' ? '生成的图片' : '生成的视频' }}</figcaption>
+          <figcaption class="chat-image-actions"><span>{{ messageMedia[message.id].type === 'image' ? '生成的图片' : '生成的视频' }}</span><a v-if="messageMedia[message.id].type === 'image'" :href="messageMedia[message.id].url" :download="messageMedia[message.id].filename">下载原图</a></figcaption>
         </figure>
         <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" />
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
@@ -264,5 +276,11 @@ function activityText(event: RuntimeEvent): string {
       <ErrorRecoveryPanel v-if="!homeMode && error" :message="error" @retry="$emit('retry')" />
     </div>
     <button v-if="!atBottom" type="button" class="back-bottom" @click="bottom(true)"><ArrowDown :size="14" />回到底部</button>
+    <dialog ref="previewDialog" class="chat-image-preview" aria-label="图片预览" @close="previewImage = null" @click="($event.target === $event.currentTarget) && closeImage()">
+      <div v-if="previewImage" class="chat-image-preview-inner">
+        <header><span>图片预览</span><div><a :href="previewImage.url" :download="previewImage.filename">下载原图</a><button type="button" aria-label="关闭预览" @click="closeImage">关闭</button></div></header>
+        <img :src="previewImage.url" alt="生成图片的放大预览" />
+      </div>
+    </dialog>
   </div>
 </template>
