@@ -223,6 +223,7 @@ export interface Conversation {
   id: string
   title: string
   interaction_mode: 'autonomous' | 'guided'
+  execution_mode: 'fast' | 'professional'
   domain: string | null
   active_run_id: string | null
   created_at: string
@@ -234,6 +235,9 @@ export interface Conversation {
 export interface IntentPlan {
   intent: string
   needs_execution: boolean
+  tool?: string
+  domain?: string | null
+  execution_mode?: 'fast' | 'professional'
   suggested_domain: string | null
   suggested_skills: string[]
   confidence: number

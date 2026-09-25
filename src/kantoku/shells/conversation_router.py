@@ -2,9 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
 
-from kantoku.core.conversations import ConversationRecord, IntentPlan, InteractionMode
+from kantoku.core.conversations import (
+    ConversationRecord,
+    ExecutionMode,
+    IntentPlan,
+    InteractionMode,
+)
 
 
 class ConversationAction(StrEnum):
@@ -16,24 +22,37 @@ class ConversationAction(StrEnum):
     CHOOSE_DOMAIN = "choose_domain"
 
 
+@dataclass(frozen=True)
+class ConversationRoute:
+    action: ConversationAction
+    domain: str | None
+    execution_mode: ExecutionMode
+
+
 def route_conversation(
     conversation: ConversationRecord, plan: IntentPlan, *, confirmed: bool,
-) -> ConversationAction:
-    """Autonomous uses direct media or an explicitly selected Domain workflow."""
+) -> ConversationRoute:
+    """One domain + mode decision for both homepage and professional entry points."""
+    mode = conversation.execution_mode
+    domain = conversation.domain
     if not plan.needs_execution:
-        return ConversationAction.CHAT
+        return ConversationRoute(ConversationAction.CHAT, domain, mode)
     if conversation.interaction_mode is InteractionMode.AUTONOMOUS:
         if plan.intent == "image.generate":
-            return ConversationAction.IMAGE_GENERATE
+            return ConversationRoute(ConversationAction.IMAGE_GENERATE, domain, mode)
         if plan.intent == "image.edit":
-            return ConversationAction.IMAGE_EDIT
+            return ConversationRoute(ConversationAction.IMAGE_EDIT, domain, mode)
         if plan.intent == "video.generate":
-            return ConversationAction.VIDEO_GENERATE
-        if (conversation.domain == "comic" and plan.intent == "comic_production") or (
-            conversation.domain == "commerce" and plan.intent == "commerce_production"
-        ):
-            return ConversationAction.WORKFLOW_START
-        return ConversationAction.CHOOSE_DOMAIN
+            return ConversationRoute(ConversationAction.VIDEO_GENERATE, domain, mode)
+        production_domains = {
+            "comic_production": "comic", "commerce_production": "commerce",
+        }
+        required_domain = production_domains.get(plan.intent)
+        if required_domain and domain in {None, required_domain}:
+            return ConversationRoute(
+                ConversationAction.WORKFLOW_START, required_domain, mode,
+            )
+        return ConversationRoute(ConversationAction.CHOOSE_DOMAIN, domain, mode)
     if confirmed and conversation.domain in {"comic", "commerce"}:
-        return ConversationAction.WORKFLOW_START
-    return ConversationAction.CHAT
+        return ConversationRoute(ConversationAction.WORKFLOW_START, domain, mode)
+    return ConversationRoute(ConversationAction.CHAT, domain, mode)

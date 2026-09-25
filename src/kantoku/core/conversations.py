@@ -5,12 +5,17 @@ from __future__ import annotations
 from datetime import datetime
 from enum import StrEnum
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, computed_field
 
 
 class InteractionMode(StrEnum):
     AUTONOMOUS = "autonomous"
     GUIDED = "guided"
+
+
+class ExecutionMode(StrEnum):
+    FAST = "fast"
+    PROFESSIONAL = "professional"
 
 
 class MessageRole(StrEnum):
@@ -36,6 +41,13 @@ class ConversationRecord(BaseModel):
     active_run_id: str | None = None
     created_at: datetime
     updated_at: datetime
+
+    @computed_field
+    @property
+    def execution_mode(self) -> ExecutionMode:
+        """Public product mode; reuse the existing durable interaction mode."""
+        return (ExecutionMode.FAST if self.interaction_mode is InteractionMode.AUTONOMOUS
+                else ExecutionMode.PROFESSIONAL)
 
 
 class ConversationMessageRecord(BaseModel):

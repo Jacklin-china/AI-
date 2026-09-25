@@ -66,6 +66,17 @@ def test_image_whereabouts_is_chat_not_another_paid_image() -> None:
     assert decision.action == "chat"
 
 
+def test_video_request_after_image_cannot_become_another_image() -> None:
+    previous = CreativeContext(subject="上一张角色图", artifact_id="artifact-prior")
+    decision = plan_creative_turn(
+        "生成无一郎竹林战斗视频", previous, trace_id="trace-video-route",
+        classify=lambda *_args, **_kwargs: SimpleNamespace(content=(
+            '{"action":"image.generate","subject":"无一郎"}'
+        )),
+    )
+    assert decision.action == "chat"
+
+
 def test_untemplated_first_request_can_be_understood_as_image() -> None:
     decision = plan_creative_turn(
         "想看一座赛博朋克城市", None, trace_id="trace-creative-open",

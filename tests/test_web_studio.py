@@ -1470,6 +1470,7 @@ def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confi
     assert next(payload for name, payload in events if name == "intent")["tool"] == "workflow.start"
     run = next(payload for name, payload in events if name == "run")
     assert run["workflow"] == "comic.production.v1"
+    assert run["state"]["execution_mode"] == "fast"
     assert run["state"]["confirmed"] is False
     assert run["id"] in {
         item.id for item in app.runtime_store.list_runs(
@@ -1479,6 +1480,55 @@ def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confi
     assert run["id"] not in {item["id"] for item in app.list_core_runs()}
     assert any("当前聊天" in payload["content"] for name, payload in events
                if name == "message" and payload["role"] == "assistant")
+
+
+def test_home_fast_mode_infers_domain_without_opening_professional_workflow_page(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.runner, "submit", lambda _execute: None)
+    monkeypatch.setattr(
+        web_studio, "plan_creative_turn",
+        lambda content, _prior, **_kwargs: creative.CreativeDecision(
+            action="chat", request=content,
+        ),
+    )
+    home = app.create_conversation({"interaction_mode": "autonomous"})
+    assert home["execution_mode"] == "fast"
+    events = list(app.stream_conversation(home["id"], {
+        "content": "帮我制作三镜头漫剧",
+    }))
+    intent = next(payload for name, payload in events if name == "intent")
+    assert intent["tool"] == "workflow.start"
+    assert intent["domain"] == "comic"
+    assert intent["execution_mode"] == "fast"
+    assert app.conversation(home["id"])["domain"] == "comic"
+    assert any(name == "run" for name, _ in events)
+
+    guided = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})
+    assert guided["execution_mode"] == "professional"
+    guided_events = list(app.stream_conversation(guided["id"], {
+        "content": "帮我制作三镜头漫剧",
+    }))
+    assert not any(name == "run" for name, _ in guided_events)
+
+
+def test_home_explicit_image_request_still_generates_when_creative_model_misses_intent(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        web_studio, "plan_creative_turn",
+        lambda content, _prior, **_kwargs: creative.CreativeDecision(
+            action="chat", request=content,
+        ),
+    )
+    home = app.create_conversation({"interaction_mode": "autonomous"})
+    events = list(app.stream_conversation(home["id"], {
+        "content": "画一个竹林里的卡通剑士",
+    }))
+    assert next(payload for name, payload in events if name == "intent")["tool"] == "image.generate"
+    assert any(name == "image_ready" for name, _ in events)
+    assert not any(name == "run" for name, _ in events)
+    assert app.conversation(home["id"])["domain"] is None
 
 
 def test_fast_domain_http_switch_and_guided_rejection(

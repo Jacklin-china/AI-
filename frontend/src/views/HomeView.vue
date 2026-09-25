@@ -57,8 +57,8 @@ const pendingApproval = computed(() => [...props.approvals, ...localApprovals.va
 async function refreshConversations(): Promise<void> {
   const list = await getConversations(props.domain)
   conversations.value = list.filter((item) => props.domain
-    ? item.interaction_mode === 'guided' && item.domain === props.domain
-    : item.interaction_mode === 'autonomous')
+    ? item.execution_mode === 'professional' && item.domain === props.domain
+    : item.execution_mode === 'fast')
 }
 
 async function selectConversation(id: string): Promise<void> {
@@ -334,6 +334,13 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
   let anchor = task.id
   try {
     await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
+        onIntent: (plan) => {
+          if (conversationId.value !== task.conversationId || plan.execution_mode !== 'fast') return
+          if (plan.domain && ['comic', 'commerce', 'studio'].includes(plan.domain)) {
+            fastDomain.value = plan.domain as FastDomain
+            domainHint.value = fastDomain.value
+          }
+        },
         onDelta: (delta) => {
           if (conversationId.value === task.conversationId) {
             streamingByMessage.value = {

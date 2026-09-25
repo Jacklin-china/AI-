@@ -57,6 +57,7 @@ from kantoku.core.approval import ApprovalService
 from kantoku.core.conversations import (
     ConversationMessageRecord,
     ConversationRecord,
+    ExecutionMode,
     IntentPlan,
     IntentPlanner,
     InteractionMode,
@@ -721,18 +722,32 @@ class StudioApplication:
                 ),
             )
             if creative_decision.action == "chat":
-                existing_plan = self.intent_planner.plan(content, image_context=image_context)
+                existing_plan = self.intent_planner.plan(
+                    content, domain_hint=hint, image_context=image_context,
+                )
                 if existing_plan.needs_execution and existing_plan.intent in {
-                    "video.generate", "comic_production", "commerce_production",
+                    "image.generate", "image.edit", "video.generate",
+                    "comic_production", "commerce_production",
                 }:
                     plan = existing_plan
+                    if existing_plan.intent.startswith("image."):
+                        creative_decision = replace(
+                            creative_decision, action=existing_plan.intent,
+                            subject=_image_requirement(content, conversation_history),
+                        )
         else:
             plan = self.intent_planner.plan(
                 content, domain_hint=hint, image_context=image_context,
             )
         guided = conversation.interaction_mode == InteractionMode.GUIDED
         confirmed = guided and _is_execution_confirmed(content, history_before)
-        action = route_conversation(conversation, plan, confirmed=confirmed)
+        route = route_conversation(conversation, plan, confirmed=confirmed)
+        action = route.action
+        if (route.execution_mode is ExecutionMode.FAST and conversation.domain is None
+                and action is ConversationAction.WORKFLOW_START and route.domain):
+            conversation = self.runtime_store.set_conversation_domain(
+                conversation_id, route.domain,
+            )
         generation_request_id = str(
             data.get("generation_request_id") or f"generation-{uuid4().hex}"
         )
@@ -757,7 +772,8 @@ class StudioApplication:
             )
         yield "intent", {
             **plan.model_dump(mode="json"), "tool": action.value,
-            "trace_id": trace_id,
+            "trace_id": trace_id, "domain": route.domain,
+            "execution_mode": route.execution_mode.value,
         }
         if action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}:
             media_job = self.runtime_store.create_media_job(
@@ -989,7 +1005,7 @@ class StudioApplication:
             return
         history = self.runtime_store.list_conversation_messages(conversation_id)[-16:]
         # 首页简单生图走共享能力；选定领域的复杂请求复用同一个 Graph。
-        target_domain = conversation.domain
+        target_domain = route.domain
         execute = action is ConversationAction.WORKFLOW_START
         run: dict[str, Any] | None = None
         if execute and target_domain:
@@ -1017,6 +1033,7 @@ class StudioApplication:
                     "project": (
                         conversation.title if conversation.title != "新对话" else "Kantoku Chat"
                     ),
+                    "execution_mode": route.execution_mode.value,
                     "prompt": prompt, "shot_no": 1,
                     "estimate_fen": budget.estimate_image_fen(),
                     "image_count": _image_count(requirement),
@@ -1070,8 +1087,10 @@ class StudioApplication:
             )
         else:
             instruction = (
-                "当前只是对话，没有创建生产任务。不要说已提交、正在生成或进入生成阶段；"
-                "若用户想要实际出图，请让用户明确提出生成图片的要求。"
+                "当前只是对话，没有创建生产任务。不要说已提交、正在生成或已完成；"
+                "首页用户不需要固定口令，也不需要填写尺寸、镜头或 Prompt。"
+                "若意图不明确，只询问产出主体或目标这一个必要问题；"
+                "不要把快速聊天变成专业参数确认流程。"
             )
         messages: list[dict[str, str]] = [
             {

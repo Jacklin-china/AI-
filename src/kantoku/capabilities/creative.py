@@ -95,6 +95,12 @@ def plan_creative_turn(
 ) -> CreativeDecision:
     """Understand a natural-language turn; fall back safely if the text model is unavailable."""
     fallback = _fallback_action(request, previous)
+    # This planner only plans still images. Keep an explicit video deliverable
+    # out of its image actions so the shared conversation router can handle it.
+    media_plan = IntentPlanner().plan(request, image_context=previous is not None)
+    if (media_plan.intent == "video.generate" and media_plan.needs_execution
+            and not any(cue in request for cue in ("封面", "海报", "截图", "缩略图"))):
+        return CreativeDecision(action="chat", request=request)
     if request.strip().lower() in {"你好", "您好", "hi", "hello", "谢谢", "好的", "在吗"}:
         return CreativeDecision(action="chat", request=request)
     if fallback == "image.generate" and previous is None:

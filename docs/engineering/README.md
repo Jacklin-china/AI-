@@ -7,6 +7,7 @@
 改动前先读产品原则、本文件和实际代码，再确认问题属于哪一层。目标调用方向是 **Conversation → Unified Agent Orchestrator → Action / Plan → Direct Capability 或 Domain Workflow → Core Infrastructure → Provider**。这是收口方向，不代表当前已有独立的统一编排模块；禁止为了满足图示另起第二套运行时。
 
 - Conversation 只管理会话、消息、持久化和实时事件；统一编排只做意图、上下文、交互策略和执行路径决策。不要把首页、Comic、Commerce 的判断继续堆进 `stream_conversation`，也不要为每个入口各建 Router / Planner。
+- 会话原有 `interaction_mode=autonomous/guided` 是持久化兼容字段；对产品与客户端呈现为 `execution_mode=fast/professional`。同一个 `conversation_router` 决定 Action、Domain 与执行模式；首页复杂请求可推断 Domain，但不会因此跳入专业页面。不要另存一份互相竞争的模式状态。
 - ImageService、VideoService 和 Prompt Enhancer 应是各自唯一的共享能力入口；Autonomous / Guided 差异由 mode、domain、policy 和 action 表达。简单请求直达共享能力，复杂请求才启动领域 Workflow，两者共用预算、Artifact、日志与幂等机制。
 - Core 不理解领域词或业务流程；Domain 只定义专业 Schema、Policy、Workflow 和 Prompt，不复制 Core。Provider 只实现供应商协议，不决定用户交互、审批或业务流程。前端只调用应用 API，不直接访问 Provider。
 - 禁止伪造 Provider 状态、进度与结果。修 Bug 补回归测试；先收口已有实现，再删除被替代代码，历史由 Git 保存。不得创建 `_new`、`_old`、`_backup`、`_final`、`_v2` 副本。

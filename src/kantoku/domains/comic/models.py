@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import Field
 
@@ -14,6 +14,7 @@ class ComicState(RunState):
 
     project: str
     prompt: str
+    execution_mode: Literal["fast", "professional"] = "professional"
     shot_no: int = Field(gt=0)
     estimate_fen: int = Field(gt=0)
     image_count: int = Field(default=1, ge=1, le=20)
