@@ -87,6 +87,26 @@ def test_comic_workflow_waits_resumes_and_archives(tmp_path: Path) -> None:
     assert store.list_artifacts(completed.id)[0].source == "comic.archive"
 
 
+def test_fast_comic_passes_qc_without_fake_human_review(tmp_path: Path) -> None:
+    class NoHumanReviewServices(FakeComicServices):
+        def review(
+            self, _state: ComicState, _decision: str, _response: Mapping[str, Any]
+        ) -> Mapping[str, Any]:
+            raise AssertionError("fast QC pass must not be recorded as human review")
+
+    store = RuntimeStore(tmp_path / "fast-comic.db")
+    runtime = GraphRuntime(store)
+    workflow = build_comic_workflow(NoHumanReviewServices())
+    runtime.register(workflow)
+    completed = runtime.start(workflow.id, ComicState(
+        project="demo", prompt="scene", shot_no=1, estimate_fen=10,
+        execution_mode="fast", confirmed=True,
+    ))
+    assert completed.status is ExecutionStatus.COMPLETED
+    assert completed.state["approval_decision"] == "approve"
+    assert store.list_approvals() == []
+
+
 def test_external_job_waits_across_runtime_restart_then_resumes(tmp_path: Path) -> None:
     class PendingOnceServices(FakeComicServices):
         def generate(self, state: ComicState) -> Mapping[str, Any]:

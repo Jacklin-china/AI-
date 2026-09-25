@@ -177,5 +177,10 @@ class StudioComicServices:
         """调用现有图片归档。"""
         if state.request_id is None:
             raise ToolError("Comic Run 缺少归档请求 ID")
+        if state.execution_mode == "fast" and state.qc_passed and state.image_path:
+            source = Path(state.image_path)
+            if not source.is_file():
+                raise ToolError("快速创作图片文件缺失，不能创建 Artifact")
+            return {"archive_path": str(source)}
         archived = archive_reviewed_image(state.request_id)
         return {"archive_path": str(archived.image_path)}

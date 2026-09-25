@@ -260,7 +260,10 @@ def _assert_available(
     scopes: list[tuple[str, Decimal | None, str, tuple[object, ...]]] = [
         (
             "单日",
-            budget.image_daily_cny,
+            (getattr(budget, "autonomous_image_daily_cny", None)
+             if conversation_id is not None
+             and getattr(budget, "autonomous_image_daily_cny", None) is not None
+             else budget.image_daily_cny),
             "created_at >= ? AND created_at < ?",
             (day_start, day_end),
         ),

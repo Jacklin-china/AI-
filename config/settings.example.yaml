@@ -87,11 +87,12 @@ budget:                        # 成本红线：任何付费调用前必须检�
   image_estimated_credits_per_call: 3  # 兜底：普通图按截图区间上限预占；高质量模式须传真实估算
   image_estimated_cny_per_call: 3.00  # 兜底保守估价：仅在 image.pricing 未配置时生效；真实调用仍要求人工确认上界
   image_daily_cny: 20.0        # 当前单条视频硬上限；同日只跑一条时等于视频上限
+  autonomous_image_daily_cny: 100.0  # 首页经费用确认后的单日硬上限
   image_project_cny: 20.0      # 单视频项目上限
   image_episode_cny: 20.0      # 当前一条视频按一集核算
   image_shot_cny: 3.0          # 单次保守上界；项目总预算仍限制为 20 元
-  image_conversation_cny: 5.0  # 首页聊天额度；不沿用专业项目/单镜预算身份
-  autonomous_image_auto_cny: 0.30  # 首页单次小额生成静默执行阈值
+  image_conversation_cny: 100.0  # 首页经费用确认后的单聊天硬上限
+  autonomous_image_auto_cny: 20.0  # 首页单次自动执行上限；超额需确认
   image_max_concurrency: 1     # W4 先串行；确认限流与整批预占正确后才调高
   token_daily_limit: 200000    # token 单日上限，防跑飞
 

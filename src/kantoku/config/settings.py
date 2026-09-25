@@ -86,6 +86,9 @@ class BudgetSettings(BaseModel):
         default=None, gt=0, allow_inf_nan=False
     )
     image_daily_cny: Decimal = Field(ge=0, allow_inf_nan=False)
+    autonomous_image_daily_cny: Decimal | None = Field(
+        default=None, ge=0, allow_inf_nan=False
+    )
     image_project_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
     image_episode_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)
     image_shot_cny: Decimal | None = Field(ge=0, allow_inf_nan=False)

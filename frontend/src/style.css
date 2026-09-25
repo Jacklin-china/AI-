@@ -635,6 +635,13 @@
 .chat-generated-image figcaption { margin-top: 6px; color: var(--text-muted); font-size: 12px; }
 .chat-image-generation { width: min(420px, calc(100% - 38px)); margin: -10px 0 0 38px; }
 .chat-image-generation:empty { display: none; }
+.chat-cost-card { padding: 14px 16px; border: 1px solid var(--border); border-radius: 8px; background: var(--surface); color: var(--text-primary); font-size: 13px; }
+.chat-cost-card strong { font-size: 14px; }
+.chat-cost-card p { margin: 7px 0 12px; color: var(--text-secondary); line-height: 1.55; }
+.chat-cost-card > div { display: flex; justify-content: flex-end; gap: 8px; }
+.chat-cost-card button { padding: 6px 11px; border: 1px solid var(--border); border-radius: 6px; background: var(--surface); cursor: pointer; }
+.chat-cost-card button.primary { background: var(--text-primary); border-color: var(--text-primary); color: var(--surface); }
+.chat-cost-card button:disabled { opacity: .5; cursor: wait; }
 .chat-image-generation .chat-generated-image { width: 100%; margin: 0; }
 .chat-image-generation .chat-generated-image img { animation: image-reveal .32s ease-out both; }
 .chat-image-open { display: block; width: 100%; padding: 0; border: 0; background: transparent; cursor: zoom-in; text-align: left; }
@@ -694,6 +701,7 @@
 .composer-domain-chip small { color: var(--warning); font-size: 10px; }
 .composer-domain-chip button { display: grid; place-items: center; width: 20px; height: 20px; padding: 0; border: 0; border-radius: 4px; background: transparent; color: var(--text-muted); }
 .composer-domain-chip button:hover { background: var(--sidebar-hover); color: var(--text-primary); }
+.composer-domain-chip button:disabled, .composer-plus:disabled { opacity: .45; cursor: default; }
 .composer-domain-control { position: relative; }
 .composer-plus { border: 1px solid transparent !important; border-radius: 6px; }
 .composer-plus[aria-expanded="true"], .composer-plus:hover { border-color: var(--border) !important; background: var(--surface-subtle); color: var(--text-primary); }

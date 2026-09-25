@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from kantoku.capabilities.video import VideoGenerationRequest, VideoService
+from kantoku.config import get_settings
 from kantoku.core.budget import attach_image_artifact
 from kantoku.core.runtime.graph import (
     END,
@@ -36,6 +37,9 @@ def build_comic_workflow(
 
     def review(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
         decision = context.approval_decision
+        if decision is None and state.execution_mode == "fast" and state.qc_passed:
+            # Automatic QC pass is not a human review; do not record a fake label.
+            return {"approval_decision": ApprovalDecision.APPROVE.value}
         if decision is None:
             raise RuntimeError("approval decision is missing")
         return dict(service.review(state, decision.value, context.approval_response))
@@ -99,7 +103,7 @@ def build_comic_workflow(
                 "unit_fen": state.estimate_fen,
                 "image_count": state.image_count,
                 "total_fen": state.estimate_fen * state.image_count,
-                "project": state.project, "provider": "Jimeng",
+                "project": state.project, "provider": get_settings().image.provider,
                 "message": (
                     "批准后才会调用付费生图服务。"
                     if state.image_count <= 1
@@ -116,6 +120,9 @@ def build_comic_workflow(
             "human_review",
             review,
             requires_approval=True,
+            approval_when=lambda state: (
+                state.execution_mode != "fast" or not state.qc_passed
+            ),
             approval_request=lambda state: {
                 "kind": "creative_review",
                 "request_id": state.request_id,

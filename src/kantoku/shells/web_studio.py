@@ -57,7 +57,6 @@ from kantoku.core.approval import ApprovalService
 from kantoku.core.conversations import (
     ConversationMessageRecord,
     ConversationRecord,
-    ExecutionMode,
     IntentPlan,
     IntentPlanner,
     InteractionMode,
@@ -69,7 +68,12 @@ from kantoku.core.conversations import (
 from kantoku.core.llm import chat, stream_chat
 from kantoku.core.runtime.batch import BatchService
 from kantoku.core.runtime.graph import GraphRuntime
-from kantoku.core.runtime.models import ApprovalDecision, ArtifactType, RunRecord
+from kantoku.core.runtime.models import (
+    TERMINAL_STATUSES,
+    ApprovalDecision,
+    ArtifactType,
+    RunRecord,
+)
 from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
@@ -415,10 +419,16 @@ class StudioApplication:
                             generation_request_id, MediaJobStatus.FAILED,
                             error_message=message.content,
                         )
+                        self.runtime_store.finish_fast_domain_task(
+                            conversation_id, generation_request_id,
+                        )
                     return message, None
                 self.runtime_store.update_media_job(
                     generation_request_id, MediaJobStatus.COMPLETED,
                     artifact_id=message.artifact_id,
+                )
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, generation_request_id,
                 )
                 try:
                     summary = self.runtime_store.add_conversation_message(
@@ -443,6 +453,9 @@ class StudioApplication:
                 self.runtime_store.update_media_job(
                     generation_request_id, MediaJobStatus.FAILED,
                     error_id=str(failure["error_id"]), error_message=safe_message,
+                )
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, generation_request_id,
                 )
                 message = self.runtime_store.add_conversation_message(
                     conversation_id, role=MessageRole.ASSISTANT, type=MessageType.ERROR,
@@ -469,12 +482,17 @@ class StudioApplication:
 
     def _recover_media_job(self, job: MediaJobRecord) -> None:
         """Resume one persisted request, retaining its provider job and budget identity."""
+        if job.approval_status in {"pending", "rejected"}:
+            return
         saved = self.runtime_store.get_conversation_generation(job.generation_request_id)
         reservation = budget.get_reservation(job.generation_request_id)
         if saved is None and reservation is not None:
             self.runtime_store.update_media_job(
                 job.generation_request_id, MediaJobStatus.FAILED,
                 error_message="提交记录缺少原始提示词，需要人工对账；不会重新付费提交。",
+            )
+            self.runtime_store.finish_fast_domain_task(
+                job.conversation_id, job.generation_request_id,
             )
             return
         history = self.runtime_store.list_conversation_messages(
@@ -491,10 +509,14 @@ class StudioApplication:
                 job.generation_request_id, MediaJobStatus.FAILED,
                 error_message="原生图需求缺失；请查看日志，不会重复提交。",
             )
+            self.runtime_store.finish_fast_domain_task(
+                job.conversation_id, job.generation_request_id,
+            )
             return
-        estimate_fen = reservation.est_fen if reservation else budget.quote_image_price(
-            count=1
-        ).total_fen
+        estimate_fen = (
+            reservation.est_fen if reservation else job.estimate_fen
+            or budget.quote_image_price(count=1).total_fen
+        )
         self._start_media_job(
             job.conversation_id, job.user_message_id, job.generation_request_id,
             requirement, saved["prompt"] if saved else None, estimate_fen,
@@ -530,6 +552,18 @@ class StudioApplication:
             yield "done", {"generation_request_id": None}
             return
         if unfinished is not None:
+            if job.approval_status == "pending":
+                message = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT, type=MessageType.STATUS,
+                    content="上次生图仍在等待费用确认；确认前没有提交付费任务。",
+                )
+                yield "cost_approval", {
+                    "generation_request_id": job.generation_request_id,
+                    "estimate_fen": job.estimate_fen,
+                }
+                yield "message", message.model_dump(mode="json")
+                yield "done", {"generation_request_id": job.generation_request_id}
+                return
             self._recover_media_job(job)
             job = self.runtime_store.get_media_job(job.generation_request_id)
             if job is not None and job.status in {
@@ -638,20 +672,64 @@ class StudioApplication:
     def set_fast_domain(
         self, conversation_id: str, domain: str | None,
     ) -> dict[str, Any]:
+        self._reconcile_fast_domain(conversation_id)
         conversation = self.runtime_store.get_conversation(conversation_id)
         if conversation.interaction_mode is not InteractionMode.AUTONOMOUS:
             raise ToolError("专业创作域不能在首页切换快捷模式")
         if domain not in {None, "comic", "commerce", "studio"}:
             raise ToolError("不支持的首页创作域快捷模式")
+        if conversation.fast_domain_task_id:
+            raise ToolError("当前快捷任务尚未结束，请等待结果或费用确认")
         return self.runtime_store.set_conversation_domain(
             conversation_id, domain,
         ).model_dump(mode="json")
+
+    def _reconcile_fast_domain(self, conversation_id: str) -> None:
+        """Recover the one-shot selection after a run ends, including after restart."""
+        conversation = self.runtime_store.get_conversation(conversation_id)
+        task_id = conversation.fast_domain_task_id
+        if not task_id:
+            return
+        job = self.runtime_store.get_media_job(task_id)
+        if job is not None:
+            if job.status in {MediaJobStatus.COMPLETED, MediaJobStatus.FAILED}:
+                self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
+            return
+        if task_id.startswith("run-"):
+            run = self.runtime_store.get_run(task_id)
+            if run.status in TERMINAL_STATUSES:
+                self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
+
+    def decide_media_cost(
+        self, conversation_id: str, generation_request_id: str, approve: bool,
+    ) -> dict[str, Any]:
+        conversation = self.runtime_store.get_conversation(conversation_id)
+        if conversation.interaction_mode is not InteractionMode.AUTONOMOUS:
+            raise ToolError("仅首页快速生图可在聊天内确认费用")
+        job = self.runtime_store.decide_media_job_cost(
+            generation_request_id, conversation_id, approve,
+        )
+        if approve:
+            self.runtime_store.update_media_job(
+                generation_request_id, MediaJobStatus.GENERATING,
+            )
+            self._recover_media_job(job)
+        else:
+            self.runtime_store.update_media_job(
+                generation_request_id, MediaJobStatus.FAILED,
+                error_message="你已取消本次付费生图；没有提交供应商任务。",
+            )
+            self.runtime_store.finish_fast_domain_task(
+                conversation_id, generation_request_id,
+            )
+        return self.runtime_store.get_media_job(generation_request_id).model_dump(mode="json")
 
     def delete_conversation(self, conversation_id: str) -> dict[str, bool]:
         self.runtime_store.delete_conversation(conversation_id)
         return {"deleted": True}
 
     def conversation(self, conversation_id: str) -> dict[str, Any]:
+        self._reconcile_fast_domain(conversation_id)
         conversation = self.runtime_store.get_conversation(conversation_id)
         # A reopened home chat keeps querying its persisted provider job. The
         # idempotent image service only reconciles an already submitted request.
@@ -682,6 +760,7 @@ class StudioApplication:
         self, conversation_id: str, data: dict[str, Any]
     ) -> Any:
         """Yield real model deltas followed by an optional existing Core run."""
+        self._reconcile_fast_domain(conversation_id)
         conversation = self.runtime_store.get_conversation(conversation_id)
         trace_id = str(data.get("_trace_id") or f"trace-{uuid4().hex[:12]}")
         content = str(data.get("content", "")).strip()
@@ -691,7 +770,15 @@ class StudioApplication:
                 and content.strip().rstrip("。！! ") in {"继续任务", "继续生图", "继续刚才的任务"}):
             yield from self._resume_home_image(conversation_id, content)
             return
-        hint = str(data.get("domain_hint") or conversation.domain or "") or None
+        selected_domain = (
+            conversation.domain
+            if conversation.interaction_mode is InteractionMode.AUTONOMOUS
+            and conversation.fast_domain_task_id is None else None
+        )
+        hint = selected_domain if conversation.interaction_mode is InteractionMode.AUTONOMOUS \
+            else str(data.get("domain_hint") or conversation.domain or "") or None
+        if conversation.fast_domain_task_id:
+            conversation = conversation.model_copy(update={"domain": None})
         conversation_history = self.runtime_store.list_conversation_messages(conversation_id)
         history_before = conversation_history[-16:]
         image_context = any(
@@ -743,11 +830,6 @@ class StudioApplication:
         confirmed = guided and _is_execution_confirmed(content, history_before)
         route = route_conversation(conversation, plan, confirmed=confirmed)
         action = route.action
-        if (route.execution_mode is ExecutionMode.FAST and conversation.domain is None
-                and action is ConversationAction.WORKFLOW_START and route.domain):
-            conversation = self.runtime_store.set_conversation_domain(
-                conversation_id, route.domain,
-            )
         generation_request_id = str(
             data.get("generation_request_id") or f"generation-{uuid4().hex}"
         )
@@ -766,6 +848,9 @@ class StudioApplication:
         )
         if user_message.content != content:
             raise ToolError("生成请求 ID 已用于不同内容")
+        selected_task_id = user_message.id if selected_domain else None
+        if selected_task_id:
+            self.runtime_store.bind_fast_domain_task(conversation_id, selected_task_id)
         if conversation.title == "新对话":
             self.runtime_store.update_conversation(
                 conversation_id, title=content[:32], active_run_id=conversation.active_run_id,
@@ -776,9 +861,17 @@ class StudioApplication:
             "execution_mode": route.execution_mode.value,
         }
         if action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}:
+            quote = budget.quote_image_price(count=1)
+            auto_fen = int(get_settings().budget.autonomous_image_auto_cny * 100)
             media_job = self.runtime_store.create_media_job(
                 generation_request_id, conversation_id, user_message.id,
+                estimate_fen=quote.total_fen,
+                approval_required=quote.total_fen > auto_fen,
             )
+            if selected_task_id:
+                self.runtime_store.transfer_fast_domain_task(
+                    conversation_id, selected_task_id, generation_request_id,
+                )
             existing = self.runtime_store.get_conversation_message_by_event(
                 conversation_id, f"generation-artifact:{generation_request_id}"
             )
@@ -812,6 +905,9 @@ class StudioApplication:
                     }
                     yield "message", summary.model_dump(mode="json")
                 yield "done", {"generation_request_id": generation_request_id}
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, generation_request_id,
+                )
                 return
             if media_job.status == MediaJobStatus.FAILED:
                 history = self.runtime_store.list_conversation_messages(conversation_id)
@@ -833,6 +929,9 @@ class StudioApplication:
                 yield "image_failed", {"generation_request_id": generation_request_id}
                 yield "message", failed_message.model_dump(mode="json")
                 yield "done", {"generation_request_id": generation_request_id}
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, generation_request_id,
+                )
                 return
             saved = self.runtime_store.get_conversation_generation(generation_request_id)
             requirement = (
@@ -848,29 +947,14 @@ class StudioApplication:
                     generation_request_id, MediaJobStatus.FAILED,
                     error_message="缺少图片主体；本次没有提交生图任务。",
                 )
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, generation_request_id,
+                )
                 message = self.runtime_store.add_conversation_message(
                     conversation_id, role=MessageRole.ASSISTANT,
                     type=MessageType.TEXT,
                     content="想画什么？直接告诉我主体即可，尺寸和风格可以由我在后台处理。",
                     event_id=f"generation-subject:{generation_request_id}",
-                )
-                yield "message", message.model_dump(mode="json")
-                yield "done", {"generation_request_id": generation_request_id}
-                return
-            quote = budget.quote_image_price(count=_image_count(content))
-            auto_fen = int(get_settings().budget.autonomous_image_auto_cny * 100)
-            if quote.count != 1 or quote.total_fen > auto_fen:
-                text = (
-                    f"预计费用 ¥{quote.total_fen / 100:.2f}，超过首页自动执行额度。"
-                    "请进入专业创作域确认预算后继续；本次没有提交付费任务。"
-                )
-                self.runtime_store.update_media_job(
-                    generation_request_id, MediaJobStatus.FAILED, error_message=text,
-                )
-                message = self.runtime_store.add_conversation_message(
-                    conversation_id, role=MessageRole.ASSISTANT,
-                    type=MessageType.TEXT, content=text,
-                    event_id=f"generation-cost:{generation_request_id}",
                 )
                 yield "message", message.model_dump(mode="json")
                 yield "done", {"generation_request_id": generation_request_id}
@@ -914,6 +998,13 @@ class StudioApplication:
             yield "prompt_prepared", {
                 "generation_request_id": generation_request_id, "message_id": prepared.id,
             }
+            if media_job.approval_status == "pending":
+                yield "cost_approval", {
+                    "generation_request_id": generation_request_id,
+                    "estimate_fen": media_job.estimate_fen,
+                }
+                yield "done", {"generation_request_id": generation_request_id}
+                return
             self.runtime_store.update_media_job(
                 generation_request_id, MediaJobStatus.GENERATING,
             )
@@ -986,6 +1077,10 @@ class StudioApplication:
             )
             yield "message", message.model_dump(mode="json")
             yield "done", {"run_id": None}
+            if selected_task_id:
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, selected_task_id,
+                )
             return
         if action is ConversationAction.CHOOSE_DOMAIN:
             text = (
@@ -1002,6 +1097,10 @@ class StudioApplication:
             yield "delta", {"content": text}
             yield "message", message.model_dump(mode="json")
             yield "done", {"run_id": None}
+            if selected_task_id:
+                self.runtime_store.finish_fast_domain_task(
+                    conversation_id, selected_task_id,
+                )
             return
         history = self.runtime_store.list_conversation_messages(conversation_id)[-16:]
         # 首页简单生图走共享能力；选定领域的复杂请求复用同一个 Graph。
@@ -1040,13 +1139,21 @@ class StudioApplication:
                     # Comic Graph is a professional multi-step production, not
                     # the single-image home capability. Its paid step still
                     # needs the existing cost approval in either mode.
-                    "confirmed": False,
+                    "confirmed": (
+                        not guided and budget.estimate_image_fen(
+                            count=_image_count(requirement),
+                        ) <= int(get_settings().budget.autonomous_image_auto_cny * 100)
+                    ),
                 }
                 domain = "comic"
             run = self.enqueue_core_run({
                 "domain": domain, "state": state,
                 "interaction_mode": "guided" if guided else "autonomous",
             })
+            if selected_task_id:
+                self.runtime_store.transfer_fast_domain_task(
+                    conversation_id, selected_task_id, str(run["id"]),
+                )
             self.runtime_store.update_conversation(
                 conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
             )
@@ -1121,6 +1228,10 @@ class StudioApplication:
             conversation_id, role=MessageRole.ASSISTANT, type=message_type, content=complete,
             run_id=run["id"] if run else None,
         )
+        if selected_task_id and not execute:
+            self.runtime_store.finish_fast_domain_task(
+                conversation_id, selected_task_id,
+            )
         yield "message", assistant.model_dump(mode="json")
         yield "done", {"run_id": run["id"] if run else None}
 
@@ -1954,6 +2065,13 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     self.json_reply(
                         200, app.decide_core_approval(parts[2], parts[3], data)
                     )
+                elif (len(parts) == 6 and parts[:2] == ["api", "conversations"]
+                      and parts[3] == "media-jobs" and parts[5] == "approval"):
+                    if data.get("decision") not in {"approve", "reject"}:
+                        raise ToolError("费用确认操作无效")
+                    self.json_reply(200, app.decide_media_cost(
+                        parts[2], parts[4], data["decision"] == "approve",
+                    ))
                 elif request_path == "/api/batches":
                     self.json_reply(201, app.create_core_batch(data))
                 elif len(parts) == 4 and parts[:2] == ["api", "batches"] \

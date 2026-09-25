@@ -7,7 +7,7 @@ import MessageComposer from '../components/chat/MessageComposer.vue'
 import SystemStatusInline from '../components/chat/SystemStatusInline.vue'
 import { presenterFor } from '../domains/presenters'
 import { navigate } from '../router'
-import { createConversation, decideApproval, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, setConversationFastDomain, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
+import { createConversation, decideApproval, decideMediaCost, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, setConversationFastDomain, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../types'
 
 const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreApproval[]; busy?: boolean; domain?: string; embedded?: boolean; initialRunId?: string }>(), { runs: () => [], approvals: () => [], busy: false, embedded: false })
@@ -23,6 +23,7 @@ const activeRun = ref<CoreRun | null>(null)
 const domainHint = ref<string | null>(props.domain ?? null)
 type FastDomain = 'comic' | 'commerce' | 'studio'
 const fastDomain = ref<FastDomain | null>(null)
+const fastDomainTaskId = ref<string | null>(null)
 const switchingFastDomain = ref(false)
 const dataMode = ref<'demo' | 'production'>('production')
 const enhancePrompt = ref(true)
@@ -61,6 +62,19 @@ async function refreshConversations(): Promise<void> {
     : item.execution_mode === 'fast')
 }
 
+function syncFastDomain(detail: Conversation): void {
+  if (props.domain || detail.id !== conversationId.value) return
+  fastDomain.value = ['comic', 'commerce', 'studio'].includes(detail.domain ?? '')
+    ? detail.domain as FastDomain : null
+  fastDomainTaskId.value = detail.fast_domain_task_id
+  domainHint.value = fastDomain.value
+}
+
+async function refreshFastDomain(ownerId: string): Promise<void> {
+  const detail = await getConversation(ownerId).catch(() => null)
+  if (detail) syncFastDomain(detail)
+}
+
 async function selectConversation(id: string): Promise<void> {
   const currentSelection = ++selectionVersion
   if (mediaPollTimer) { clearInterval(mediaPollTimer); mediaPollTimer = null }
@@ -81,12 +95,11 @@ async function selectConversation(id: string): Promise<void> {
   const detail = await getConversation(id)
   if (!detail || currentSelection !== selectionVersion) return
   conversationId.value = id
-  fastDomain.value = !props.domain && ['comic', 'commerce', 'studio'].includes(detail.domain ?? '')
-    ? detail.domain as FastDomain : null
+  syncFastDomain(detail)
   domainHint.value = props.domain ?? fastDomain.value
   messages.value = detail.messages ?? []
   restoreMediaJobs(detail.media_jobs ?? [])
-  if (mediaJobs.value.some((job) => job.status === 'pending' || job.status === 'generating')) {
+  if (mediaJobs.value.some((job) => (job.status === 'pending' || job.status === 'generating') && job.approval_status !== 'pending')) {
     startMediaPolling(id)
   }
   for (const message of messages.value) if (message.artifact_id) void loadMessageMedia(message, id)
@@ -142,6 +155,7 @@ async function refreshActiveMedia(ownerId: string): Promise<void> {
   try {
     const detail = await getConversation(ownerId)
     if (!detail || conversationId.value !== ownerId) return
+    syncFastDomain(detail)
     if (error.value === '连接中断，正在恢复图片任务状态。') error.value = ''
     restoreMediaJobs(detail.media_jobs ?? [])
     const persisted = detail.messages ?? []
@@ -155,7 +169,7 @@ async function refreshActiveMedia(ownerId: string): Promise<void> {
         void loadMessageMedia(message, ownerId)
       }
     }
-    if (!mediaJobs.value.some((job) => job.status === 'pending' || job.status === 'generating') && mediaPollTimer) {
+    if (!mediaJobs.value.some((job) => (job.status === 'pending' || job.status === 'generating') && job.approval_status !== 'pending') && mediaPollTimer) {
       clearInterval(mediaPollTimer)
       mediaPollTimer = null
     }
@@ -202,7 +216,7 @@ async function newConversation(): Promise<void> {
 }
 
 async function selectFastDomain(domain: FastDomain | null): Promise<void> {
-  if (props.domain || switchingFastDomain.value) return
+  if (props.domain || switchingFastDomain.value || fastDomainTaskId.value) return
   if (!conversationId.value) await initialize()
   if (!conversationId.value || domain === fastDomain.value) return
   switchingFastDomain.value = true
@@ -268,6 +282,9 @@ async function refreshInlineRun(runId: string, includeDetails = true): Promise<v
   if (run) {
     activeRun.value = run
     updateInline(runId, { run })
+    if (['completed', 'failed', 'cancelled'].includes(run.status) && conversationId.value) {
+      void refreshFastDomain(conversationId.value)
+    }
   }
   const artifact = artifacts?.find((item) => item.type === 'image' || item.type === 'video') ?? null
   const patch: Partial<InlineRunState> = {}
@@ -323,7 +340,7 @@ function followHomeRun(run: CoreRun, anchor: string): void {
       void refreshInlineRun(run.id, ['approval_required', 'approval_resolved', 'artifact_created', 'run_completed', 'run_failed', 'run_cancelled'].includes(event.event_type)).catch(() => {})
       emit('refresh')
     },
-    onEnd: () => { homeStops.get(run.id)?.(); homeStops.delete(run.id); void refreshInlineRun(run.id).catch(() => {}) },
+    onEnd: () => { homeStops.get(run.id)?.(); homeStops.delete(run.id); void refreshInlineRun(run.id).catch(() => {}); if (conversationId.value) void refreshFastDomain(conversationId.value) },
   })
   homeStops.set(run.id, stop)
 }
@@ -336,10 +353,6 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
     await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
         onIntent: (plan) => {
           if (conversationId.value !== task.conversationId || plan.execution_mode !== 'fast') return
-          if (plan.domain && ['comic', 'commerce', 'studio'].includes(plan.domain)) {
-            fastDomain.value = plan.domain as FastDomain
-            domainHint.value = fastDomain.value
-          }
         },
         onDelta: (delta) => {
           if (conversationId.value === task.conversationId) {
@@ -385,6 +398,10 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
         },
         onImageEvent: (name, event) => {
           if (conversationId.value !== task.conversationId) return
+          if (name === 'cost_approval') {
+            void refreshActiveMedia(task.conversationId)
+            return
+          }
           if (name === 'image_generating') startMediaPolling(task.conversationId)
           if (event.generation_request_id !== task.id) return
           if (name === 'prompt_prepared' || name === 'image_generating') {
@@ -401,7 +418,7 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
             } }
           }
         },
-      }, fastDomain.value === 'commerce' ? 'demo' : dataMode.value, enhancePrompt.value, task.id)
+      }, task.domainHint === 'commerce' ? 'demo' : dataMode.value, enhancePrompt.value, task.id)
     const next = { ...pendingMessages.value }; delete next[task.id]; pendingMessages.value = next
   } catch (taskError) {
     const imageStarted = imagePhases.value[task.id]?.status === 'prepared' || imagePhases.value[task.id]?.status === 'generating'
@@ -416,7 +433,11 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
     const nextStreaming = { ...streamingByMessage.value }
     delete nextStreaming[task.id]
     streamingByMessage.value = nextStreaming
-    if (conversationId.value === task.conversationId) void refreshConversations()
+    if (conversationId.value === task.conversationId) {
+      void refreshConversations()
+      void refreshFastDomain(task.conversationId)
+      void refreshActiveMedia(task.conversationId)
+    }
   }
 }
 
@@ -494,6 +515,19 @@ async function decideInline(messageId: string, action: 'approve' | 'reject' | 'r
   } finally { deciding.value = false }
 }
 
+async function decideMedia(requestId: string, decision: 'approve' | 'reject'): Promise<void> {
+  if (!conversationId.value || deciding.value) return
+  deciding.value = true
+  try {
+    await decideMediaCost(conversationId.value, requestId, decision)
+    await refreshActiveMedia(conversationId.value)
+    if (decision === 'approve') startMediaPolling(conversationId.value)
+    else await refreshFastDomain(conversationId.value)
+  } catch (taskError) {
+    error.value = taskError instanceof Error ? taskError.message : '费用确认失败'
+  } finally { deciding.value = false }
+}
+
 function openRun(run: CoreRun): void { navigate({ name: 'workspace_run', domain: run.domain, runId: run.id }) }
 onMounted(initialize)
 onBeforeUnmount(() => {
@@ -535,9 +569,9 @@ watch(
       <SystemStatusInline :label="sending || Object.keys(streamingByMessage).length ? 'Kantoku 正在回复' : '就绪'" :tone="sending || Object.keys(streamingByMessage).length ? 'active' : 'neutral'" />
     </header>
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
-    <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @example="(text) => composer?.fill(text)" />
+    <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
     <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
-    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
+    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
     </div>
   </main>
 </template>

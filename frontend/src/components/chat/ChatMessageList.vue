@@ -36,6 +36,7 @@ const props = defineProps<{
 defineEmits<{
   retry: []; openRun: [run: CoreRun]; example: [text: string]
   decideInline: [messageId: string, action: 'approve' | 'reject' | 'revise', response: Record<string, unknown>]
+  decideMedia: [generationRequestId: string, decision: 'approve' | 'reject']
 }>()
 const scroller = ref<HTMLElement | null>(null)
 const previewDialog = ref<HTMLDialogElement | null>(null)
@@ -127,6 +128,11 @@ function mediaJobForUser(message: ConversationMessage): MediaJob | undefined {
   const requestId = message.event_id?.startsWith('generation-user:')
     ? message.event_id.slice('generation-user:'.length) : null
   return requestId ? props.mediaJobs?.find((job) => job.generation_request_id === requestId) : undefined
+}
+
+function awaitingCost(requestId: string): MediaJob | undefined {
+  return props.mediaJobs?.find((job) =>
+    job.generation_request_id === requestId && job.approval_status === 'pending')
 }
 
 function hasImagePrompt(requestId: string): boolean {
@@ -270,7 +276,12 @@ function activityText(event: RuntimeEvent): string {
       <template v-for="(message, index) in messages" :key="message.id">
         <UserMessageBubble v-if="message.role === 'user'" :content="message.content" :pending="homeMode && !activityByMessage?.[message.id] && !imagePhases?.[message.id] ? pendingMessages?.[message.id] : undefined" />
         <div v-if="homeMode && mediaJobForUser(message) && !hasImagePrompt(mediaJobForUser(message)!.generation_request_id)" class="chat-image-generation" aria-live="polite">
-          <template v-if="['pending', 'generating'].includes(mediaJobForUser(message)!.status)">
+          <div v-if="awaitingCost(mediaJobForUser(message)!.generation_request_id)" class="chat-cost-card">
+            <strong>本次生图需要确认费用</strong>
+            <p>预计 ¥{{ ((mediaJobForUser(message)!.estimate_fen ?? 0) / 100).toFixed(2) }}。确认后才会开始生成；取消则不会提交付费任务。</p>
+            <div><button type="button" :disabled="approvalBusy" @click="$emit('decideMedia', mediaJobForUser(message)!.generation_request_id, 'reject')">取消</button><button type="button" :disabled="approvalBusy" class="primary" @click="$emit('decideMedia', mediaJobForUser(message)!.generation_request_id, 'approve')">确认并生成</button></div>
+          </div>
+          <template v-else-if="['pending', 'generating'].includes(mediaJobForUser(message)!.status)">
             <div class="chat-image-wave" role="status" :aria-label="mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片'"><span v-for="(character, position) in (mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span></div>
             <div class="chat-image-skeleton" role="img" aria-label="图片生成中"></div>
           </template>
@@ -278,12 +289,17 @@ function activityText(event: RuntimeEvent): string {
         </div>
         <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" />
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
+          <div v-if="awaitingCost(imageRequestId(message)!)" class="chat-cost-card">
+            <strong>本次生图需要确认费用</strong>
+            <p>预计 ¥{{ ((awaitingCost(imageRequestId(message)!)!.estimate_fen ?? 0) / 100).toFixed(2) }}。确认后才会开始生成；取消则不会提交付费任务。</p>
+            <div><button type="button" :disabled="approvalBusy" @click="$emit('decideMedia', imageRequestId(message)!, 'reject')">取消</button><button type="button" :disabled="approvalBusy" class="primary" @click="$emit('decideMedia', imageRequestId(message)!, 'approve')">确认并生成</button></div>
+          </div>
           <template v-if="imageResult(imageRequestId(message)!)?.artifact_id">
             <ChatImageAttachment v-if="messageMedia?.[imageResult(imageRequestId(message)!)!.id]" :media="messageMedia[imageResult(imageRequestId(message)!)!.id]" @open="openImage" />
             <p v-else-if="messageMediaErrors?.[imageResult(imageRequestId(message)!)!.id]" class="chat-image-load-error" role="alert">图片已保存，但预览暂时无法加载。</p>
             <div v-else class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="status" aria-label="正在载入图片"></div>
           </template>
-          <template v-else-if="['generating', 'ready', 'summarized'].includes(imagePhases?.[imageRequestId(message)!]?.status ?? '')">
+          <template v-else-if="!awaitingCost(imageRequestId(message)!) && ['generating', 'ready', 'summarized'].includes(imagePhases?.[imageRequestId(message)!]?.status ?? '')">
             <div class="chat-image-wave" role="status" :aria-label="imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片'">
               <span v-for="(character, position) in (imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span>
             </div>

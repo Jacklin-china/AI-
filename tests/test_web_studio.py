@@ -25,7 +25,7 @@ from kantoku.core.conversations import (
     MessageRole,
     MessageType,
 )
-from kantoku.core.runtime.models import ArtifactType
+from kantoku.core.runtime.models import ArtifactType, ExecutionStatus
 from kantoku.domains.comic import services as comic_services
 from kantoku.perception import report, review
 from kantoku.schemas.media import ImageGenerationResult
@@ -1097,6 +1097,7 @@ def test_media_job_cannot_claim_completion_without_real_artifact(
 def test_home_image_over_auto_budget_never_submits(
     app: web_studio.StudioApplication,
 ) -> None:
+    web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
     conversation = app.create_conversation({"interaction_mode": "autonomous"})
     events = list(app.stream_conversation(conversation["id"], {
         "content": "生成两张蜡笔小新头像",
@@ -1105,6 +1106,9 @@ def test_home_image_over_auto_budget_never_submits(
     assert not any(name in {"run", "activity"} for name, _ in events)
     assert next(payload for name, payload in events if name == "message")["type"] == "text"
     assert app.image_service.provider.submit_count == 0
+    job = app.runtime_store.get_media_job("generation-over-auto-test")
+    assert job.approval_status == "pending"
+    assert job.estimate_fen == 30
     assert not app.runtime_store.list_runs()
     assert not app.runtime_store.list_artifacts(conversation_id=conversation["id"])
 
@@ -1343,6 +1347,8 @@ def test_reopened_chat_keeps_polling_existing_provider_job_until_ready(
     app._media_futures[request_id].result(timeout=5)
     detail = app.conversation(conversation["id"])
     assert detail["media_jobs"][0]["status"] == "completed"
+    assert detail["domain"] is None
+    assert detail["fast_domain_task_id"] is None
     assert any(message["artifact_id"] for message in detail["messages"])
     assert provider.submit_count == 1
     assert query_count == 3
@@ -1450,6 +1456,143 @@ def test_home_fast_commerce_reuses_workflow_without_professional_approvals(
     )
     assert any("Mock" in payload["content"] for name, payload in events if name == "message"
                and payload["role"] == "assistant")
+    assert app.conversation(conversation_id)["domain"] is None
+
+
+def test_home_cost_confirmation_resumes_same_media_job(
+    app: web_studio.StudioApplication,
+) -> None:
+    web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
+    conversation = app.create_conversation({"interaction_mode": "autonomous"})
+    conversation_id = conversation["id"]
+    app.set_fast_domain(conversation_id, "studio")
+    request_id = "generation-cost-confirmation"
+    events = list(app.stream_conversation(conversation_id, {
+        "content": "画一只森林中的卡通小熊", "generation_request_id": request_id,
+    }))
+    assert any(name == "cost_approval" for name, _ in events)
+    assert app.image_service.provider.submit_count == 0
+    waiting = app.conversation(conversation_id)
+    assert waiting["domain"] == "studio"
+    assert waiting["fast_domain_task_id"] == request_id
+    assert waiting["media_jobs"][0]["approval_status"] == "pending"
+
+    app.decide_media_cost(conversation_id, request_id, True)
+    app._media_futures[request_id].result(timeout=10)
+    complete = app.conversation(conversation_id)
+    assert app.image_service.provider.submit_count == 1
+    assert complete["domain"] is None
+    assert complete["fast_domain_task_id"] is None
+    assert complete["media_jobs"][0]["status"] == "completed"
+    assert any(message["artifact_id"] for message in complete["messages"])
+    with pytest.raises(ToolError):
+        app.decide_media_cost(conversation_id, request_id, True)
+    assert app.image_service.provider.submit_count == 1
+
+
+def test_home_cost_rejection_never_submits(
+    app: web_studio.StudioApplication,
+) -> None:
+    web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    list(app.stream_conversation(conversation_id, {
+        "content": "画一只卡通小熊", "generation_request_id": "generation-cost-rejected",
+    }))
+    app.decide_media_cost(conversation_id, "generation-cost-rejected", False)
+    assert app.image_service.provider.submit_count == 0
+    assert app.conversation(conversation_id)["media_jobs"][0]["status"] == "failed"
+
+
+def test_pending_cost_confirmation_survives_restart_without_submit(
+    app: web_studio.StudioApplication,
+) -> None:
+    web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    request_id = "generation-approval-restart"
+    list(app.stream_conversation(conversation_id, {
+        "content": "画一只森林中的卡通小熊", "generation_request_id": request_id,
+    }))
+    restarted = web_studio.StudioApplication()
+    assert restarted.image_service.provider.submit_count == 0
+    assert restarted.conversation(conversation_id)["media_jobs"][0]["approval_status"] == "pending"
+    restarted.decide_media_cost(conversation_id, request_id, True)
+    restarted._media_futures[request_id].result(timeout=10)
+    assert restarted.image_service.provider.submit_count == 1
+    assert restarted.conversation(conversation_id)["media_jobs"][0]["status"] == "completed"
+
+
+def test_home_over_twenty_requires_confirmation_then_executes(
+    app: web_studio.StudioApplication,
+) -> None:
+    settings = web_studio.get_settings()
+    settings.budget.autonomous_image_auto_cny = Decimal("20")
+    settings.budget.autonomous_image_daily_cny = Decimal("100")
+    settings.budget.image_conversation_cny = Decimal("100")
+    settings.budget.image_estimated_cny_per_call = Decimal("20.01")
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    request_id = "generation-over-twenty"
+    events = list(app.stream_conversation(conversation_id, {
+        "content": "画一只竹林里的卡通小熊", "generation_request_id": request_id,
+    }))
+    assert next(payload for name, payload in events if name == "cost_approval") == {
+        "generation_request_id": request_id, "estimate_fen": 2001,
+    }
+    assert app.image_service.provider.submit_count == 0
+    app.decide_media_cost(conversation_id, request_id, True)
+    app._media_futures[request_id].result(timeout=10)
+    assert app.image_service.provider.submit_count == 1
+    assert app.conversation(conversation_id)["media_jobs"][0]["status"] == "completed"
+
+
+def test_home_cost_confirmation_http_api(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    request_id = "generation-http-cost"
+    list(app.stream_conversation(conversation_id, {
+        "content": "画一只卡通小熊", "generation_request_id": request_id,
+    }))
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    try:
+        connection.request(
+            "POST", f"/api/conversations/{conversation_id}/media-jobs/{request_id}/approval",
+            body=json.dumps({"decision": "reject"}),
+            headers={"X-Studio-Token": app.token, "Content-Type": "application/json"},
+        )
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["status"] == "failed"
+        assert app.image_service.provider.submit_count == 0
+    finally:
+        connection.close()
+
+
+def test_selected_fast_domain_does_not_leak_to_next_message(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(app.runner, "submit", lambda _execute: None)
+    monkeypatch.setattr(web_studio, "stream_chat", lambda *_args, **_kwargs: iter(["你好。"]))
+    monkeypatch.setattr(
+        web_studio, "plan_creative_turn",
+        lambda content, _prior, **_kwargs: creative.CreativeDecision(
+            action="chat", request=content,
+        ),
+    )
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    app.set_fast_domain(conversation_id, "comic")
+    first = list(app.stream_conversation(conversation_id, {
+        "content": "帮我制作三镜头漫剧",
+    }))
+    run = next(payload for name, payload in first if name == "run")
+    assert app.conversation(conversation_id)["domain"] == "comic"
+    second = list(app.stream_conversation(conversation_id, {"content": "你好"}))
+    assert next(payload for name, payload in second if name == "intent")["domain"] is None
+    app.runtime_store.update_run(
+        run["id"], status=ExecutionStatus.COMPLETED, state=run["state"],
+        current_node="__end__",
+    )
+    assert app.conversation(conversation_id)["domain"] is None
 
 
 def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confirmation(
@@ -1471,7 +1614,7 @@ def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confi
     run = next(payload for name, payload in events if name == "run")
     assert run["workflow"] == "comic.production.v1"
     assert run["state"]["execution_mode"] == "fast"
-    assert run["state"]["confirmed"] is False
+    assert run["state"]["confirmed"] is True
     assert run["id"] in {
         item.id for item in app.runtime_store.list_runs(
             interaction_mode=InteractionMode.AUTONOMOUS,
@@ -1501,7 +1644,7 @@ def test_home_fast_mode_infers_domain_without_opening_professional_workflow_page
     assert intent["tool"] == "workflow.start"
     assert intent["domain"] == "comic"
     assert intent["execution_mode"] == "fast"
-    assert app.conversation(home["id"])["domain"] == "comic"
+    assert app.conversation(home["id"])["domain"] is None
     assert any(name == "run" for name, _ in events)
 
     guided = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})

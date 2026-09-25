@@ -249,6 +249,24 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
             ADD COLUMN reference_artifact_id TEXT REFERENCES artifacts(id);
         """,
     ),
+    (
+        11,
+        """
+        ALTER TABLE conversations ADD COLUMN fast_domain_task_id TEXT;
+        ALTER TABLE media_jobs ADD COLUMN estimate_fen INTEGER;
+        ALTER TABLE media_jobs ADD COLUMN approval_status TEXT;
+        UPDATE conversations SET domain=NULL
+        WHERE interaction_mode='autonomous' AND domain IS NOT NULL
+          AND (
+            active_run_id IN (
+                SELECT id FROM runs WHERE status IN ('completed','failed','cancelled')
+            ) OR id IN (
+                SELECT conversation_id FROM media_jobs
+                WHERE status IN ('completed','failed')
+            )
+          );
+        """,
+    ),
 )
 
 
@@ -356,10 +374,43 @@ class RuntimeStore:
         self.get_conversation(conversation_id)
         with self._connect() as connection:
             connection.execute(
-                "UPDATE conversations SET domain=?,updated_at=? WHERE id=?",
+                "UPDATE conversations SET domain=?,fast_domain_task_id=NULL,updated_at=? "
+                "WHERE id=? AND fast_domain_task_id IS NULL",
                 (domain, utc_now().isoformat(), conversation_id),
             )
         return self.get_conversation(conversation_id)
+
+    def bind_fast_domain_task(self, conversation_id: str, task_id: str) -> None:
+        """Bind the selected home context to exactly one task."""
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET fast_domain_task_id=?,updated_at=? "
+                "WHERE id=? AND domain IS NOT NULL AND fast_domain_task_id IS NULL",
+                (task_id, utc_now().isoformat(), conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("快捷功能已被当前任务占用")
+
+    def transfer_fast_domain_task(
+        self, conversation_id: str, previous_id: str, task_id: str,
+    ) -> None:
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "UPDATE conversations SET fast_domain_task_id=? "
+                "WHERE id=? AND fast_domain_task_id=?",
+                (task_id, conversation_id, previous_id),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("快捷任务上下文已变化")
+
+    def finish_fast_domain_task(self, conversation_id: str, task_id: str) -> None:
+        """Clear only the selection belonging to this task, never a newer one."""
+        with self._connect() as connection:
+            connection.execute(
+                "UPDATE conversations SET domain=NULL,fast_domain_task_id=NULL,updated_at=? "
+                "WHERE id=? AND fast_domain_task_id=?",
+                (utc_now().isoformat(), conversation_id, task_id),
+            )
 
     def delete_conversation(self, conversation_id: str) -> None:
         """Hide only the conversation; Runs, artifacts and ledgers remain untouched."""
@@ -463,7 +514,8 @@ class RuntimeStore:
 
     def create_media_job(
         self, generation_request_id: str, conversation_id: str, user_message_id: str,
-        *, media_type: str = "image",
+        *, media_type: str = "image", estimate_fen: int | None = None,
+        approval_required: bool = False,
     ) -> MediaJobRecord:
         """Persist a Conversation-owned job before provider work starts."""
         self.get_conversation(conversation_id)
@@ -474,9 +526,11 @@ class RuntimeStore:
             connection.execute(
                 "INSERT OR IGNORE INTO media_jobs "
                 "(generation_request_id,conversation_id,user_message_id,media_type,"
-                "status,created_at,updated_at) VALUES (?,?,?,?,?,?,?)",
+                "status,created_at,updated_at,estimate_fen,approval_status) "
+                "VALUES (?,?,?,?,?,?,?,?,?)",
                 (generation_request_id, conversation_id, user_message_id,
-                 media_type, MediaJobStatus.PENDING.value, now, now),
+                 media_type, MediaJobStatus.PENDING.value, now, now, estimate_fen,
+                 "pending" if approval_required else None),
             )
             row = connection.execute(
                 "SELECT * FROM media_jobs WHERE generation_request_id=?",
@@ -488,6 +542,23 @@ class RuntimeStore:
         ):
             raise ToolError("媒体任务 ID 已属于其他对话请求")
         return job
+
+    def decide_media_job_cost(
+        self, generation_request_id: str, conversation_id: str, approve: bool,
+    ) -> MediaJobRecord:
+        """Persist the user's decision before a paid job can be recovered/submitted."""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            cursor = connection.execute(
+                "UPDATE media_jobs SET approval_status=?,updated_at=? WHERE "
+                "generation_request_id=? AND conversation_id=? AND status='pending' "
+                "AND approval_status='pending'",
+                ("approved" if approve else "rejected", utc_now().isoformat(),
+                 generation_request_id, conversation_id),
+            )
+            if cursor.rowcount != 1:
+                raise ToolError("费用确认已处理或任务不存在")
+        return self.get_media_job(generation_request_id)
 
     def get_media_job(self, generation_request_id: str) -> MediaJobRecord | None:
         with self._connect() as connection:
@@ -567,6 +638,7 @@ class RuntimeStore:
             media_type=row["media_type"], status=row["status"],
             artifact_id=row["artifact_id"], error_id=row["error_id"],
             error_message=row["error_message"],
+            estimate_fen=row["estimate_fen"], approval_status=row["approval_status"],
             created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
         )
 
@@ -596,6 +668,7 @@ class RuntimeStore:
         return ConversationRecord(
             id=row["id"], title=row["title"], interaction_mode=row["interaction_mode"],
             domain=row["domain"], active_run_id=row["active_run_id"],
+            fast_domain_task_id=row["fast_domain_task_id"],
             created_at=_time(row["created_at"]), updated_at=_time(row["updated_at"]),
         )
 

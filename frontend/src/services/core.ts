@@ -1,4 +1,4 @@
-import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreBatch, CoreRun, IntentPlan } from '../types'
+import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreBatch, CoreRun, IntentPlan, MediaJob } from '../types'
 
 export interface RuntimeEvent {
   id: number
@@ -270,6 +270,15 @@ export async function setConversationFastDomain(
   return response.json() as Promise<Conversation>
 }
 
+export function decideMediaCost(
+  conversationId: string, generationRequestId: string, decision: 'approve' | 'reject',
+): Promise<MediaJob> {
+  return corePost<MediaJob>(
+    `/api/conversations/${encodeURIComponent(conversationId)}/media-jobs/${encodeURIComponent(generationRequestId)}/approval`,
+    { decision },
+  )
+}
+
 export async function deleteConversation(id: string): Promise<void> {
   await ensureToken()
   const response = await fetch(api(`/api/conversations/${encodeURIComponent(id)}`), {
@@ -282,7 +291,7 @@ export async function getConversation(id: string): Promise<Conversation | null> 
   return coreGet<Conversation>(`/api/conversations/${encodeURIComponent(id)}`, `conversation:${id}`)
 }
 
-export type ImageGenerationEventName = 'prompt_prepared' | 'image_generating' | 'image_ready' | 'image_summary' | 'image_failed'
+export type ImageGenerationEventName = 'prompt_prepared' | 'image_generating' | 'image_ready' | 'image_summary' | 'image_failed' | 'cost_approval'
 export interface ImageGenerationEvent {
   generation_request_id: string
   message_id?: string
@@ -334,7 +343,7 @@ export async function streamConversationMessage(
       else if (event === 'message') handlers.onMessage?.(payload as unknown as ConversationMessage)
       else if (event === 'run') handlers.onRun?.(payload as unknown as CoreRun)
       else if (event === 'activity') handlers.onActivity?.(payload as { generation_request_id: string; status: string; label: string })
-      else if (['prompt_prepared', 'image_generating', 'image_ready', 'image_summary', 'image_failed'].includes(event)) {
+      else if (['prompt_prepared', 'image_generating', 'image_ready', 'image_summary', 'image_failed', 'cost_approval'].includes(event)) {
         handlers.onImageEvent?.(event as ImageGenerationEventName, payload as unknown as ImageGenerationEvent)
       }
       else if (event === 'error') {

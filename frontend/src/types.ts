@@ -215,6 +215,8 @@ export interface MediaJob {
   artifact_id: string | null
   error_id: string | null
   error_message: string | null
+  estimate_fen: number | null
+  approval_status: 'pending' | 'approved' | 'rejected' | null
   created_at: string
   updated_at: string
 }
@@ -226,6 +228,7 @@ export interface Conversation {
   execution_mode: 'fast' | 'professional'
   domain: string | null
   active_run_id: string | null
+  fast_domain_task_id: string | null
   created_at: string
   updated_at: string
   messages?: ConversationMessage[]

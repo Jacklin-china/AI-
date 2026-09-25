@@ -39,6 +39,7 @@ class ConversationRecord(BaseModel):
     interaction_mode: InteractionMode
     domain: str | None = None
     active_run_id: str | None = None
+    fast_domain_task_id: str | None = None
     created_at: datetime
     updated_at: datetime
 
@@ -78,6 +79,8 @@ class MediaJobRecord(BaseModel):
     artifact_id: str | None = None
     error_id: str | None = None
     error_message: str | None = None
+    estimate_fen: int | None = None
+    approval_status: str | None = None
     created_at: datetime
     updated_at: datetime
 
