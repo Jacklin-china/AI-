@@ -1,16 +1,11 @@
 <script setup lang="ts">
 import { computed } from 'vue'
+import { renderInlineMarkdown as inline } from './inlineMarkdown'
 
 const props = defineProps<{ content: string; live?: boolean; showMark?: boolean }>()
 
 function escapeHtml(value: string): string {
   return value.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
-}
-
-function inline(value: string): string {
-  return escapeHtml(value)
-    .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
-    .replace(/`([^`]+)`/g, '<code>$1</code>')
 }
 
 function markdown(value: string): string {

@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import re
+import socket
 from dataclasses import dataclass
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote_plus, urlparse
-from urllib.request import Request, urlopen
+from urllib.request import HTTPRedirectHandler, Request, build_opener, urlopen
 
 from kantoku.config.settings import SearchSettings
 from kantoku.core.llm import chat
@@ -21,14 +23,94 @@ class SearchResult:
     domain: str
 
 
+class _PageTextParser(HTMLParser):
+    """Extract a bounded amount of readable text from an already visited page."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.suppressed = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        if tag in {"script", "style", "noscript", "svg"}:
+            self.suppressed += 1
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag in {"script", "style", "noscript", "svg"} and self.suppressed:
+            self.suppressed -= 1
+
+    def handle_data(self, data: str) -> None:
+        if not self.suppressed and sum(map(len, self.parts)) < 2500:
+            text = " ".join(data.split())
+            if text:
+                self.parts.append(text)
+
+
+def _require_public_https(url: str) -> None:
+    """Reject local/private destinations before every request and redirect."""
+    parsed = urlparse(url)
+    hostname = parsed.hostname
+    if (parsed.scheme != "https" or not hostname or parsed.username or parsed.password
+            or parsed.port not in {None, 443} or hostname.endswith((".local", ".internal"))):
+        raise ValueError("搜索结果不是安全的公开 HTTPS 页面")
+    addresses = socket.getaddrinfo(hostname, 443, type=socket.SOCK_STREAM)
+    if not addresses or any(
+        not ipaddress.ip_address(address[4][0]).is_global for address in addresses
+    ):
+        raise ValueError("搜索结果指向非公开地址")
+
+
+class _PublicRedirectHandler(HTTPRedirectHandler):
+    def redirect_request(
+        self, request: Request, fp: object, code: int, msg: str,
+        headers: object, newurl: str,
+    ) -> Request | None:
+        _require_public_https(newurl)
+        return super().redirect_request(request, fp, code, msg, headers, newurl)
+
+
+def visit_search_result(result: SearchResult, settings: SearchSettings) -> SearchResult:
+    """Fetch one public result and return it only after an actual successful visit."""
+    _require_public_https(result.url)
+    request = Request(result.url, headers={
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 Chrome/120.0 Safari/537.36"
+        ),
+    })
+    with build_opener(_PublicRedirectHandler()).open(
+        request, timeout=settings.timeout_s,
+    ) as response:
+        final_url = response.geturl()
+        _require_public_https(final_url)
+        content_type = response.headers.get_content_type()
+        if content_type not in {"text/html", "text/plain"}:
+            raise ValueError("搜索结果不是可读网页")
+        charset = response.headers.get_content_charset() or "utf-8"
+        payload = response.read(300_001)
+    if len(payload) > 300_000:
+        payload = payload[:300_000]
+    decoded = payload.decode(charset, errors="replace")
+    if content_type == "text/html":
+        parser = _PageTextParser()
+        parser.feed(decoded)
+        page_text = " ".join(parser.parts)[:1800]
+    else:
+        page_text = " ".join(decoded.split())[:1800]
+    if not page_text:
+        raise ValueError("搜索结果页面没有可读内容")
+    return SearchResult(result.title, final_url, page_text, urlparse(final_url).hostname or "")
+
+
 def plan_web_search(content: str, *, trace_id: str) -> str | None:
     """Let the configured chat model decide whether current public facts are needed."""
     response = chat(
         [
             {"role": "system", "content": (
                 "Decide whether the user's question requires live public web information. "
-                "Search for current events, changing facts, or requested sources; do not search "
-                "for greetings, private conversation, or creative generation. "
+                "Search for current events, changing facts, requested sources, or factual "
+                "claims you cannot answer reliably without verification. Do not search "
+                "for greetings, simple stable facts, private conversation, or creative generation. "
                 'Return only JSON: {"search":true|false,"query":"short search terms"}. '
                 "Never claim to have searched."
             )},

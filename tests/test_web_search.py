@@ -1,4 +1,4 @@
-"""Public search decisions and RSS source reporting."""
+"""Public search decisions, result parsing, and safe source visits."""
 
 from types import SimpleNamespace
 
@@ -26,3 +26,10 @@ def test_search_html_only_reports_returned_https_domains() -> None:
     assert len(results) == 1
     assert results[0].domain == "example.org"
     assert results[0].url == "https://example.org/a"
+
+
+def test_search_visit_rejects_private_addresses() -> None:
+    with pytest.raises(ValueError, match="非公开地址"):
+        web_search._require_public_https("https://127.0.0.1/private")
+    with pytest.raises(ValueError, match="公开 HTTPS"):
+        web_search._require_public_https("http://example.org/")

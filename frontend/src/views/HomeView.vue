@@ -353,7 +353,6 @@ function followHomeRun(run: CoreRun, anchor: string): void {
 
 async function runHomeMessage(task: QueuedMessage): Promise<void> {
   pendingMessages.value = { ...pendingMessages.value, [task.id]: 'replying' }
-  if (conversationId.value === task.conversationId) activityByMessage.value = { ...activityByMessage.value, [task.id]: '正在理解需求' }
   let anchor = task.id
   let persistedUserMessageId: string | null = null
   let bound = false

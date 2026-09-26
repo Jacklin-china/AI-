@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onMounted, ref, watch } from 'vue'
-import { ArrowDown, Download, RotateCcw, X } from 'lucide-vue-next'
+import { ArrowDown, ChevronDown, Download, RotateCcw, X } from 'lucide-vue-next'
 import type { ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../../types'
 import { presenterFor } from '../../domains/presenters'
 import type { RuntimeEvent } from '../../services/core'
@@ -49,6 +49,8 @@ const previewScale = ref(1)
 const previewX = ref(0)
 const previewY = ref(0)
 const dragging = ref(false)
+const expandedSearch = ref<Record<string, boolean>>({})
+const expandedRuns = ref<Record<string, boolean>>({})
 let dragStart = { x: 0, y: 0, offsetX: 0, offsetY: 0 }
 const atBottom = ref(true)
 async function openImage(media: { url: string; filename: string }): Promise<void> {
@@ -171,6 +173,55 @@ function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
     asset_generation: '正在制作素材', localize: '正在整理内容',
   }
   return labels[run.current_node] ?? '正在处理'
+}
+
+function searchFinished(messageId: string): boolean {
+  return props.publicActivities?.[messageId]?.some((item) => item.kind === 'search_complete') ?? false
+}
+
+function searchSummary(messageId: string): string {
+  return props.publicActivities?.[messageId]?.find((item) => item.kind === 'search_complete')?.label ?? ''
+}
+
+function activityLabel(messageId: string, item: { kind: string; label: string }): string {
+  if (!searchFinished(messageId)) return item.label
+  if (item.kind === 'search' && item.label === '正在搜索网页') return '已搜索网页'
+  if (item.kind === 'organizing') return '已整理搜索结果'
+  return item.label
+}
+
+function runActivityTitle(run: CoreRun): string {
+  const domain = ({ comic: '漫剧创作', commerce: '电商创作', studio: '视觉创作' } as Record<string, string>)[run.domain]
+    ?? '创作任务'
+  if (run.status === 'completed') return `已完成${domain}`
+  if (run.status === 'failed') return `${domain}未完成`
+  if (run.status === 'cancelled') return `${domain}已取消`
+  return `正在执行${domain}`
+}
+
+function runExpanded(run: CoreRun): boolean {
+  return expandedRuns.value[run.id] ?? !['completed', 'failed', 'cancelled'].includes(run.status)
+}
+
+function toggleRun(run: CoreRun): void {
+  expandedRuns.value = { ...expandedRuns.value, [run.id]: !runExpanded(run) }
+}
+
+function runSteps(state: InlineRunState): { id: string; label: string; status: string }[] {
+  const latest = new Map<string, RuntimeEvent>()
+  for (const event of [...state.activities].sort((a, b) => a.sequence - b.sequence)) {
+    if (event.node_id && ['node_started', 'node_progress', 'node_retrying', 'node_completed', 'node_failed'].includes(event.event_type)) {
+      latest.set(event.node_id, event)
+    }
+  }
+  return [...latest.values()].slice(-8).map((event) => ({
+    id: event.node_id!,
+    label: presenterFor(state.run.domain).nodeLabel(event.node_id!),
+    status: ({
+      node_started: '正在执行', node_progress: '正在执行', node_retrying: '正在重试',
+      node_completed: '已完成', node_failed: '执行失败',
+    } as Record<string, string>)[event.event_type] ?? '',
+  }))
 }
 
 function fastCommerceSummary(run: CoreRun): string {
@@ -312,10 +363,15 @@ function activityText(event: RuntimeEvent): string {
         </div>
         <p v-if="homeMode && activityByMessage?.[message.id]" class="chat-inline-status chat-direct-status">{{ activityByMessage[message.id] }}</p>
         <div v-if="homeMode && publicActivities?.[message.id]?.length" class="chat-public-activity" aria-label="公开执行摘要" aria-live="polite">
-          <div v-for="(item, activityIndex) in publicActivities[message.id]" :key="activityIndex" class="chat-public-activity-item" :data-kind="item.kind">
-            <span class="chat-public-activity-dot" aria-hidden="true"></span>
-            <div><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></div>
-          </div>
+          <button v-if="searchFinished(message.id)" type="button" class="chat-activity-toggle" :aria-expanded="!!expandedSearch[message.id]" @click="expandedSearch = { ...expandedSearch, [message.id]: !expandedSearch[message.id] }">
+            <span>{{ searchSummary(message.id) }}</span><ChevronDown :size="13" :class="{ expanded: expandedSearch[message.id] }" aria-hidden="true" />
+          </button>
+          <template v-if="!searchFinished(message.id) || expandedSearch[message.id]">
+            <div v-for="(item, activityIndex) in publicActivities[message.id].filter((entry) => entry.kind !== 'search_complete')" :key="activityIndex" class="chat-public-activity-item" :data-kind="item.kind">
+              <span class="chat-public-activity-dot" aria-hidden="true"></span>
+              <div><strong>{{ activityLabel(message.id, item) }}</strong><small v-if="item.detail">{{ item.detail }}</small></div>
+            </div>
+          </template>
         </div>
         <ChatImageAttachment v-if="homeMode && messageMedia?.[message.id]?.type === 'image' && !isHomeImageArtifact(message)" :media="messageMedia[message.id]" @open="openImage" />
         <figure v-else-if="homeMode && messageMedia?.[message.id]?.type === 'video' && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
@@ -325,7 +381,17 @@ function activityText(event: RuntimeEvent): string {
         <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" :show-mark="false" />
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
         <section v-if="homeMode && inlineRuns?.[message.id]" class="chat-inline-activity" aria-live="polite">
-          <p class="chat-inline-status">{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</p>
+          <div class="chat-public-activity chat-run-feed">
+            <button type="button" class="chat-activity-toggle" :aria-expanded="runExpanded(inlineRuns[message.id].run)" @click="toggleRun(inlineRuns[message.id].run)">
+              <span>{{ runActivityTitle(inlineRuns[message.id].run) }}</span><small>{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</small><ChevronDown :size="13" :class="{ expanded: runExpanded(inlineRuns[message.id].run) }" aria-hidden="true" />
+            </button>
+            <template v-if="runExpanded(inlineRuns[message.id].run)">
+              <div v-for="step in runSteps(inlineRuns[message.id])" :key="step.id" class="chat-public-activity-item" :data-kind="step.status === '已完成' ? 'site_visited' : 'workflow'">
+                <span class="chat-public-activity-dot" aria-hidden="true"></span>
+                <div><strong>{{ step.label }}</strong><small>{{ step.status }}</small></div>
+              </div>
+            </template>
+          </div>
           <p v-if="fastCommerceSummary(inlineRuns[message.id].run)" class="chat-inline-qc">{{ fastCommerceSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>

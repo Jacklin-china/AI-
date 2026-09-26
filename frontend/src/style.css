@@ -601,8 +601,16 @@
 .chat-empty-brand + .list-empty-hint { margin: 6px auto auto; }
 .chat-public-activity { display: grid; gap: 6px; width: min(100%, 570px); margin: -9px 0 0; padding: 10px 13px; border-left: 1px solid var(--border); background: #f8fafb; }
 .chat-public-activity-item { display: flex; align-items: flex-start; gap: 9px; min-width: 0; color: var(--text-secondary); }
+.chat-activity-toggle { display: flex; align-items: center; gap: 8px; width: 100%; padding: 0; border: 0; background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
+.chat-activity-toggle:hover, .chat-activity-toggle:focus-visible { color: var(--text-primary); }
+.chat-activity-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 3px; }
+.chat-activity-toggle span { font-size: 11.5px; font-weight: 600; }
+.chat-activity-toggle small { margin-left: auto; color: var(--text-muted); font-size: 10.5px; }
+.chat-activity-toggle svg { margin-left: auto; transition: transform .15s ease; }
+.chat-activity-toggle small + svg { margin-left: 0; }
+.chat-activity-toggle svg.expanded { transform: rotate(180deg); }
 .chat-public-activity-dot { flex: 0 0 5px; width: 5px; height: 5px; margin-top: 7px; border-radius: 50%; background: #8ca2ad; }
-.chat-public-activity-item[data-kind="sources"] .chat-public-activity-dot { background: #468575; }
+.chat-public-activity-item[data-kind="site_visited"] .chat-public-activity-dot { background: #468575; }
 .chat-public-activity-item strong { display: block; font-size: 11.5px; font-weight: 600; line-height: 1.45; }
 .chat-public-activity-item small { display: block; margin-top: 1px; color: var(--text-muted); font-size: 11px; line-height: 1.5; overflow-wrap: anywhere; }
 .list-empty-hint:has(+ .list-examples) { margin-bottom: 0; }
@@ -635,6 +643,9 @@
 .home-message-scroller .chat-generated-image { width: min(420px, 100%); margin-left: 0; }
 .home-message-scroller .chat-direct-status, .home-message-scroller .chat-inline-error, .home-message-scroller .chat-inline-activity { margin-left: 0; }
 .home-message-scroller .chat-inline-activity { width: min(620px, 100%); }
+.home-message-scroller .chat-inline-activity:has(.chat-run-feed) { padding-left: 0; border-left: 0; }
+.chat-run-feed { margin: 0 0 8px; }
+@media (prefers-reduced-motion: reduce) { .chat-activity-toggle svg { transition: none; } }
 .assistant-mark { display: grid; flex: 0 0 27px; place-items: center; width: 27px; height: 27px; margin-top: 1px; border-radius: 6px; background: #20242a; color: #fff; font-size: 11px; font-weight: 700; }
 .assistant-mark.live { box-shadow: 0 0 0 3px rgba(52, 92, 170, .1); }
 .assistant-copy { flex: 1 1 auto; width: 100%; min-width: 0; max-width: 700px; padding-top: 2px; }
@@ -642,6 +653,7 @@
 .assistant-copy p:last-child { margin-bottom: 0; }
 .assistant-rich { width: 100%; min-width: 0; max-width: 700px; margin: 0 0 10px; color: var(--text-primary); font-size: 14px; line-height: 1.72; white-space: normal; word-break: normal; overflow-wrap: break-word; }.assistant-rich:last-child { margin-bottom: 0; }
 .assistant-rich p { white-space: normal; word-break: normal; overflow-wrap: break-word; }.assistant-rich strong { font-weight: 650; }.assistant-rich code { padding: 1px 4px; border-radius: 4px; background: var(--surface-subtle); font: 12px var(--font-mono, ui-monospace); }
+.assistant-rich a { color: var(--accent, #355f8a); text-decoration: underline; text-underline-offset: 3px; }.assistant-rich a:hover { text-decoration-thickness: 2px; }.assistant-rich a:focus-visible { outline: 2px solid var(--accent, #355f8a); outline-offset: 2px; border-radius: 2px; }
 .assistant-rich h2, .assistant-rich h3, .assistant-rich h4 { margin: 12px 0 5px; font-weight: 650; line-height: 1.4; }.assistant-rich h2 { font-size: 18px; }.assistant-rich h3 { font-size: 16px; }.assistant-rich h4 { font-size: 14px; }
 .assistant-rich ul, .assistant-rich ol { padding-left: 22px; margin: 7px 0 11px; }.assistant-rich li { padding-left: 2px; margin: 3px 0; }
 .assistant-rich blockquote { margin: 10px 0; padding: 2px 12px; border-left: 3px solid var(--border-strong); color: var(--text-secondary); }

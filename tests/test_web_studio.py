@@ -1609,7 +1609,14 @@ def test_home_chat_reports_only_actual_web_search_sources(
     monkeypatch.setattr(web_studio, "plan_web_search", lambda _content, **_kwargs: "北京热点")
     monkeypatch.setattr(web_studio, "search_web", lambda _query, _settings: [
         SearchResult("北京新闻", "https://example.org/story", "公开摘要", "example.org"),
+        SearchResult("未访问", "https://unvisited.example/story", "不得引用", "unvisited.example"),
     ])
+    def visit(result: SearchResult, _settings: object) -> SearchResult:
+        if result.domain == "unvisited.example":
+            raise OSError("不可访问")
+        return SearchResult(result.title, result.url, "实际网页内容", result.domain)
+
+    monkeypatch.setattr(web_studio, "visit_search_result", visit)
     captured: list[list[dict[str, str]]] = []
 
     def answer(messages: list[dict[str, str]], **_kwargs: object) -> Iterator[str]:
@@ -1625,10 +1632,24 @@ def test_home_chat_reports_only_actual_web_search_sources(
         if message.role == MessageRole.USER
     )
     activities = [payload for name, payload in events if name == "public_activity"]
-    assert [item["kind"] for item in activities] == ["search", "sources"]
+    assert [item["kind"] for item in activities] == [
+        "search", "site_visited", "organizing", "search_complete",
+    ]
     assert activities[0]["detail"] == "搜索：北京热点"
-    assert activities[1]["detail"] == "来源网站：example.org"
+    assert activities[1]["detail"] == "访问：example.org"
+    assert activities[-1]["label"] == "已搜索 1 个来源"
     assert "https://example.org/story" in captured[0][1]["content"]
+    assert "unvisited.example" not in captured[0][1]["content"]
+
+
+def test_home_plain_chat_has_no_search_activity(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(web_studio, "stream_chat", lambda *_args, **_kwargs: iter(["你好。"]))
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    events = list(app.stream_conversation(conversation_id, {"content": "你好"}))
+    assert not any(name == "public_activity" for name, _payload in events)
+    assert any(name == "delta" and payload["content"] == "你好。" for name, payload in events)
 
 
 def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confirmation(
