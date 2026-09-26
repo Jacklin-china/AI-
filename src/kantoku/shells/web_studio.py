@@ -1278,8 +1278,12 @@ class StudioApplication:
                 visited_sites = len(visited)
                 if visited:
                     yield "public_activity", {
+                        "kind": "search_ready", "label": "已完成网页检索",
+                        "detail": f"成功访问 {len(visited)} 个来源",
+                    }
+                    yield "public_activity", {
                         "kind": "organizing", "label": "正在整理搜索结果",
-                        "detail": "仅使用成功访问的公开网页",
+                        "detail": f"基于已访问的 {len(visited)} 个来源",
                     }
                     context = "\n".join(
                         f"- {result.title} | {result.url} | {result.snippet}"
@@ -1297,10 +1301,22 @@ class StudioApplication:
                         "kind": "search_error", "label": "未取得可核实的网页",
                         "detail": "本次没有成功访问可引用的来源",
                     }
-                    messages.insert(1, {"role": "system", "content": (
-                        "本次未能成功访问可靠的实时网页；不要声称已经联网验证，"
-                        "也不要引用搜索结果页中尚未访问的站点。"
-                    )})
+                    fallback = (
+                        "暂时未能访问到可核实的公开网页，因此无法可靠回答这条实时信息。"
+                        "请稍后重试。"
+                    )
+                    assistant = self.runtime_store.add_conversation_message(
+                        conversation_id, role=MessageRole.ASSISTANT,
+                        type=MessageType.TEXT, content=fallback,
+                    )
+                    yield "public_activity", {
+                        "kind": "search_complete", "label": "搜索未取得可核实来源",
+                        "detail": "",
+                    }
+                    yield "delta", {"content": fallback}
+                    yield "message", assistant.model_dump(mode="json")
+                    yield "done", {"run_id": None}
+                    return
         complete = ""
         try:
             for delta in stream_chat(messages, trace_id=trace_id):

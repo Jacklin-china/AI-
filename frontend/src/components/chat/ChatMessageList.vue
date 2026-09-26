@@ -328,7 +328,7 @@ function activityText(event: RuntimeEvent): string {
         </div>
       </template>
       <template v-for="(message, index) in messages" :key="message.id">
-        <UserMessageBubble v-if="message.role === 'user'" :content="message.content" :pending="homeMode && !activityByMessage?.[message.id] && !imagePhases?.[message.id] ? pendingMessages?.[message.id] : undefined" />
+        <UserMessageBubble v-if="message.role === 'user'" :content="message.content" :pending="homeMode && !activityByMessage?.[message.id] && !imagePhases?.[message.id] && !publicActivities?.[message.id]?.length ? pendingMessages?.[message.id] : undefined" />
         <div v-if="homeMode && mediaJobForUser(message) && !hasImagePrompt(mediaJobForUser(message)!.generation_request_id)" class="chat-image-generation" aria-live="polite">
           <div v-if="awaitingCost(mediaJobForUser(message)!.generation_request_id)" class="chat-cost-card">
             <strong>本次生图需要确认费用</strong>
@@ -395,9 +395,9 @@ function activityText(event: RuntimeEvent): string {
           <p v-if="fastCommerceSummary(inlineRuns[message.id].run)" class="chat-inline-qc">{{ fastCommerceSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>
-          <figure v-if="inlineRuns[message.id].imageUrl" class="chat-generated-image"><img :src="inlineRuns[message.id].imageUrl" alt="生成的图片" /><figcaption>{{ inlineRuns[message.id].artifact ? '图片已保存' : '图片已生成，等待审核' }}</figcaption></figure>
-          <figure v-if="inlineRuns[message.id].videoUrl" class="chat-generated-image"><video :src="inlineRuns[message.id].videoUrl" controls preload="metadata" /><figcaption>视频已保存</figcaption></figure>
-          <p v-else-if="inlineRuns[message.id].artifact?.type === 'video'" class="chat-inline-status">视频已保存，预览暂不可用。</p>
+          <figure v-if="inlineRuns[message.id].imageUrl && (inlineRuns[message.id].run.status === 'completed' || inlineRuns[message.id].approval?.request.kind === 'creative_review')" class="chat-generated-image"><img :src="inlineRuns[message.id].imageUrl" alt="生成的图片" /><figcaption>{{ inlineRuns[message.id].run.status === 'completed' ? '图片已保存' : '画面已生成，等待审核' }}</figcaption></figure>
+          <figure v-if="inlineRuns[message.id].videoUrl && inlineRuns[message.id].run.status === 'completed'" class="chat-generated-image"><video :src="inlineRuns[message.id].videoUrl" controls preload="metadata" /><figcaption>视频已保存</figcaption></figure>
+          <p v-else-if="inlineRuns[message.id].run.status === 'completed' && inlineRuns[message.id].artifact?.type === 'video'" class="chat-inline-status">视频已保存，预览暂不可用。</p>
           <ApprovalCard v-if="inlineRuns[message.id].approval" :approval="inlineRuns[message.id].approval!" :domain="inlineRuns[message.id].run.domain" :busy="approvalBusy ?? false" :image-url="inlineRuns[message.id].imageUrl" home-mode @decide="(action, response) => $emit('decideInline', message.id, action, response)" />
         </section>
         <div v-if="!homeMode && activityAnchor === index + 1 && activityLines.length" class="runtime-activity-list anchored" aria-label="任务进度">

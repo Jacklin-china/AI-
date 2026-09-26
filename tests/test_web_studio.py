@@ -1633,13 +1633,46 @@ def test_home_chat_reports_only_actual_web_search_sources(
     )
     activities = [payload for name, payload in events if name == "public_activity"]
     assert [item["kind"] for item in activities] == [
-        "search", "site_visited", "organizing", "search_complete",
+        "search", "site_visited", "search_ready", "organizing", "search_complete",
     ]
     assert activities[0]["detail"] == "搜索：北京热点"
     assert activities[1]["detail"] == "访问：example.org"
     assert activities[-1]["label"] == "已搜索 1 个来源"
     assert "https://example.org/story" in captured[0][1]["content"]
     assert "unvisited.example" not in captured[0][1]["content"]
+    kinds = [payload["kind"] if name == "public_activity" else name for name, payload in events]
+    assert kinds.index("search") < kinds.index("site_visited")
+    assert kinds.index("site_visited") < kinds.index("search_ready")
+    assert kinds.index("organizing") < kinds.index("delta")
+    assert kinds.index("delta") < kinds.index("search_complete")
+
+
+def test_home_search_without_visited_sources_never_calls_answer_model(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kantoku.capabilities.web_search import SearchResult
+
+    monkeypatch.setattr(web_studio, "plan_web_search", lambda _content, **_kwargs: "佛山天气")
+    monkeypatch.setattr(web_studio, "search_web", lambda _query, _settings: [
+        SearchResult("无法访问的网页", "https://example.org/weather", "摘要", "example.org"),
+    ])
+    def unavailable(_result: SearchResult, _settings: object) -> SearchResult:
+        raise OSError("页面不可访问")
+
+    monkeypatch.setattr(web_studio, "visit_search_result", unavailable)
+    def must_not_answer(*_args: object, **_kwargs: object) -> Iterator[str]:
+        raise AssertionError("没有真实来源时不得让模型凭记忆回答实时问题")
+
+    monkeypatch.setattr(web_studio, "stream_chat", must_not_answer)
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    events = list(app.stream_conversation(conversation_id, {"content": "佛山今天天气如何？"}))
+    activity = [payload for name, payload in events if name == "public_activity"]
+    assert activity[-2]["kind"] == "search_error"
+    assert activity[-1]["kind"] == "search_complete"
+    answer = next(payload["content"] for name, payload in events if name == "delta")
+    assert "无法可靠回答" in answer
+    assert "example.org" not in answer
+    assert any(name == "message" and payload["content"] == answer for name, payload in events)
 
 
 def test_home_plain_chat_has_no_search_activity(
