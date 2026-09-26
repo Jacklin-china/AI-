@@ -6,6 +6,11 @@ app:
   name: kantoku-agent
   log_level: INFO              # DEBUG / INFO / WARNING
 
+search:
+  enabled: true                # 首页普通聊天自动判断是否需要公开网页信息
+  timeout_s: 8
+  max_results: 4
+
 llm:
   # 主文本模型：DeepSeek，密钥只放根目录 .env
   base_url: https://api.deepseek.com/v1

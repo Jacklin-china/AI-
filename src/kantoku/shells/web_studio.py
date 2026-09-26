@@ -42,6 +42,7 @@ from kantoku.capabilities.creative import (
 )
 from kantoku.capabilities.image import ConversationImageService
 from kantoku.capabilities.video import MockVideoProvider, VideoService
+from kantoku.capabilities.web_search import plan_web_search, search_web
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.observability import current_trace_id, public_error, request_trace
 from kantoku.config.settings import (
@@ -859,7 +860,26 @@ class StudioApplication:
             **plan.model_dump(mode="json"), "tool": action.value,
             "trace_id": trace_id, "domain": route.domain,
             "execution_mode": route.execution_mode.value,
+            "user_message_id": user_message.id,
         }
+        if not guided:
+            task_labels = {
+                ConversationAction.IMAGE_GENERATE: "生成图片",
+                ConversationAction.IMAGE_EDIT: "编辑图片",
+                ConversationAction.VIDEO_GENERATE: "生成视频",
+                ConversationAction.WORKFLOW_START: "创作任务",
+            }
+            if action in task_labels:
+                yield "public_activity", {
+                    "kind": "analysis", "label": "正在分析需求",
+                    "detail": f"任务：{task_labels[action]}",
+                }
+            if selected_domain:
+                domain_labels = {"comic": "漫剧创作", "commerce": "电商创作", "studio": "视觉创作"}
+                yield "public_activity", {
+                    "kind": "skill", "label": "正在调用技能",
+                    "detail": f"技能：{domain_labels.get(selected_domain, selected_domain)}",
+                }
         if action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}:
             quote = budget.quote_image_price(count=1)
             auto_fen = int(get_settings().budget.autonomous_image_auto_cny * 100)
@@ -1198,6 +1218,7 @@ class StudioApplication:
                 "首页用户不需要固定口令，也不需要填写尺寸、镜头或 Prompt。"
                 "若意图不明确，只询问产出主体或目标这一个必要问题；"
                 "不要把快速聊天变成专业参数确认流程。"
+                "没有真实搜索来源时，不要声称已联网核实实时信息。"
             )
         messages: list[dict[str, str]] = [
             {
@@ -1210,6 +1231,49 @@ class StudioApplication:
             *[{"role": item.role.value, "content": item.content} for item in model_history
               if item.role in {MessageRole.USER, MessageRole.ASSISTANT}],
         ]
+        if (not guided and action is ConversationAction.CHAT
+                and selected_domain is None and get_settings().search.enabled):
+            query: str | None = None
+            try:
+                query = plan_web_search(content, trace_id=trace_id)
+            except Exception:
+                logger.bind(trace_id=trace_id, conversation_id=conversation_id).exception(
+                    "自动联网决策失败，继续普通聊天"
+                )
+            if query:
+                yield "public_activity", {
+                    "kind": "search", "label": "正在搜索网页", "detail": f"搜索：{query}",
+                }
+                try:
+                    results = search_web(query, get_settings().search)
+                except Exception:
+                    logger.bind(trace_id=trace_id, conversation_id=conversation_id).exception(
+                        "公开网页搜索失败"
+                    )
+                    results = []
+                    yield "public_activity", {
+                        "kind": "search", "label": "网页搜索暂不可用",
+                        "detail": "本次未取得可靠来源",
+                    }
+                if results:
+                    domains = list(dict.fromkeys(result.domain for result in results))
+                    yield "public_activity", {
+                        "kind": "sources", "label": "已找到公开来源",
+                        "detail": "来源网站：" + "、".join(domains),
+                    }
+                    context = "\n".join(
+                        f"- {result.title} | {result.url} | {result.snippet}"
+                        for result in results
+                    )
+                    messages.insert(1, {"role": "system", "content": (
+                        "以下是刚获得的公开网页搜索结果，仅据此回答需要实时信息的部分。"
+                        "引用来源时使用结果中的真实链接，不得编造访问过的网站。"
+                        "搜索摘要可能不完整，无法核实的事实要说明。\n" + context
+                    )})
+                else:
+                    messages.insert(1, {"role": "system", "content": (
+                        "本次未取得可靠的实时网页来源；不要声称已经联网验证。"
+                    )})
         complete = ""
         try:
             for delta in stream_chat(messages, trace_id=trace_id):

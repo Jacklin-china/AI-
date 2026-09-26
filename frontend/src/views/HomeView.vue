@@ -40,6 +40,7 @@ interface QueuedMessage { id: string; conversationId: string; content: string; d
 const inlineRuns = ref<Record<string, InlineRunState>>({})
 const pendingMessages = ref<Record<string, 'queued' | 'replying' | 'failed'>>({})
 const activityByMessage = ref<Record<string, string>>({})
+const publicActivities = ref<Record<string, { kind: string; label: string; detail: string }[]>>({})
 const messageMedia = ref<Record<string, { type: 'image' | 'video'; url: string; filename: string }>>({})
 const messageMediaErrors = ref<Record<string, boolean>>({})
 const imagePhases = ref<Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>>({})
@@ -93,6 +94,7 @@ async function selectConversation(id: string): Promise<void> {
   imagePhases.value = {}
   mediaJobs.value = []
   activityByMessage.value = {}
+  publicActivities.value = {}
   streamingByMessage.value = {}
   homeStops.clear(); runAnchors.clear(); inlineRuns.value = {}
   const detail = await getConversation(id)
@@ -353,10 +355,12 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
   pendingMessages.value = { ...pendingMessages.value, [task.id]: 'replying' }
   if (conversationId.value === task.conversationId) activityByMessage.value = { ...activityByMessage.value, [task.id]: '正在理解需求' }
   let anchor = task.id
+  let persistedUserMessageId: string | null = null
   let bound = false
   try {
     await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
-        onIntent: () => {
+        onIntent: (plan) => {
+          persistedUserMessageId = plan.user_message_id ?? null
           bound = true
           task.onBound?.()
           void refreshFastDomain(task.conversationId)
@@ -401,6 +405,16 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
         onActivity: (activity) => {
           if (conversationId.value === task.conversationId && activity.generation_request_id === task.id) {
             activityByMessage.value = { ...activityByMessage.value, [task.id]: activity.label }
+          }
+        },
+        onPublicActivity: (activity) => {
+          if (conversationId.value !== task.conversationId) return
+          const previous = publicActivities.value[task.id] ?? []
+          const next = [...previous, activity]
+          publicActivities.value = {
+            ...publicActivities.value,
+            [task.id]: next,
+            ...(persistedUserMessageId ? { [persistedUserMessageId]: next } : {}),
           }
         },
         onImageEvent: (name, event) => {
@@ -614,12 +628,12 @@ watch(
   <main class="chat-shell" :class="{ embedded }">
     <ConversationHistory :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" />
     <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
-    <header class="chat-home-head">
+    <header v-if="domain" class="chat-home-head">
       <div><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>{{ domain ? '描述目标，逐步确认制作细节与结果。' : '直接提问或描述你想制作的内容，结果会留在当前聊天。' }}</p></div>
       <SystemStatusInline :label="sending || Object.keys(streamingByMessage).length ? 'Kantoku 正在回复' : '就绪'" :tone="sending || Object.keys(streamingByMessage).length ? 'active' : 'neutral'" />
     </header>
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
-    <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
+    <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :public-activities="publicActivities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
     <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
     <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
     </div>

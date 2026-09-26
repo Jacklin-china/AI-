@@ -42,6 +42,7 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
         prompt_max_chars=1000, force_single=True, model="test", width=100, height=100
     )
     settings.llm = SimpleNamespace(model_chat="text-test", model_vision="vision-test")
+    settings.search = SimpleNamespace(enabled=True, timeout_s=2, max_results=4)
     settings.budget.autonomous_image_auto_cny = Decimal("0.30")
     settings.budget.image_conversation_cny = Decimal("5.00")
     for module in (web_studio, studio, budget):
@@ -51,6 +52,7 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
     monkeypatch.setattr(archive, "_archive_root", lambda: tmp_path / "archive")
     provider = LocalFakeImageProvider(tmp_path / "output", model_id="test", actual_fen=30)
     monkeypatch.setattr(web_studio, "_provider", lambda: provider)
+    monkeypatch.setattr(web_studio, "plan_web_search", lambda _content, **_kwargs: None)
     monkeypatch.setattr(web_studio, "_brief_deltas", lambda brief: iter([brief]))
     monkeypatch.setattr(
         web_studio, "_image_result_summary",
@@ -1584,6 +1586,10 @@ def test_selected_fast_domain_does_not_leak_to_next_message(
     first = list(app.stream_conversation(conversation_id, {
         "content": "帮我制作三镜头漫剧",
     }))
+    assert any(
+        name == "public_activity" and payload["detail"] == "技能：漫剧创作"
+        for name, payload in first
+    )
     run = next(payload for name, payload in first if name == "run")
     assert app.conversation(conversation_id)["domain"] == "comic"
     second = list(app.stream_conversation(conversation_id, {"content": "你好"}))
@@ -1593,6 +1599,36 @@ def test_selected_fast_domain_does_not_leak_to_next_message(
         current_node="__end__",
     )
     assert app.conversation(conversation_id)["domain"] is None
+
+
+def test_home_chat_reports_only_actual_web_search_sources(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kantoku.capabilities.web_search import SearchResult
+
+    monkeypatch.setattr(web_studio, "plan_web_search", lambda _content, **_kwargs: "北京热点")
+    monkeypatch.setattr(web_studio, "search_web", lambda _query, _settings: [
+        SearchResult("北京新闻", "https://example.org/story", "公开摘要", "example.org"),
+    ])
+    captured: list[list[dict[str, str]]] = []
+
+    def answer(messages: list[dict[str, str]], **_kwargs: object) -> Iterator[str]:
+        captured.append(messages)
+        return iter(["已参考公开来源。"])
+
+    monkeypatch.setattr(web_studio, "stream_chat", answer)
+    conversation_id = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    events = list(app.stream_conversation(conversation_id, {"content": "北京今天有什么热点新闻？"}))
+    intent = next(payload for name, payload in events if name == "intent")
+    assert intent["user_message_id"] == next(
+        message.id for message in app.runtime_store.list_conversation_messages(conversation_id)
+        if message.role == MessageRole.USER
+    )
+    activities = [payload for name, payload in events if name == "public_activity"]
+    assert [item["kind"] for item in activities] == ["search", "sources"]
+    assert activities[0]["detail"] == "搜索：北京热点"
+    assert activities[1]["detail"] == "来源网站：example.org"
+    assert "https://example.org/story" in captured[0][1]["content"]
 
 
 def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confirmation(

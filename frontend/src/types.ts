@@ -237,6 +237,7 @@ export interface Conversation {
 
 export interface IntentPlan {
   intent: string
+  user_message_id?: string
   needs_execution: boolean
   tool?: string
   domain?: string | null

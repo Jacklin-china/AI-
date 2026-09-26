@@ -11,6 +11,7 @@ import ChatImageAttachment from './ChatImageAttachment.vue'
 import ErrorRecoveryPanel from './ErrorRecoveryPanel.vue'
 import UserMessageBubble from './UserMessageBubble.vue'
 import WorkflowActivity from './WorkflowActivity.vue'
+import KantokuMark from '../brand/KantokuMark.vue'
 interface InlineRunState {
   run: CoreRun
   activities: RuntimeEvent[]
@@ -26,6 +27,7 @@ const props = defineProps<{
   streamingByMessage?: Record<string, string>; errorMessageId?: string
   pendingMessages?: Record<string, 'queued' | 'replying' | 'failed'>
   activityByMessage?: Record<string, string>
+  publicActivities?: Record<string, { kind: string; label: string; detail: string }[]>
   imagePhases?: Record<string, { status: 'prepared' | 'generating' | 'ready' | 'summarized' | 'failed'; width: number; height: number }>
   messageMedia?: Record<string, { type: 'image' | 'video'; url: string; filename: string }>
   messageMediaErrors?: Record<string, boolean>
@@ -267,6 +269,7 @@ function activityText(event: RuntimeEvent): string {
   <div ref="scroller" class="message-scroller" :class="{ 'home-message-scroller': homeMode }" @scroll="check">
     <div class="message-list">
       <template v-if="!messages.length && !streaming && !activities?.length && !run && !error">
+        <div v-if="homeMode" class="chat-empty-brand"><KantokuMark /><span>Kantoku</span></div>
         <p class="list-empty-hint">{{ emptyHint ?? '从一个问题开始，也可以直接描述你要制作的内容。' }}</p>
         <div v-if="examples?.length" class="list-examples">
           <span>可以试试：</span>
@@ -308,6 +311,12 @@ function activityText(event: RuntimeEvent): string {
           <p v-else-if="imagePhases?.[imageRequestId(message)!]?.status === 'failed' && !hasFailureMessage(imageRequestId(message)!)" class="chat-inline-error" role="alert">{{ mediaJobs?.find((job) => job.generation_request_id === imageRequestId(message))?.error_message ?? '图片生成未完成，请查看错误记录。' }}</p>
         </div>
         <p v-if="homeMode && activityByMessage?.[message.id]" class="chat-inline-status chat-direct-status">{{ activityByMessage[message.id] }}</p>
+        <div v-if="homeMode && publicActivities?.[message.id]?.length" class="chat-public-activity" aria-label="公开执行摘要" aria-live="polite">
+          <div v-for="(item, activityIndex) in publicActivities[message.id]" :key="activityIndex" class="chat-public-activity-item" :data-kind="item.kind">
+            <span class="chat-public-activity-dot" aria-hidden="true"></span>
+            <div><strong>{{ item.label }}</strong><small>{{ item.detail }}</small></div>
+          </div>
+        </div>
         <ChatImageAttachment v-if="homeMode && messageMedia?.[message.id]?.type === 'image' && !isHomeImageArtifact(message)" :media="messageMedia[message.id]" @open="openImage" />
         <figure v-else-if="homeMode && messageMedia?.[message.id]?.type === 'video' && !isHomeImageArtifact(message)" class="chat-generated-image chat-message-media">
           <video :src="messageMedia[message.id].url" controls preload="metadata" />

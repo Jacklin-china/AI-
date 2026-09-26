@@ -188,6 +188,14 @@ class CommerceSettings(BaseModel):
     marketplace: str = "Ozon Mock Marketplace"
 
 
+class SearchSettings(BaseModel):
+    """首页隐式公开搜索；仅影响普通对话，不改变生产流程。"""
+
+    enabled: bool = True
+    timeout_s: float = Field(default=8, gt=0, le=30)
+    max_results: int = Field(default=4, ge=1, le=8)
+
+
 class Settings(BaseSettings):
     """项目配置总入口；业务代码只通过 ``get_settings`` 获取配置。"""
 
@@ -201,6 +209,7 @@ class Settings(BaseSettings):
     runtime: RuntimeSettings = RuntimeSettings()
     video: VideoSettings = VideoSettings()
     commerce: CommerceSettings = CommerceSettings()
+    search: SearchSettings = SearchSettings()
 
 
 def _require_env(name: str) -> str:

@@ -310,6 +310,7 @@ export async function streamConversationMessage(
     onMessage?: (message: ConversationMessage) => void
     onRun?: (run: CoreRun) => void
     onActivity?: (activity: { generation_request_id: string; status: string; label: string }) => void
+    onPublicActivity?: (activity: { kind: string; label: string; detail: string }) => void
     onImageEvent?: (name: ImageGenerationEventName, payload: ImageGenerationEvent) => void
   },
   dataMode?: 'demo' | 'production',
@@ -343,6 +344,7 @@ export async function streamConversationMessage(
       else if (event === 'message') handlers.onMessage?.(payload as unknown as ConversationMessage)
       else if (event === 'run') handlers.onRun?.(payload as unknown as CoreRun)
       else if (event === 'activity') handlers.onActivity?.(payload as { generation_request_id: string; status: string; label: string })
+      else if (event === 'public_activity') handlers.onPublicActivity?.(payload as { kind: string; label: string; detail: string })
       else if (['prompt_prepared', 'image_generating', 'image_ready', 'image_summary', 'image_failed', 'cost_approval'].includes(event)) {
         handlers.onImageEvent?.(event as ImageGenerationEventName, payload as unknown as ImageGenerationEvent)
       }
