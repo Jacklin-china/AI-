@@ -4,6 +4,7 @@ import ApprovalCard from '../components/approval/ApprovalCard.vue'
 import ChatMessageList from '../components/chat/ChatMessageList.vue'
 import ConversationHistory from '../components/chat/ConversationHistory.vue'
 import MessageComposer from '../components/chat/MessageComposer.vue'
+import { visibleFastDomain, type FastDomain } from '../components/chat/fastDomainSelection'
 import SystemStatusInline from '../components/chat/SystemStatusInline.vue'
 import { presenterFor } from '../domains/presenters'
 import { navigate } from '../router'
@@ -21,10 +22,12 @@ const sending = ref(false)
 const error = ref('')
 const activeRun = ref<CoreRun | null>(null)
 const domainHint = ref<string | null>(props.domain ?? null)
-type FastDomain = 'comic' | 'commerce' | 'studio'
 const fastDomain = ref<FastDomain | null>(null)
 const fastDomainTaskId = ref<string | null>(null)
 const switchingFastDomain = ref(false)
+const dispatchingFastDomain = ref<Record<string, boolean>>({})
+const consumedFastDomains = new Set<string>()
+const pendingFastDispatches = new Map<string, Promise<void>>()
 const dataMode = ref<'demo' | 'production'>('production')
 const enhancePrompt = ref(true)
 const composer = ref<{ fill: (text: string) => void } | null>(null)
@@ -33,7 +36,7 @@ const localApprovals = ref<CoreApproval[]>([])
 const lastContent = ref('')
 const imageUrl = ref('')
 interface InlineRunState { run: CoreRun; activities: RuntimeEvent[]; approval: CoreApproval | null; artifact: CoreArtifact | null; imageUrl: string; videoUrl: string }
-interface QueuedMessage { id: string; conversationId: string; content: string; domainHint: string | null }
+interface QueuedMessage { id: string; conversationId: string; content: string; domainHint: string | null; onBound?: () => void }
 const inlineRuns = ref<Record<string, InlineRunState>>({})
 const pendingMessages = ref<Record<string, 'queued' | 'replying' | 'failed'>>({})
 const activityByMessage = ref<Record<string, string>>({})
@@ -64,8 +67,8 @@ async function refreshConversations(): Promise<void> {
 
 function syncFastDomain(detail: Conversation): void {
   if (props.domain || detail.id !== conversationId.value) return
-  fastDomain.value = ['comic', 'commerce', 'studio'].includes(detail.domain ?? '')
-    ? detail.domain as FastDomain : null
+  if (!detail.domain) consumedFastDomains.delete(detail.id)
+  fastDomain.value = visibleFastDomain(detail.domain, detail.fast_domain_task_id, consumedFastDomains.has(detail.id))
   fastDomainTaskId.value = detail.fast_domain_task_id
   domainHint.value = fastDomain.value
 }
@@ -216,12 +219,13 @@ async function newConversation(): Promise<void> {
 }
 
 async function selectFastDomain(domain: FastDomain | null): Promise<void> {
-  if (props.domain || switchingFastDomain.value || fastDomainTaskId.value) return
+  if (props.domain || switchingFastDomain.value || fastDomainTaskId.value || pendingFastDispatches.has(conversationId.value)) return
   if (!conversationId.value) await initialize()
   if (!conversationId.value || domain === fastDomain.value) return
   switchingFastDomain.value = true
   try {
     const updated = await setConversationFastDomain(conversationId.value, domain)
+    consumedFastDomains.delete(conversationId.value)
     fastDomain.value = updated.domain as FastDomain | null
     domainHint.value = fastDomain.value
     error.value = ''
@@ -349,10 +353,13 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
   pendingMessages.value = { ...pendingMessages.value, [task.id]: 'replying' }
   if (conversationId.value === task.conversationId) activityByMessage.value = { ...activityByMessage.value, [task.id]: '正在理解需求' }
   let anchor = task.id
+  let bound = false
   try {
     await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
-        onIntent: (plan) => {
-          if (conversationId.value !== task.conversationId || plan.execution_mode !== 'fast') return
+        onIntent: () => {
+          bound = true
+          task.onBound?.()
+          void refreshFastDomain(task.conversationId)
         },
         onDelta: (delta) => {
           if (conversationId.value === task.conversationId) {
@@ -430,6 +437,13 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
     if (imageStarted) startMediaPolling(task.conversationId)
     const nextActivity = { ...activityByMessage.value }; delete nextActivity[task.id]; activityByMessage.value = nextActivity
   } finally {
+    if (!bound && task.domainHint) {
+      const detail = await getConversation(task.conversationId).catch(() => null)
+      if (detail?.domain === task.domainHint && !detail.fast_domain_task_id) {
+        await setConversationFastDomain(task.conversationId, null).catch(() => null)
+      }
+    }
+    task.onBound?.()
     const nextStreaming = { ...streamingByMessage.value }
     delete nextStreaming[task.id]
     streamingByMessage.value = nextStreaming
@@ -445,10 +459,46 @@ async function send(content: string): Promise<void> {
   if (!props.domain) {
     if (!conversationId.value) await initialize()
     if (!conversationId.value) return
+    const ownerId = conversationId.value
+    const selectedDomain = fastDomain.value
+    const earlierDispatch = pendingFastDispatches.get(ownerId)
     const id = `local-${Date.now()}-${++localMessageCounter}`
-    messages.value.push({ id, conversation_id: conversationId.value, role: 'user', type: 'text', content, run_id: null, event_id: null, created_at: new Date().toISOString() })
-    pendingMessages.value = { ...pendingMessages.value, [id]: 'replying' }
-    void runHomeMessage({ id, content, conversationId: conversationId.value, domainHint: domainHint.value })
+    messages.value.push({ id, conversation_id: ownerId, role: 'user', type: 'text', content, run_id: null, event_id: null, created_at: new Date().toISOString() })
+    pendingMessages.value = { ...pendingMessages.value, [id]: earlierDispatch ? 'queued' : 'replying' }
+    let onBound: (() => void) | undefined
+    if (selectedDomain) {
+      consumedFastDomains.add(ownerId)
+      fastDomain.value = null
+      domainHint.value = null
+      let release!: () => void
+      const gate = new Promise<void>((resolve) => { release = resolve })
+      pendingFastDispatches.set(ownerId, gate)
+      dispatchingFastDomain.value = { ...dispatchingFastDomain.value, [ownerId]: true }
+      onBound = () => {
+        if (pendingFastDispatches.get(ownerId) !== gate) return
+        pendingFastDispatches.delete(ownerId)
+        const next = { ...dispatchingFastDomain.value }; delete next[ownerId]; dispatchingFastDomain.value = next
+        release()
+      }
+    }
+    if (earlierDispatch) {
+      try {
+        await earlierDispatch
+        const detail = await getConversation(ownerId)
+        if (!detail) throw new Error('无法确认上一条快捷任务状态，请稍后重试')
+        if (detail.domain && !detail.fast_domain_task_id && consumedFastDomains.has(ownerId)) {
+          await setConversationFastDomain(ownerId, null)
+        }
+      } catch (taskError) {
+        if (conversationId.value === ownerId) {
+          error.value = taskError instanceof Error ? taskError.message : '无法确认上一条快捷任务状态'
+          errorMessageId.value = id
+        }
+        pendingMessages.value = { ...pendingMessages.value, [id]: 'failed' }
+        return
+      }
+    }
+    void runHomeMessage({ id, content, conversationId: ownerId, domainHint: selectedDomain, onBound })
     return
   }
   if (sending.value) return
@@ -563,7 +613,7 @@ watch(
 <template>
   <main class="chat-shell" :class="{ embedded }">
     <ConversationHistory :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" />
-    <div class="chat-home" :class="{ embedded }">
+    <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
     <header class="chat-home-head">
       <div><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>{{ domain ? '描述目标，逐步确认制作细节与结果。' : '直接提问或描述你想制作的内容，结果会留在当前聊天。' }}</p></div>
       <SystemStatusInline :label="sending || Object.keys(streamingByMessage).length ? 'Kantoku 正在回复' : '就绪'" :tone="sending || Object.keys(streamingByMessage).length ? 'active' : 'neutral'" />
@@ -571,7 +621,7 @@ watch(
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
     <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
     <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
-    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
+    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
     </div>
   </main>
 </template>

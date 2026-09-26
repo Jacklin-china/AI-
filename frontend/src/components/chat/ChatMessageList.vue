@@ -264,7 +264,7 @@ function activityText(event: RuntimeEvent): string {
 }
 </script>
 <template>
-  <div ref="scroller" class="message-scroller" @scroll="check">
+  <div ref="scroller" class="message-scroller" :class="{ 'home-message-scroller': homeMode }" @scroll="check">
     <div class="message-list">
       <template v-if="!messages.length && !streaming && !activities?.length && !run && !error">
         <p class="list-empty-hint">{{ emptyHint ?? '从一个问题开始，也可以直接描述你要制作的内容。' }}</p>
@@ -287,7 +287,7 @@ function activityText(event: RuntimeEvent): string {
           </template>
           <p v-else-if="mediaJobForUser(message)!.status === 'failed' && !hasFailureMessage(mediaJobForUser(message)!.generation_request_id)" class="chat-inline-error" role="alert">{{ mediaJobForUser(message)!.error_message }}</p>
         </div>
-        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" />
+        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" :show-mark="!homeMode" />
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
           <div v-if="awaitingCost(imageRequestId(message)!)" class="chat-cost-card">
             <strong>本次生图需要确认费用</strong>
@@ -313,7 +313,7 @@ function activityText(event: RuntimeEvent): string {
           <video :src="messageMedia[message.id].url" controls preload="metadata" />
           <figcaption>生成的视频</figcaption>
         </figure>
-        <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" />
+        <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" :show-mark="false" />
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
         <section v-if="homeMode && inlineRuns?.[message.id]" class="chat-inline-activity" aria-live="polite">
           <p class="chat-inline-status">{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</p>
