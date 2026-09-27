@@ -81,6 +81,14 @@
 
 每阶段先运行相应回归测试，再运行全项目结构检查、ruff、pytest 与前端构建/类型检查；有真实供应商费用的验收另外确认预算。**不得在 Phase 1 一次实现 Phase 2–7，也不得在本图片阶段自动启用视频。**
 
+### Phase 2 已实现的作品上下文边界
+
+`domains/comic/projects.py` 在现有 Core SQLite 文件中追加 `comic_schema_migrations`、`comic_projects` 和 `comic_entity_versions`，后者保存不可变的 Project/CreativeBrief 修订。创建作品同时创建 Brief v1；更新 Brief 必须提交当前作品 `expected_version`，并原子追加 Brief 与 Project 修订。重复提交完全相同的内容不增加版本；并发不同修改不能静默覆盖。`GET` 可按作品版本读取旧 Brief，Context 响应带明确的来源版本。
+
+HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id}`、`PUT /api/comic/projects/{project_id}/brief`、`GET /api/comic/projects/{project_id}/context`，同时兼容请求中的 `/comic/projects` 写法；均沿用现有本机会话令牌、Trace 和错误处理。创建请求可直接提供结构化 Brief；若只提供标题，则仅把标题保存为原始需求，其他字段保持空列表，**不会凭空推断用户约束或偏好**。当前 Context 只含 Project、Brief、可选当前任务与来源修订；`relevant_memory` 为空，因为角色/场景/镜头资产尚未在 Phase 4/5 接入。Context 是可按版本重建的派生视图，不另存一套会漂移的内容表。
+
+本次迁移只建新表，不导入、改写或删除旧 `shot/persona/recipe`、StudioTask、账单、Run、Artifact；旧入口保持原样。历史数据自动归属作品会出现同名冲突，因此必须等待显式映射与对照测试，不能按作品名猜测迁移。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

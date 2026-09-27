@@ -79,6 +79,8 @@ from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
+from kantoku.domains.comic.models import ComicProjectInput, CreativeBriefUpdate
+from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
 from kantoku.domains.comic.services import StudioComicServices
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
 from kantoku.domains.commerce import CommerceState, build_commerce_workflow
@@ -349,6 +351,7 @@ class StudioApplication:
         configured = get_settings().storage.sqlite_path
         database_path = configured if configured.is_absolute() else ROOT / configured
         self.runtime_store = RuntimeStore(database_path)
+        self.comic_projects = ComicProjectStore(self.runtime_store.path)
         self.runtime = GraphRuntime(self.runtime_store)
         self.skills = SkillRegistry()
         SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
@@ -1640,6 +1643,27 @@ class StudioApplication:
         """返回单个真实 Run。"""
         return self._run_payload(run_id)
 
+    def create_comic_project(self, data: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self.comic_projects.create(ComicProjectInput.model_validate(data))
+        return snapshot.model_dump(mode="json")
+
+    def get_comic_project(
+        self, project_id: str, *, version: int | None = None,
+    ) -> dict[str, Any]:
+        return self.comic_projects.get(project_id, version=version).model_dump(mode="json")
+
+    def update_comic_brief(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        snapshot = self.comic_projects.replace_brief(
+            project_id, CreativeBriefUpdate.model_validate(data),
+        )
+        return snapshot.model_dump(mode="json")
+
+    def get_comic_context(
+        self, project_id: str, *, task: str | None = None, version: int | None = None,
+    ) -> dict[str, Any]:
+        snapshot = self.comic_projects.get(project_id, version=version)
+        return ComicContextBuilder.build(snapshot, task=task).model_dump(mode="json")
+
     def _run_payload(self, run_id: str) -> dict[str, Any]:
         run = self.runtime_store.get_run(run_id)
         payload = run.model_dump(mode="json")
@@ -1888,7 +1912,7 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     "Access-Control-Allow-Headers", "Content-Type, X-Studio-Token, X-Trace-ID",
                 )
                 self.send_header(
-                    "Access-Control-Allow-Methods", "GET, POST, PATCH, DELETE, OPTIONS",
+                    "Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, DELETE, OPTIONS",
                 )
                 self.send_header("Access-Control-Expose-Headers", "X-Trace-ID")
 
@@ -1988,7 +2012,9 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
             parsed = urlsplit(self.path)
             request_path = parsed.path
             # SSE 由 EventSource 发起，无法携带自定义头，令牌改由查询参数校验。
-            needs_session = request_path.startswith(("/api/", "/media/")) and not (
+            needs_session = request_path.startswith(
+                ("/api/", "/media/", "/comic/projects")
+            ) and not (
                 request_path == "/api/session"
                 or (
                     request_path.startswith("/api/runs/")
@@ -2029,6 +2055,24 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     self.json_reply(200, {"token": app.token})
                 elif request_path == "/api/state":
                     self.json_reply(200, app.state())
+                elif request_path.startswith(("/api/comic/projects/", "/comic/projects/")):
+                    comic_parts = request_path.removeprefix("/api").strip("/").split("/")
+                    query = parse_qs(parsed.query)
+                    raw_version = query.get("version", [None])[0]
+                    version = None if raw_version is None else int(raw_version)
+                    if version is not None and version < 1:
+                        raise ToolError("作品版本必须大于零")
+                    if len(comic_parts) == 3:
+                        self.json_reply(200, app.get_comic_project(
+                            comic_parts[2], version=version,
+                        ))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "context":
+                        self.json_reply(200, app.get_comic_context(
+                            comic_parts[2], task=query.get("task", [None])[0],
+                            version=version,
+                        ))
+                    else:
+                        self.json_reply(404, {"error": "Comic API 路径不存在"})
                 elif request_path == "/api/runs":
                     self.json_reply(200, {"runs": app.list_core_runs()})
                 elif request_path.startswith("/api/runs/"):
@@ -2113,7 +2157,7 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     self.reply(200, candidate.read_bytes(), media_type)
                 else:
                     self.json_reply(404, {"error": "页面不存在"})
-            except (KantokuError, OSError) as error:
+            except (ValueError, KantokuError, OSError) as error:
                 self.error_reply(400, error)
 
         @traced_request
@@ -2137,11 +2181,15 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 if not 0 < length <= 65536:
                     raise ToolError("请求内容过长或为空")
                 data = json.loads(self.rfile.read(length))
-                if not isinstance(data, dict) or not self.path.startswith("/api/"):
-                    raise ToolError("请求格式不合法")
                 request_path = urlsplit(self.path).path
+                if not isinstance(data, dict) or not (
+                    request_path.startswith("/api/") or request_path == "/comic/projects"
+                ):
+                    raise ToolError("请求格式不合法")
                 parts = request_path.strip("/").split("/")
-                if request_path == "/api/runs":
+                if request_path in {"/api/comic/projects", "/comic/projects"}:
+                    self.json_reply(201, app.create_comic_project(data))
+                elif request_path == "/api/runs":
                     self.json_reply(201, app.create_core_run(data))
                 elif request_path == "/api/conversations":
                     self.json_reply(201, app.create_conversation(data))
@@ -2196,6 +2244,26 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 else:
                     app.start(request_path.removeprefix("/api/"), data)
                     self.json_reply(202, {"accepted": True})
+            except (ValueError, ValidationError, KantokuError) as error:
+                self.error_reply(400, error)
+
+        @traced_request
+        def do_PUT(self) -> None:
+            if not self.allowed(session=True):
+                self.json_reply(403, {"error": "会话验证失败"})
+                return
+            try:
+                request_path = urlsplit(self.path).path
+                parts = request_path.removeprefix("/api").strip("/").split("/")
+                length = int(self.headers.get("Content-Length", "0"))
+                if (len(parts) != 4 or parts[:2] != ["comic", "projects"]
+                        or parts[3] != "brief" or not 0 < length <= 65536
+                        or not request_path.startswith(("/api/comic/", "/comic/"))):
+                    raise ToolError("请求格式不合法")
+                data = json.loads(self.rfile.read(length))
+                if not isinstance(data, dict):
+                    raise ToolError("请求格式不合法")
+                self.json_reply(200, app.update_comic_brief(parts[2], data))
             except (ValueError, ValidationError, KantokuError) as error:
                 self.error_reply(400, error)
 

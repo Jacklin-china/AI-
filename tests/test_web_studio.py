@@ -1846,3 +1846,77 @@ def test_startup_logs_loaded_config_and_image_settings(
     assert f"image_base_url={base_url}" in messages[0]
     assert "image_model=qwen-image-3.0" in messages[0]
     assert "Qwen Image" in capsys.readouterr().out
+
+
+def test_comic_project_api_persists_brief_versions_and_context(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(
+        method: str, path: str, payload: dict[str, object] | None = None,
+        *, authorized: bool = True,
+    ) -> tuple[int, dict[str, object]]:
+        connection.request(
+            method, path, body=None if payload is None else json.dumps(payload),
+            headers=headers if authorized else {},
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    try:
+        status, _ = request("GET", "/comic/projects/missing", authorized=False)
+        assert status == 403
+        status, created = request("POST", "/comic/projects", {
+            "title": "东方仙侠少女雨夜战斗漫画",
+            "brief": {
+                "original_request": "东方仙侠少女雨夜战斗漫画",
+                "hard_constraints": ["东方仙侠", "少女", "雨夜", "战斗"],
+                "soft_preferences": ["电影感", "冷色调"],
+                "creative_freedom": ["构图优化", "光影优化", "镜头设计"],
+            },
+        })
+        assert status == 201
+        project = created["project"]
+        assert isinstance(project, dict)
+        project_id = project["project_id"]
+        assert isinstance(project_id, str)
+        assert project["current_version"] == 1
+        assert created["creative_brief"]["hard_constraints"] == [
+            "东方仙侠", "少女", "雨夜", "战斗",
+        ]
+
+        status, context = request(
+            "GET", f"/api/comic/projects/{project_id}/context?task=plan",
+        )
+        assert status == 200
+        assert context["current_task"] == "plan"
+        assert context["source_versions"] == {"project": 1, "creative_brief": 1}
+        assert context["relevant_memory"] == []
+
+        status, updated = request("PUT", f"/comic/projects/{project_id}/brief", {
+            "expected_version": 1,
+            "original_request": "增加白鹤的雨夜战斗",
+            "hard_constraints": ["少女", "雨夜", "白鹤"],
+            "soft_preferences": ["冷色调"],
+            "creative_freedom": ["镜头设计"],
+        })
+        assert status == 200
+        assert updated["project"]["current_version"] == 2
+        status, old = request("GET", f"/api/comic/projects/{project_id}?version=1")
+        assert status == 200
+        assert old == created
+        status, current = request("GET", f"/comic/projects/{project_id}")
+        assert status == 200
+        assert current == updated
+
+        status, conflict = request("PUT", f"/api/comic/projects/{project_id}/brief", {
+            "expected_version": 1,
+            "original_request": "过期修改",
+        })
+        assert status == 400
+        assert "刷新" in conflict["error"]
+        assert app.runtime_store.list_runs() == []
+    finally:
+        connection.close()

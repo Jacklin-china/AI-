@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from typing import Any, Literal
+from datetime import datetime
+from enum import StrEnum
+from typing import Annotated, Any, Literal
 
-from pydantic import Field
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from kantoku.core.state import RunState
 
@@ -36,3 +38,88 @@ class ComicState(RunState):
     archive_path: str | None = None
     image_artifact_id: str | None = None
     video_artifact_id: str | None = None
+
+
+ProjectText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=200)]
+BriefText = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=4000)]
+BriefItem = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=300)]
+
+
+class ProjectStatus(StrEnum):
+    DRAFT = "draft"
+    PLANNING = "planning"
+    PRODUCTION = "production"
+    COMPLETED = "completed"
+    ARCHIVED = "archived"
+
+
+class CreativeBriefInput(BaseModel):
+    """用户明确提供的创意边界；空列表不会被猜测成模型已理解的内容。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    original_request: BriefText
+    hard_constraints: list[BriefItem] = Field(default_factory=list, max_length=50)
+    soft_preferences: list[BriefItem] = Field(default_factory=list, max_length=50)
+    creative_freedom: list[BriefItem] = Field(default_factory=list, max_length=50)
+
+    @model_validator(mode="after")
+    def unique_items(self) -> CreativeBriefInput:
+        for name in ("hard_constraints", "soft_preferences", "creative_freedom"):
+            items = getattr(self, name)
+            if len(items) != len(set(items)):
+                raise ValueError(f"{name} 不允许重复")
+        return self
+
+
+class ComicProjectInput(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: ProjectText
+    description: str = Field(default="", max_length=2000)
+    brief: CreativeBriefInput | None = None
+
+
+class CreativeBriefUpdate(CreativeBriefInput):
+    expected_version: int = Field(ge=1)
+
+
+class CreativeProject(BaseModel):
+    """作品根对象；current_version 在每次作品内容变更时递增。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    project_id: str
+    title: ProjectText
+    description: str
+    status: ProjectStatus
+    created_at: datetime
+    updated_at: datetime
+    current_version: int = Field(ge=1)
+    brief_id: str
+    brief_version: int = Field(ge=1)
+
+
+class CreativeBrief(CreativeBriefInput):
+    brief_id: str
+    project_id: str
+    version: int = Field(ge=1)
+    created_at: datetime
+
+
+class ComicProjectSnapshot(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    project: CreativeProject
+    creative_brief: CreativeBrief
+
+
+class ComicContext(BaseModel):
+    """只传任务必需信息；后续资产与镜头阶段填充 relevant_memory。"""
+
+    model_config = ConfigDict(extra="forbid")
+
+    stable_context: dict[str, Any]
+    relevant_memory: list[dict[str, Any]]
+    current_task: str | None
+    source_versions: dict[str, int]
