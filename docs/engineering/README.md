@@ -29,6 +29,58 @@
 
 交互参考：[Runway Agent 的对话式创作](https://help.runwayml.com/hc/en-us/articles/51601639579667-Creating-with-Runway-Agent)、[Figma 的可收起侧栏](https://help.figma.com/hc/en-us/articles/360039831974-Explore-the-navigation-bar-and-left-sidebar)、[Figma 的上下文属性面板](https://help.figma.com/hc/en-us/articles/360039832014-Design-prototype-and-explore-layer-properties-in-the-right-sidebar)、[InvokeAI 的 Gallery/Canvas](https://invoke.ai/features/gallery/)。拖动分区继续使用项目已有 `splitpanes`，简单高级信息使用原生折叠，不为同一用途重复引入组件库。
 
+## 漫剧图片生产：Phase 1 架构契约与迁移计划（2026-09-27）
+
+本阶段只完成审计、数据契约和迁移设计，**不把设计视为已上线能力**。交付目标限于图片生产；现有可选 Video Node 与 Mock Provider 保留兼容，但新作品流程不自动接入图生视频、时间轴或视频编辑。未来视频仍须复用共享 Video Capability，不把视频状态预塞进图片专用表。
+
+### 现状与处置
+
+| 现有模块 | 证据与边界 | 处置 |
+| --- | --- | --- |
+| `domains/comic/workflow.py`、`models.py` | `comic.production.v1` 是单镜头准备、费用审批、生图、QC、人工审核、返工、归档的固定图；`ComicState` 不是作品模型。 | **保留兼容**现有 Run/Checkpoint；未来在 Comic Domain 按任务类型组合领域 Workflow，不把旧图扩充成所有作品必经的巨型图。 |
+| `domains/comic/services.py` 与 `tools/studio.py` | 已复用 `gen_image` 的预算、幂等和供应商查询，但服务直接持有 `ImageProvider`，StudioTask 另存 JSON 文件，按项目名与镜号扫描防重。 | **渐进重构**为共享 Image Capability 的领域调用端口；旧 request ID、账单与恢复路径保持有效，不能为了收口重新提交旧任务。 |
+| `tools/storyboard.py`、`schemas/storyboard.py` | 有严格镜号校验和实际持久化；生成固定 20 镜，`save_storyboard` 按 episode 替换旧镜头。 | **复用校验，迁移存储**到作品级、可变镜数和追加版本；旧 CLI/Agent 调用保持兼容直到验证迁移。 |
+| `memory/persona.py`、`tools/prompt_factory.py`、`agent/context.py` | 已有角色结构、Prompt 配方及最近镜头窗口；Persona 以名字全局覆盖，Recipe 以 episode/镜号定位，现有质量词是固定文本。 | **复用约束、溯源和上下文裁剪**；改为项目范围的资产版本与按模型编译，不再用全局角色名或固定质量词代替导演分析。 |
+| `perception/qc.py`、`perception/review.py`、`tools/archive.py` | 已有视觉预筛、不可变人工审核、返工队列与归档；当前返工是新生成任务，不是已实现的局部编辑。 | **保留并扩展领域判定**；只有接入可验证的局部修改能力后，`MINOR_ERROR` 才能自动修补。 |
+| `core/runtime/`、`core/budget.py`、Artifact、Approval、Image/Video Capability | 通用 Run、Node、Checkpoint、事件、预算台账和 Artifact 已共享；预算当前仍要求 project/episode/shot_no，属于待收口的通用身份约束。 | **复用而不复制**；预算身份泛化需另做兼容迁移，不在 Comic Domain 另建账本。 |
+| `shells/web_studio.py` 的旧 Studio 操作与 Core Run API、Comic Skill manifest | 均有路由、动态加载或测试引用。 | **暂不删除**；替换后先验证旧入口、Skill、恢复和历史数据，再移除确实重复的领域适配代码。 |
+
+目前**没有证据支持立即删除任何业务文件或历史表**。`db/schema.sql` 的 `shot`、`persona`、`recipe` 和 StudioTask 文件均视为历史业务记录，绝不靠清空或覆盖完成迁移。
+
+### 作品级数据契约
+
+稳定的 `project_id` 是作品身份；项目名称只用于展示，不能作为去重、预算或关联键。以下对象属于 `domains/comic/`，不是 Core 通用模型。所有可编辑对象使用稳定 `entity_id` 与从 1 开始递增的修订号；编辑追加新修订，不覆盖旧内容。删除分镜或资产写入墓碑修订，历史版本仍可恢复。
+
+| 对象 | 领域数据与关系 | 版本边界 |
+| --- | --- | --- |
+| `CreativeProject` | `project_id`、标题、作品状态、创建/更新时间；关联 Conversation、Run 的 ID，不复制其记录。 | 项目元数据可更新；创作内容独立修订。 |
+| `CreativeBrief` | `original_request`、`hard_constraints`、`soft_preferences`、`creative_freedom`，保留用户原始表述；模型推断与用户明示应标明来源。 | 每次创作理解或人工修改产生新修订；硬约束不能被导演或 Prompt 编译静默改写。 |
+| `DirectorSpec` | 关联 Brief 修订，记录 `visual_direction`、`mood`、`color_language`、`lighting`、`camera_language`、`composition`，并说明与故事、角色、场景及镜头目的的关系。 | 动态分析，不建立“情绪词 → 固定摄影公式”；引用的 Brief 修订必须明确。 |
+| `CharacterAsset`、`SceneAsset`、`StyleBible` | 项目范围内的角色外观/服装/特征、环境/时间/天气/光线、风格/色彩/材质/摄影语言；参考图片只存 Core `artifact_id`。 | 各资产独立修订，可锁定某一修订供多个镜头复用；不可通过重名覆盖其他项目。 |
+| `Storyboard`、`Shot` | Storyboard 保存有序 Shot ID 列表，镜头数由需求决定；Shot 保存 `shot_id`、目的、主体、动作、环境、构图、摄影、引用的资产 ID 与修订、状态。顺序号仅用于展示，不作为镜头身份。 | 分镜和单镜头分别追加修订；重排、删除或返工不改变稳定 Shot ID。 |
+| `PromptArtifact` | 使用 Core `ArtifactType.PROMPT`，在 metadata 记录所用 Brief/Director/Asset/Shot 修订、编译器版本、模型标识、Prompt 哈希及来源 Run/Node；`location` 指向持久化的 Prompt 正文。 | 新 Prompt 创建新 Artifact/版本，不覆写已提交生图任务的输入。 |
+| `GenerationTask`、`QualityReport`、最终 `Artifact` | 生成沿用 Core Run/Node、StudioTask 或其兼容替代、`generation_request_id`、预算台账和 Image Capability；QC 沿用现有预测/人工审核并关联对应镜头及图片 Artifact。 | Retry 恢复原请求；Regenerate 创建新请求。图片、QC 报告及未来视频均由 Core Artifact 保存，不建立 Comic 专属媒体库。 |
+
+领域 Shot 状态为 `draft → planned → generating → checking → approved`；`generating/checking` 可转 `failed`，`checking/failed` 可在明确修复方案后转 `repairing`，再进入新一次 `generating/checking`。这些是 **Shot 的领域状态**，不替代 Core Run/Node 状态；状态改变应与相应修订或生成请求建立可追溯关联。`PASS / MINOR_ERROR / MAJOR_ERROR` 是 QC 判定，不是供应商状态；不允许把“已提交”当成“已出图”。
+
+### 存储与迁移顺序
+
+1. Phase 2 在现有 SQLite 数据库中添加 **Comic Domain 自有**的项目与追加修订存储（项目表、带 `project_id/entity_type/entity_id/revision` 唯一约束的领域修订表）。Pydantic 领域 Schema 校验每一类 payload；一次写入使用事务和预期修订号，避免并发覆盖。迁移不得修改 Core `runs`、`artifacts` 或预算台账语义。
+2. 新写路径先只服务新作品；旧 `comic.production.v1`、StudioTask、`shot/persona/recipe` 继续原样读取。为旧记录建立**显式、可重跑**的导入映射：先列出 episode、项目名、角色名和请求 ID，发现同名冲突时要求人工选择归属，不猜测合并；导入只追加新记录并保存 legacy ID 对照，不删除旧行或文件。
+3. 通过对照测试核实镜头顺序、角色内容、Prompt 哈希、Run/Artifact/预算关联、未知供应商任务恢复与审批记录。确认新旧读取一致并完成备份/回滚演练后，才切换新项目读取入口；旧 API、CLI 与 Skill 在调用方迁移前保持兼容。
+4. 仅当静态引用、路由、动态加载、Skill manifest、前端调用和回归测试均证明旧适配实现不再使用，才删除被替代**代码**。历史账单、作品、Artifact、StudioTask 文件及其迁移对照长期保留；表的删除不是本图片生产阶段目标。
+
+### 后续阶段的交付门槛
+
+- Phase 2：Project + CreativeBrief 的保存、编辑、恢复、并发修订与旧数据隔离测试；不调用生图。
+- Phase 3：DirectorSpec 使用 Brief 修订、故事/角色/场景上下文；测试硬约束保持、修订溯源与无固定摄影公式。
+- Phase 4：资产项目隔离、引用 Artifact、锁定版本与跨镜头复用测试。
+- Phase 5：任意合法镜头数、稳定 Shot ID、重排/墓碑/恢复和状态转换测试；旧 20 镜接口继续兼容。
+- Phase 6：复用现有 Image Capability、Budget、Run、Artifact 和 Prompt 配方，验证首提、重启恢复、未知状态不重提、Retry/Regenerate 区分及多镜头版本引用。
+- Phase 7：复用现有视觉 QC 与审批，验证 PASS/MINOR/MAJOR 的真实证据、返工版本和费用；没有可用局部编辑 Provider 时明确标记 `MINOR_ERROR` 需要人工处理或获批重生，不伪称局部修复成功。
+
+每阶段先运行相应回归测试，再运行全项目结构检查、ruff、pytest 与前端构建/类型检查；有真实供应商费用的验收另外确认预算。**不得在 Phase 1 一次实现 Phase 2–7，也不得在本图片阶段自动启用视频。**
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。
