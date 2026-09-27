@@ -1,5 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
+import { History } from 'lucide-vue-next'
 import ApprovalCard from '../components/approval/ApprovalCard.vue'
 import ChatMessageList from '../components/chat/ChatMessageList.vue'
 import ConversationHistory from '../components/chat/ConversationHistory.vue'
@@ -11,9 +12,10 @@ import { navigate } from '../router'
 import { createConversation, decideApproval, decideMediaCost, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, setConversationFastDomain, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../types'
 
-const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreApproval[]; busy?: boolean; domain?: string; embedded?: boolean; initialRunId?: string }>(), { runs: () => [], approvals: () => [], busy: false, embedded: false })
+const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreApproval[]; busy?: boolean; domain?: string; embedded?: boolean; initialRunId?: string; studioFocus?: boolean }>(), { runs: () => [], approvals: () => [], busy: false, embedded: false, studioFocus: false })
 const emit = defineEmits<{ refresh: []; runCreated: [run: CoreRun]; chatting: [active: boolean] }>()
 const conversations = ref<Conversation[]>([])
+const historyOpen = ref(false)
 const conversationId = ref('')
 const messages = ref<ConversationMessage[]>([])
 const mediaJobs = ref<MediaJob[]>([])
@@ -624,11 +626,13 @@ watch(
 </script>
 
 <template>
-  <main class="chat-shell" :class="{ embedded }">
-    <ConversationHistory :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" />
+  <main class="chat-shell" :class="{ embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }">
+    <ConversationHistory v-if="!studioFocus || historyOpen" :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="(id) => { void selectConversation(id); if (studioFocus) historyOpen = false }" @rename="renameChat" @remove="removeChat" />
     <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
     <header v-if="domain" class="chat-home-head">
-      <div><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>{{ domain ? '描述目标，逐步确认制作细节与结果。' : '直接提问或描述你想制作的内容，结果会留在当前聊天。' }}</p></div>
+      <div v-if="studioFocus"><h1>AI 导演</h1></div>
+      <div v-else><span class="section-kicker">{{ domain ? `${domain.toUpperCase()} WORKSPACE` : 'AUTONOMOUS CONVERSATION' }}</span><h1>{{ domain ? '与 Kantoku 协作' : '和 Kantoku 一起工作' }}</h1><p>{{ domain ? '描述目标，逐步确认制作细节与结果。' : '直接提问或描述你想制作的内容，结果会留在当前聊天。' }}</p></div>
+      <button v-if="studioFocus" type="button" class="studio-history-toggle" :aria-expanded="historyOpen" aria-label="查看历史聊天" @click="historyOpen = !historyOpen"><History :size="15" /> 历史聊天</button>
       <SystemStatusInline :label="sending || Object.keys(streamingByMessage).length ? 'Kantoku 正在回复' : '就绪'" :tone="sending || Object.keys(streamingByMessage).length ? 'active' : 'neutral'" />
     </header>
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>

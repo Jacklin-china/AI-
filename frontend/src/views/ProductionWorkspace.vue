@@ -1,9 +1,10 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, ref, watch } from 'vue'
-import { Film, Image as ImageIcon, Layers3 } from 'lucide-vue-next'
+import { Check, ChevronDown, Film, Image as ImageIcon, Images, MessageSquareText, PanelRight, X } from 'lucide-vue-next'
 import { Pane, Splitpanes } from 'splitpanes'
 import 'splitpanes/dist/splitpanes.css'
 import WorkflowProgress, { type WorkflowStep } from '../components/WorkflowProgress.vue'
+import { comicPhases, resolveComicPreviewUrl } from '../domains/comic/workspacePresentation'
 import { presenterFor } from '../domains/presenters'
 import { navigate } from '../router'
 import { getArtifactContentUrl, getArtifacts, getEvents, getRun, getTaskImageUrl, resumeRun, subscribeRunEvents, type RuntimeEvent } from '../services/core'
@@ -21,6 +22,9 @@ const resumeError = ref('')
 const selectedArtifactId = ref('')
 const previewUrl = ref('')
 const previewLoading = ref(false)
+const assetsOpen = ref(false)
+const inspectorOpen = ref(false)
+const compactView = ref<'chat' | 'preview'>('chat')
 let unsubscribe: (() => void) | null = null
 
 const isComic = computed(() => props.domain === 'comic')
@@ -30,9 +34,23 @@ const shotNumber = computed(() => Number(run.value?.state.shot_no) || null)
 const shotPrompt = computed(() => String(run.value?.state.prompt ?? '').trim())
 const runStatusLabels: Record<string, string> = { pending: '待执行', running: '制作中', waiting: '等待确认', completed: '已完成', failed: '失败', cancelled: '已取消' }
 const statusText = computed(() => runStatusLabels[run.value?.status ?? ''] ?? run.value?.status ?? '待开始')
-const currentStage = computed(() => run.value?.current_node
+const phases = computed(() => comicPhases(run.value))
+const currentStage = computed(() => run.value?.current_node && run.value.current_node !== '__end__'
   ? presenter.value.nodeLabel(run.value.current_node)
   : statusText.value)
+const qcReason = computed(() => {
+  const result = run.value?.state.qc_result
+  return result && typeof result === 'object' && !Array.isArray(result)
+    ? String((result as Record<string, unknown>).reason ?? '暂无检查说明')
+    : ''
+})
+const inspectorHeading = computed(() => {
+  const node = run.value?.current_node
+  if (node === 'generate') return '图片生成'
+  if (node === 'video') return '视频生成'
+  if (node === 'qc' || node === 'human_review') return '视觉检查'
+  return selectedArtifact.value ? '产物信息' : '制作详情'
+})
 const previewKey = computed(() => {
   if (!isComic.value) return ''
   if (selectedArtifact.value) return `artifact:${selectedArtifact.value.id}`
@@ -41,13 +59,13 @@ const previewKey = computed(() => {
   return state?.image_path && state.request_id ? `task:${String(state.request_id)}` : ''
 })
 const nextAction = computed(() => {
-  if (!run.value) return '在下方描述故事、角色与想呈现的画面，开始创作。'
+  if (!run.value) return '描述故事、角色与想呈现的画面，开始创作。'
   if (run.value.status === 'waiting') return externalWait.value
-    ? '原供应商任务仍需查询；请使用左侧的「继续查询原任务」。'
-    : '当前步骤需要你决定；请在下方审核画面或费用。'
+    ? '原供应商任务仍需查询；打开制作详情继续查询原任务。'
+    : '当前步骤需要你决定；请在对话中审核画面或费用。'
   if (run.value.status === 'running' || run.value.status === 'pending') return '正在执行当前步骤；产物完成后会自动出现在画布。'
-  if (run.value.status === 'completed') return '本次制作已完成。可以在下方继续提出修改或新镜头需求。'
-  return '本次制作未完成。请查看下方对话与右侧状态，确认失败原因。'
+  if (run.value.status === 'completed') return '本次制作已完成。可以继续提出修改或新镜头需求。'
+  return '本次制作未完成。打开制作详情查看状态，或在对话中继续处理。'
 })
 
 const externalWait = computed(() => {
@@ -94,9 +112,9 @@ watch(previewKey, async (key, _previous, onCleanup) => {
   previewUrl.value = ''
   previewLoading.value = !!key
   if (!key) return
-  const url = key.startsWith('artifact:')
-    ? await getArtifactContentUrl(key.slice(9)).catch(() => null)
-    : await getTaskImageUrl(key.slice(5)).catch(() => null)
+  const state = run.value?.state
+  const requestId = state?.image_path && state.request_id ? String(state.request_id) : null
+  const url = await resolveComicPreviewUrl(selectedArtifact.value, requestId, getArtifactContentUrl, getTaskImageUrl)
   if (cancelled) {
     if (url) URL.revokeObjectURL(url)
     return
@@ -134,6 +152,8 @@ function follow(): void {
 watch(() => props.runId, async () => {
   unsubscribe?.()
   selectedArtifactId.value = ''
+  assetsOpen.value = false
+  inspectorOpen.value = false
   if (props.runId) {
     await refresh()
     follow()
@@ -150,37 +170,84 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <section class="domain-workspace">
-    <Splitpanes class="domain-splitpanes">
-      <Pane :size="19" :min-size="14" :max-size="30">
-        <aside v-if="isComic" class="workspace-pane workflow-pane comic-assets-pane">
-          <header class="pane-heading"><span>Assets</span><strong>制作资产</strong></header>
-          <section class="comic-pane-group">
-            <span class="section-kicker">当前制作</span>
-            <p class="comic-project-name">{{ run ? String(run.state.project ?? '未命名项目') : '尚未开始制作' }}</p>
-            <p class="pane-note">{{ run ? `镜头 ${shotNumber ?? '—'} · ${statusText}` : '向下方 AI 导演描述创意即可开始。' }}</p>
-          </section>
-          <section class="comic-pane-group">
-            <span class="section-kicker">真实产物 · {{ visualArtifacts.length }}</span>
+  <section v-if="isComic" class="domain-workspace comic-studio">
+    <header class="comic-studio-header">
+      <div class="comic-studio-title">
+        <strong>漫剧创作</strong>
+        <small v-if="run">{{ String(run.state.project ?? '当前制作') }}</small>
+      </div>
+      <nav v-if="run" class="comic-phase-strip" aria-label="制作进度">
+        <span v-for="phase in phases" :key="phase.id" :data-status="phase.status">
+          <Check v-if="phase.status === 'completed'" :size="12" />
+          <i v-else aria-hidden="true" />
+          {{ phase.label }}
+        </span>
+      </nav>
+      <div class="comic-studio-actions">
+        <div v-if="run" class="comic-compact-switch" aria-label="工作区视图">
+          <button type="button" :aria-pressed="compactView === 'chat'" @click="compactView = 'chat'"><MessageSquareText :size="14" /> 对话</button>
+          <button type="button" :aria-pressed="compactView === 'preview'" @click="compactView = 'preview'"><Film :size="14" /> 预览</button>
+        </div>
+        <button v-if="run" type="button" class="comic-header-button" :aria-expanded="inspectorOpen" aria-label="制作详情" @click="inspectorOpen = !inspectorOpen; assetsOpen = false"><PanelRight :size="16" /><span>详情</span></button>
+      </div>
+    </header>
+    <div class="comic-studio-body" :data-compact-view="compactView">
+      <nav class="comic-tool-rail" aria-label="创作工具">
+        <button type="button" :aria-expanded="assetsOpen" aria-label="制作资产" title="制作资产" @click="assetsOpen = !assetsOpen; inspectorOpen = false"><Images :size="19" /></button>
+      </nav>
+      <main class="comic-main">
+        <Splitpanes class="comic-main-splitpanes" :class="{ 'has-run': !!run }">
+          <Pane :size="run ? 58 : 100" :min-size="run ? 36 : 100">
+            <div class="comic-director-chat">
+              <HomeView :key="domain" :domain="domain" :embedded="true" :studio-focus="true" :initial-run-id="runId" :runs="run ? [run] : []" :approvals="[]" @refresh="refresh" @run-created="(created) => navigate({ name: 'workspace_run', domain, runId: created.id })" @chatting="(active) => (chatActive = active)" />
+            </div>
+          </Pane>
+          <Pane v-if="run" :size="42" :min-size="26">
+            <section class="comic-preview" aria-label="制作结果预览">
+              <header class="comic-preview-header"><strong>结果预览</strong><small>{{ currentStage }}</small></header>
+              <div class="comic-preview-stage">
+                <video v-if="previewUrl && selectedArtifact?.type === 'video'" :src="previewUrl" controls preload="metadata" aria-label="当前视频产物" />
+                <img v-else-if="previewUrl" :src="previewUrl" alt="当前制作的真实图片产物" />
+                <div v-else class="comic-preview-empty" role="status"><strong>{{ previewLoading ? '正在载入产物' : run.state.image_path ? '图片暂时无法载入' : run.current_node === 'generate' ? '正在生成图片' : '结果会在完成后显示' }}</strong><p>{{ nextAction }}</p></div>
+              </div>
+              <footer v-if="selectedArtifact" class="comic-preview-footer">{{ presenter.artifactName(selectedArtifact.source, selectedArtifact.type) }} · 版本 {{ selectedArtifact.version }}</footer>
+            </section>
+          </Pane>
+        </Splitpanes>
+      </main>
+      <aside v-if="assetsOpen" class="comic-flyout comic-assets-flyout" aria-label="制作资产" @keydown.esc="assetsOpen = false">
+        <header><div><small>ASSETS</small><strong>制作资产</strong></div><button type="button" aria-label="关闭制作资产" @click="assetsOpen = false"><X :size="17" /></button></header>
+        <div class="comic-flyout-content">
+          <p v-if="run" class="comic-project-name">{{ String(run.state.project ?? '当前制作') }}</p>
+          <p v-if="run" class="pane-note">镜头 {{ shotNumber ?? '—' }} · {{ statusText }}</p>
+          <section class="comic-pane-group"><span class="section-kicker">已保存产物 · {{ visualArtifacts.length }}</span>
             <div v-if="visualArtifacts.length" class="comic-asset-list">
-              <button v-for="item in visualArtifacts" :key="item.id" type="button" :class="{ active: selectedArtifactId === item.id }" @click="selectedArtifactId = item.id">
+              <button v-for="item in visualArtifacts" :key="item.id" type="button" :class="{ active: selectedArtifactId === item.id }" @click="selectedArtifactId = item.id; assetsOpen = false">
                 <ImageIcon v-if="item.type === 'image'" :size="15" /><Film v-else :size="15" />
                 <span><strong>{{ presenter.artifactName(item.source, item.type) }}</strong><small>版本 {{ item.version }} · {{ item.type === 'video' ? '视频' : '图片' }}</small></span>
               </button>
             </div>
-            <p v-else class="pane-note">暂无已保存的图片或视频；生成结果会自动加入这里。</p>
+            <p v-else class="pane-note">暂无已保存的图片或视频。产物生成后会出现在这里。</p>
           </section>
-          <section class="comic-pane-group">
-            <span class="section-kicker">连续性资产</span>
-            <p class="pane-note">当前流程尚未建立可锁定的角色、场景与风格资产。不要将单次提示词视为已锁定资产。</p>
-          </section>
-          <section v-if="externalWait" class="comic-pane-group" role="status">
-            <p class="pane-note">{{ externalWait === 'needs_reconciliation' ? '原任务缺少供应商任务 ID，需要人工查账；系统不会重新付费提交。' : '供应商任务尚未完成；继续查询沿用原任务 ID。' }}</p>
-            <button v-if="externalWait === 'external_job_pending'" class="ui-button sm" :disabled="resuming" @click="queryOriginalJob">{{ resuming ? '查询中…' : '继续查询原任务' }}</button>
-            <p v-if="resumeError" class="pane-note" role="alert">{{ resumeError }}</p>
-          </section>
-        </aside>
-        <aside v-else class="workspace-pane workflow-pane">
+          <p class="comic-assets-note">角色、场景与风格锁定资产尚未接入当前流程；这里仅展示真实保存的产物。</p>
+        </div>
+      </aside>
+      <aside v-if="run && inspectorOpen" class="comic-flyout comic-inspector-flyout" aria-label="制作详情" @keydown.esc="inspectorOpen = false">
+        <header><div><small>INSPECTOR</small><strong>{{ inspectorHeading }}</strong></div><button type="button" aria-label="关闭制作详情" @click="inspectorOpen = false"><X :size="17" /></button></header>
+        <div class="comic-flyout-content">
+          <section class="comic-current-context"><span class="section-kicker">当前阶段</span><strong>{{ currentStage }}</strong><p>{{ nextAction }}</p></section>
+          <section v-if="externalWait" class="comic-pane-group" role="status"><p class="pane-note">{{ externalWait === 'needs_reconciliation' ? '原任务缺少供应商任务 ID，需要人工查账；系统不会重新付费提交。' : '供应商任务尚未完成；继续查询沿用原任务 ID。' }}</p><button v-if="externalWait === 'external_job_pending'" class="ui-button sm" :disabled="resuming" @click="queryOriginalJob">{{ resuming ? '查询中…' : '继续查询原任务' }}</button><p v-if="resumeError" class="pane-note" role="alert">{{ resumeError }}</p></section>
+          <section v-if="run.state.qc_result" class="comic-pane-group"><span class="section-kicker">视觉检查</span><strong class="comic-qc-result">{{ run.state.qc_passed ? '预筛通过' : '需要复核' }}</strong><p class="pane-note">{{ qcReason }}</p></section>
+          <section v-if="selectedArtifact" class="comic-pane-group"><span class="section-kicker">当前产物</span><p class="comic-selected-name">{{ presenter.artifactName(selectedArtifact.source, selectedArtifact.type) }} · 版本 {{ selectedArtifact.version }}</p></section>
+          <details class="comic-advanced"><summary>高级信息 <ChevronDown :size="15" /></summary><div><dl class="inspector-meta"><div><dt>镜头</dt><dd>{{ shotNumber ?? '—' }}</dd></div><div><dt>视觉风格</dt><dd>{{ String(run.state.visual_style ?? '未设定') }}</dd></div><div><dt>已发生费用</dt><dd>¥{{ (run.cost_fen / 100).toFixed(2) }}</dd></div><div v-if="run.state.model"><dt>模型</dt><dd>{{ String(run.state.model) }}</dd></div><div v-if="run.state.seed"><dt>Seed</dt><dd>{{ String(run.state.seed) }}</dd></div></dl><section v-if="shotPrompt" class="comic-advanced-section"><span class="section-kicker">当前 Prompt</span><p class="comic-inspector-prompt">{{ shotPrompt }}</p></section><button class="text-action" @click="navigate({ name: 'task_run', runId: run.id })">查看完整任务记录 →</button></div></details>
+        </div>
+      </aside>
+    </div>
+  </section>
+  <section v-else class="domain-workspace">
+    <Splitpanes class="domain-splitpanes">
+      <Pane :size="19" :min-size="14" :max-size="30">
+        <aside class="workspace-pane workflow-pane">
           <header class="pane-heading"><span>Workflow</span><strong>{{ run ? '执行进度' : '完整流程' }}</strong></header>
           <WorkflowProgress v-if="steps.length" :steps="steps" compact />
           <p v-if="!run" class="pane-note">以上是{{ presenter.label }}的完整工作流。在对话中描述需求并确认后，这里会显示真实节点进度。</p>
@@ -199,25 +266,7 @@ onBeforeUnmount(() => {
         </aside>
       </Pane>
       <Pane :size="57" :min-size="34">
-        <div v-if="isComic" class="workspace-pane comic-workspace-center">
-          <Splitpanes horizontal class="comic-center-splitpanes">
-            <Pane :size="57" :min-size="28">
-              <section class="comic-canvas" aria-label="当前创作画布">
-                <header class="comic-canvas-toolbar"><div><span class="section-kicker">WORK CANVAS</span><h1>{{ run ? `镜头 ${shotNumber ?? '—'}` : '漫剧制作台' }}</h1></div><span class="comic-canvas-status">{{ currentStage }}</span></header>
-                <div class="comic-stage">
-                  <template v-if="previewUrl && selectedArtifact?.type === 'video'"><video :src="previewUrl" controls preload="metadata" aria-label="当前视频产物" /></template>
-                  <img v-else-if="previewUrl" :src="previewUrl" alt="当前镜头的真实图片产物" />
-                  <div v-else class="comic-stage-empty"><Layers3 :size="27" :stroke-width="1.4" /><strong>{{ previewLoading ? '正在载入真实产物…' : run?.state.image_path ? '图片暂时无法载入' : '当前镜头尚无画面' }}</strong><span>{{ run ? '已生成的画面会自动出现在这里' : '从下方 AI 导演助手开始，创意将逐步变成制作结果' }}</span></div>
-                </div>
-                <div class="comic-next-step"><span>下一步</span><p>{{ nextAction }}</p></div>
-              </section>
-            </Pane>
-            <Pane :size="43" :min-size="25">
-              <div class="comic-director-dock"><HomeView :key="domain" :domain="domain" :embedded="true" :initial-run-id="runId" :runs="run ? [run] : []" :approvals="[]" @refresh="refresh" @run-created="(created) => navigate({ name: 'workspace_run', domain, runId: created.id })" @chatting="(active) => (chatActive = active)" /></div>
-            </Pane>
-          </Splitpanes>
-        </div>
-        <div v-else class="workspace-pane canvas-pane">
+        <div class="workspace-pane canvas-pane">
           <HomeView
             :key="domain"
             :domain="domain"
@@ -232,19 +281,7 @@ onBeforeUnmount(() => {
         </div>
       </Pane>
       <Pane :size="24" :min-size="16" :max-size="38">
-        <aside v-if="isComic" class="workspace-pane workspace-inspector comic-inspector">
-          <header class="pane-heading"><span>Inspector</span><strong>当前镜头</strong></header>
-          <section class="comic-pane-group"><span class="section-kicker">制作阶段</span><WorkflowProgress :steps="steps" compact /></section>
-          <section v-if="run" class="comic-pane-group">
-            <span class="section-kicker">创作要求 · 来自当前任务</span>
-            <p class="comic-inspector-prompt">{{ shotPrompt || '当前任务未保存创作描述。' }}</p>
-            <dl class="inspector-meta"><div><dt>镜头</dt><dd>{{ shotNumber ?? '—' }}</dd></div><div><dt>当前风格</dt><dd>{{ String(run.state.visual_style ?? '未设定') }}</dd></div><div><dt>状态</dt><dd>{{ statusText }}</dd></div><div><dt>已发生费用</dt><dd>¥{{ (run.cost_fen / 100).toFixed(2) }}</dd></div></dl>
-          </section>
-          <section v-if="run?.state.qc_result" class="comic-pane-group"><span class="section-kicker">视觉检查</span><strong class="comic-qc-result">{{ run.state.qc_passed ? '预筛通过' : '需要复核' }}</strong><p class="pane-note">{{ String((run.state.qc_result as Record<string, unknown>).reason ?? '暂无说明') }}</p></section>
-          <section v-if="selectedArtifact" class="comic-pane-group"><span class="section-kicker">选中产物</span><p class="comic-selected-name">{{ presenter.artifactName(selectedArtifact.source, selectedArtifact.type) }}</p><dl class="inspector-meta"><div><dt>类型</dt><dd>{{ selectedArtifact.type }}</dd></div><div><dt>版本</dt><dd>{{ selectedArtifact.version }}</dd></div></dl></section>
-          <section v-if="run" class="comic-pane-group"><button class="text-action" @click="navigate({ name: 'task_run', runId: run.id })">查看完整任务记录 →</button></section>
-        </aside>
-        <aside v-else class="workspace-pane workspace-inspector">
+        <aside class="workspace-pane workspace-inspector">
           <header class="pane-heading"><span>Inspector</span><strong>任务详情</strong></header>
           <section v-if="artifacts.length" class="pane-section">
             <span class="section-kicker">Artifacts</span>

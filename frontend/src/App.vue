@@ -15,7 +15,7 @@ import type { CoreApproval, CoreRun } from './types'
 /* 原有排版骨架：侧栏导航 + 顶栏 + 页面舞台；工作逻辑全部来自真实 Core 数据。 */
 const runs = ref<CoreRun[]>([])
 const approvals = ref<CoreApproval[]>([])
-const sidebarCollapsed = ref(false)
+const sidebarCollapsed = ref(window.matchMedia('(max-width: 800px)').matches)
 const commandOpen = ref(false)
 let timer: number | undefined
 
