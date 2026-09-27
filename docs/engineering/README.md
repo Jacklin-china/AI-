@@ -20,6 +20,15 @@
 - `shells/web_studio.py::_enhance_prompt` 与 `capabilities/creative.py::compile_image_prompt` 分别服务不同路径，是提示词处理分散的收口候选；不能仅凭同名或 IDE unused 删除。`src/kantoku/core/` 未发现直接导入 `domains/` 或 `adapters/`，但上述领域词属于语义泄漏。
 - 对源码与测试文件名的 `_new/_old/_backup/_final/_v2` 审计未发现可据此删除的副本。`src/kantoku/shells/web/` 是前端构建输出，不是第二份源码；不得当废弃代码删除。清理任何动态加载、Skill、路由或 Schema 前仍须逐项核对引用。
 
+## 漫剧制作台审计与演进边界（2026-09-27）
+
+- 当前 `domains/comic/workflow.py` 的真实闭环是**单镜头任务准备 → 费用确认 → 生图 → VLM QC → 人工审核/返工 → 归档 → 可选视频**。`prepare` 只创建可恢复的 StudioTask，不生成导演分析或结构化分镜；前端不得把它标作已完成的「导演规划」。
+- `tools/storyboard.py` 已能生成并持久化 20 镜分镜，`tools/prompt_factory.py` 已提供镜头与 Persona 的可追溯配方，`memory/` 保存角色记忆。这些能力目前未由上述 Comic Workflow 统一编排；不得在 UI 中伪装已有 Character/Scene/Style Bible 或已锁定资产。
+- 制作台本轮先复用 Run、NodeExecution、Artifact、QC State 和原有专业对话：左侧真实产物，中间当前画面，下方导演对话，右侧镜头要求、阶段与 QC。没有真实产物就呈现空状态，不生成演示数据或假进度。Commerce/Studio 沿用原页面。
+- 后续导演层应在 `domains/comic/` 中定义可持久化的 Creative Brief / Director Spec / Asset Bible / Storyboard，并区分用户硬约束、软偏好与可发挥空间；用 Stable Context + Relevant Memory + Current Task 编译不同模型的 Prompt。复用现有 Capability、Budget、Artifact、Provider、审批和 Runtime，不增加第二套生图/视频或独立聊天系统。QC 应区分通过、小修和重做，实际支持局部修复前不得在界面声称已有该能力。
+
+参考：[Runway 的镜头与角色/环境素材工作流](https://help.runwayml.com/hc/en-us/articles/26871350018835-How-to-create-longer-videos-and-films)、[Figma 的左资产/中画布/右属性布局](https://help.figma.com/hc/en-us/articles/30925881896727-FD4B-Navigate-Figma-Design-files)。当前布局继续使用项目已有 `splitpanes`，不为同一用途重复引入组件库。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

@@ -35,10 +35,10 @@ const commerceLabels: Record<string, string> = {
 }
 
 const comicLabels: Record<string, string> = {
-  prepare: '需求与分镜准备',
+  prepare: '创建制作任务',
   cost_approval: '费用确认',
   generate: '图片生成',
-  video: '图生视频',
+  video: '图生视频（可选）',
   qc: '质量检查',
   human_review: '人工审核',
   rework: '返工',
@@ -134,9 +134,9 @@ const commerce: DomainPresenter = {
 const comic: DomainPresenter = {
   id: 'comic',
   label: '漫剧',
-  subtitle: '分镜、角色一致性、生图、QC、人工审核与归档。',
+  subtitle: '单镜头制作、生图、视觉检查、人工审核与可选视频。',
   workflow: nodeList(comicLabels, comicFlow),
-  guideHint: '从剧本或分镜想法开始，我会先和你确认风格与镜头要求，确认无误后回复「开始」提交执行。',
+  guideHint: '描述故事、角色或想呈现的镜头。当前预览流程支持单镜头制作；付费生成与终审仍需你确认。',
   examples: [
     '雨夜便利店，主角捡到一只会说话的猫，生成开场分镜',
     '来一张赛博朋克风的女主角立绘，霓虹光，侧脸特写',

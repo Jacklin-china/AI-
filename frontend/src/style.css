@@ -453,6 +453,47 @@
 .inspector-artifacts small { color: var(--text-muted); }
 .inspector-empty { color: var(--text-muted); font-size: 12.5px; }
 
+/* Comic production workspace: real run/asset data, with the director chat below the canvas. */
+.comic-assets-pane, .comic-inspector { background: #f8f9f8; }
+.comic-pane-group { margin-top: 18px; padding-top: 16px; border-top: 1px solid var(--border); }
+.comic-pane-group:first-of-type { border-top: 0; margin-top: 14px; padding-top: 0; }
+.comic-project-name { margin: 9px 0 2px; overflow-wrap: anywhere; font-size: 14px; font-weight: 600; line-height: 1.4; }
+.comic-pane-group .pane-note { margin: 7px 0 0; color: var(--text-muted); font-size: 11.5px; line-height: 1.6; }
+.comic-asset-list { display: grid; gap: 4px; margin-top: 10px; }
+.comic-asset-list button { display: flex; align-items: center; gap: 9px; width: 100%; min-width: 0; padding: 9px; border: 1px solid transparent; border-radius: 6px; background: transparent; color: var(--text-secondary); text-align: left; cursor: pointer; }
+.comic-asset-list button:hover { background: #eef1ef; color: var(--text-primary); }
+.comic-asset-list button.active { border-color: #cbd8d1; background: #e9f0eb; color: #183a2b; }
+.comic-asset-list button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.comic-asset-list button span { display: grid; min-width: 0; gap: 2px; }
+.comic-asset-list button strong { overflow: hidden; font-size: 12px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }
+.comic-asset-list button small { color: var(--text-muted); font-size: 10px; }
+.comic-workspace-center { overflow: hidden; background: #f1f3f2; }
+.comic-center-splitpanes { height: 100%; }
+.comic-center-splitpanes > .splitpanes__pane { min-height: 0; overflow: hidden; background: #fff; }
+.comic-center-splitpanes > .splitpanes__splitter { height: 6px; min-height: 6px; border: 0; background: #e5e9e6; cursor: row-resize; }
+.comic-center-splitpanes > .splitpanes__splitter:hover { background: #b6c6bc; }
+.comic-canvas { display: flex; flex-direction: column; min-height: 0; height: 100%; background: #f5f7f5; }
+.comic-canvas-toolbar { display: flex; align-items: center; justify-content: space-between; gap: 12px; min-height: 62px; padding: 11px 17px; border-bottom: 1px solid #dde2de; background: #fbfcfb; }
+.comic-canvas-toolbar h1 { margin: 3px 0 0; font-size: 17px; font-weight: 650; letter-spacing: -.015em; }
+.comic-canvas-status { flex: none; padding: 4px 8px; border: 1px solid #d6dfd9; border-radius: 5px; background: #f1f5f2; color: #466151; font-size: 11px; }
+.comic-stage { display: grid; flex: 1; min-height: 0; place-items: center; overflow: hidden; padding: 15px; background: #222a29; }
+.comic-stage img, .comic-stage video { display: block; max-width: 100%; max-height: 100%; object-fit: contain; box-shadow: 0 8px 26px rgba(0,0,0,.16); }
+.comic-stage-empty { display: grid; justify-items: center; gap: 9px; max-width: 330px; color: #a8b8b1; text-align: center; }
+.comic-stage-empty strong { color: #e4ebe7; font-size: 14px; font-weight: 600; }
+.comic-stage-empty span { font-size: 11px; line-height: 1.5; }
+.comic-next-step { display: flex; align-items: baseline; gap: 10px; padding: 9px 17px; border-top: 1px solid #dde2de; background: #fbfcfb; }
+.comic-next-step span { flex: none; color: #47725b; font-size: 11px; font-weight: 650; }
+.comic-next-step p { margin: 0; color: var(--text-secondary); font-size: 11.5px; line-height: 1.45; }
+.comic-director-dock { height: 100%; min-height: 0; overflow: hidden; }
+.comic-director-dock .chat-home-head { padding: 8px 14px 6px; }
+.comic-director-dock .chat-home-head h1 { margin: 2px 0 0; font-size: 14px; }
+.comic-director-dock .composer-dock { padding: 7px 12px 9px; }
+.comic-director-dock .composer-dock > p { display: none; }
+.comic-inspector-prompt { max-height: 145px; overflow: auto; margin: 9px 0 13px; white-space: pre-wrap; overflow-wrap: anywhere; font-size: 12px; line-height: 1.65; }
+.comic-inspector .inspector-meta dd { max-width: 56%; margin: 0; overflow-wrap: anywhere; text-align: right; }
+.comic-qc-result { display: block; margin-top: 9px; font-size: 13px; font-weight: 600; }
+.comic-selected-name { margin: 8px 0; font-size: 12.5px; font-weight: 600; }
+
 .command-center { display: grid; gap: 18px; max-width: 760px; margin: 0 auto; padding-top: 40px; }
 .hero { display: grid; gap: 8px; justify-items: start; }
 .hero-avatar { display: grid; place-items: center; width: 40px; height: 40px; border-radius: 50%; background: #1a1d22; color: #fff; font-size: 12px; font-weight: 600; }
