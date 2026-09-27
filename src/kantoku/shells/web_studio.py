@@ -97,13 +97,23 @@ from kantoku.domains.comic.models import (
     ComicAssetRef,
     ComicAssetVersionRequest,
     ComicProjectInput,
+    ComicShotCreateRequest,
+    ComicShotDeleteRequest,
+    ComicShotEditRequest,
+    ComicStoryboardCreateRequest,
+    ComicStoryboardDraft,
+    ComicStoryboardEditRequest,
+    ComicVersionRestoreRequest,
     CreativeBriefUpdate,
     DirectorSpecDraft,
     DirectorSpecRequest,
     DirectorSpecRestore,
+    ShotStatus,
+    StoryboardStatus,
 )
 from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
 from kantoku.domains.comic.services import StudioComicServices
+from kantoku.domains.comic.storyboards import ComicStoryboardStore, plan_storyboard
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
 from kantoku.domains.commerce import CommerceState, build_commerce_workflow
 from kantoku.domains.commerce.workflow import WORKFLOW_ID as COMMERCE_WORKFLOW_ID
@@ -376,6 +386,7 @@ class StudioApplication:
         self.runtime_store = RuntimeStore(database_path)
         self.comic_projects = ComicProjectStore(self.runtime_store.path)
         self.comic_assets = ComicAssetStore(self.comic_projects, self.runtime_store)
+        self.comic_storyboards = ComicStoryboardStore(self.comic_projects, self.comic_assets)
         self.runtime = GraphRuntime(self.runtime_store)
         self.skills = SkillRegistry()
         SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
@@ -1628,7 +1639,9 @@ class StudioApplication:
             self._run_payload(record.id)
             for record in records
             if record.id not in self._legacy_home_run_ids
-            and record.workflow != "comic.director-spec"
+            and not record.workflow.startswith((
+                "comic.director-spec", "comic.storyboard.", "comic.shot.",
+            ))
         ]
 
     def _legacy_autonomous_run_ids(self, records: list[RunRecord]) -> set[str]:
@@ -1907,7 +1920,9 @@ class StudioApplication:
         runs = self.runtime_store.list_runs(limit=100000, domain="comic")
         tasks = []
         for run in runs:
-            if run.workflow != "comic.director-spec" or run.state.get("project_id") != project_id:
+            if (not run.workflow.startswith((
+                    "comic.director-spec", "comic.storyboard.", "comic.shot.",
+                )) or run.state.get("project_id") != project_id):
                 continue
             payload = self._run_payload(run.id)
             payload["recovery_required"] = (
@@ -1916,6 +1931,245 @@ class StudioApplication:
             )
             tasks.append(payload)
         return {"tasks": tasks}
+
+    @staticmethod
+    def _comic_storyboard_model(messages: list[dict[str, str]]) -> str:
+        return chat(messages, response_format={"type": "json_object"}).content or ""
+
+    def _comic_tracked_action(
+        self, project_id: str, task_type: str,
+        action: Callable[[Callable[[str, str | None], None]], dict[str, Any]],
+        *, storyboard_id: str | None = None, shot_id: str | None = None,
+        expected_project_version: int, expected_version: int | None = None,
+    ) -> dict[str, Any]:
+        """作品写操作复用 Core Run/Event；不创建 Comic 专属任务表。"""
+        trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
+        task_id = f"task-{uuid4().hex}"
+        state: dict[str, Any] = {
+            "trace_id": trace_id, "project_id": project_id, "task_id": task_id,
+            "task_type": task_type, "task_status": "draft", "last_completed_step": None,
+            "storyboard_id": storyboard_id, "shot_id": shot_id,
+            "expected_project_version": expected_project_version,
+            "expected_version": expected_version,
+            "worker_instance_id": self._instance_id,
+        }
+        run = self.runtime_store.create_run(
+            "comic", f"comic.{task_type}", state, task_type,
+            interaction_mode=InteractionMode.GUIDED,
+        )
+        self.runtime_store.append_event(
+            run.id, RuntimeEventType.RUN_STARTED, node_id=task_type,
+            payload={"project_id": project_id, "task_id": task_id},
+        )
+
+        def progress(status: str, completed_step: str | None) -> None:
+            state.update(task_status=status, last_completed_step=completed_step)
+            self.runtime_store.update_run(
+                run.id, status=ExecutionStatus.RUNNING, state=state, current_node=task_type,
+            )
+            self.runtime_store.append_event(
+                run.id, RuntimeEventType.NODE_PROGRESS, node_id=task_type,
+                payload={"task_status": status, "last_completed_step": completed_step},
+            )
+
+        with request_trace(trace_id), run_trace(run.id, task_type), logger.contextualize(
+            component="comic.storyboard", project_id=project_id, task_id=task_id,
+            storyboard_id=storyboard_id or "-", shot_id=shot_id or "-",
+        ):
+            logger.info(
+                "task received action={} created_at={} project_version={} "
+                "entity_version={} storyboard_id={} shot_id={}",
+                task_type, run.started_at.isoformat(), expected_project_version,
+                expected_version, storyboard_id or "-", shot_id or "-",
+            )
+            try:
+                progress("planning", "request_validated")
+                result = action(progress)
+                entity = result.get("storyboard", result)
+                saved_storyboard_id = entity.get("storyboard_id", storyboard_id)
+                saved_shot_id = entity.get("shot_id", shot_id)
+                saved_version = entity.get("version")
+                state.update(
+                    task_status="completed", last_completed_step="version_saved",
+                    storyboard_id=saved_storyboard_id, shot_id=saved_shot_id,
+                    result_version=saved_version,
+                )
+                self.runtime_store.update_run(
+                    run.id, status=ExecutionStatus.COMPLETED, state=state,
+                    current_node=task_type,
+                )
+                self.runtime_store.append_event(
+                    run.id, RuntimeEventType.RUN_COMPLETED, node_id=task_type,
+                    payload={"storyboard_id": saved_storyboard_id,
+                             "shot_id": saved_shot_id, "version": saved_version},
+                )
+                logger.info(
+                    "task completed action={} storyboard_id={} shot_id={} version={}",
+                    task_type, saved_storyboard_id, saved_shot_id, saved_version,
+                )
+                return result
+            except Exception as error:
+                failure = public_error(
+                    error, component="comic.storyboard", project_id=project_id,
+                    run_id=run.id, task_id=task_id,
+                    storyboard_id=storyboard_id or "-", shot_id=shot_id or "-",
+                )
+                error._kantoku_public_failure = failure
+                state.update(task_status="failed", error_id=failure["error_id"])
+                self.runtime_store.update_run(
+                    run.id, status=ExecutionStatus.FAILED, state=state,
+                    current_node=task_type, error=failure["error_id"],
+                )
+                self.runtime_store.append_event(
+                    run.id, RuntimeEventType.RUN_FAILED, node_id=task_type,
+                    payload={"error_id": failure["error_id"]},
+                )
+                raise
+
+    def create_comic_storyboard(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicStoryboardCreateRequest.model_validate(data)
+
+        def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            snapshot = self.comic_projects.get(project_id)
+            if snapshot.project.current_version != request.expected_project_version:
+                raise ToolError("作品已由其他操作更新，请刷新后重试")
+            director = self.comic_projects.get_director(project_id)
+            if request.generate:
+                assets = self.comic_assets.select_relevant(
+                    project_id, task=request.task,
+                    refs=[ComicAssetRef(asset_id=item) for item in request.asset_ids],
+                    project_version=snapshot.project.current_version,
+                )
+                logger.info(
+                    "storyboard context brief_version={} director_version={} "
+                    "asset_versions={} model={}", snapshot.creative_brief.version,
+                    director.version,
+                    [{"asset_id": asset.asset_id, "version": asset.version} for asset in assets],
+                    get_settings().llm.model_chat,
+                )
+                progress("generating", "context_selected")
+                plan = plan_storyboard(
+                    snapshot, director, task=request.task, assets=assets,
+                    model_call=self._comic_storyboard_model,
+                )
+                draft = plan.model_dump(include={"title", "description"})
+                shots = plan.shots
+                source = "model"
+            else:
+                draft = request.draft.model_dump() if request.draft else {}
+                shots = []
+                source = "created"
+            progress("checking", "plan_ready")
+            storyboard = self.comic_storyboards.create(
+                project_id, ComicStoryboardDraft.model_validate(draft),
+                expected_project_version=request.expected_project_version,
+                director_spec_version=director.version, shots=shots, source=source,
+            )
+            return {"storyboard": storyboard.model_dump(mode="json"),
+                    "shots": [item.model_dump(mode="json")
+                              for item in self.comic_storyboards.list_shots(
+                                  storyboard.storyboard_id)]}
+
+        return self._comic_tracked_action(
+            project_id, "storyboard.create", execute,
+            expected_project_version=request.expected_project_version,
+        )
+
+    def list_comic_storyboards(self, project_id: str) -> dict[str, Any]:
+        return {"storyboards": [item.model_dump(mode="json")
+                for item in self.comic_storyboards.list(project_id)]}
+
+    def get_comic_storyboard(self, storyboard_id: str) -> dict[str, Any]:
+        storyboard = self.comic_storyboards.get(storyboard_id)
+        return {"storyboard": storyboard.model_dump(mode="json"),
+                "shots": [item.model_dump(mode="json")
+                          for item in self.comic_storyboards.list_shots(storyboard_id)]}
+
+    def edit_comic_storyboard(self, storyboard_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicStoryboardEditRequest.model_validate(data)
+        project_id = self.comic_storyboards.get(storyboard_id).project_id
+        return self._comic_tracked_action(
+            project_id, "storyboard.edit",
+            lambda _progress: self.comic_storyboards.edit(
+                storyboard_id, expected_project_version=request.expected_project_version,
+                expected_version=request.expected_version, draft=request.draft,
+                status=StoryboardStatus(request.status), shot_ids=request.shot_ids,
+            ).model_dump(mode="json"), storyboard_id=storyboard_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
+
+    def restore_comic_storyboard(
+        self, storyboard_id: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = ComicVersionRestoreRequest.model_validate(data)
+        project_id = self.comic_storyboards.get(storyboard_id).project_id
+        return self._comic_tracked_action(
+            project_id, "storyboard.restore",
+            lambda _progress: self.comic_storyboards.restore(
+                storyboard_id, expected_project_version=request.expected_project_version,
+                expected_version=request.expected_version, version=request.version,
+            ).model_dump(mode="json"), storyboard_id=storyboard_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
+
+    def create_comic_shot(self, storyboard_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicShotCreateRequest.model_validate(data)
+        project_id = self.comic_storyboards.get(storyboard_id).project_id
+        return self._comic_tracked_action(
+            project_id, "shot.create",
+            lambda _progress: self.comic_storyboards.add_shot(
+                storyboard_id, request.shot,
+                expected_project_version=request.expected_project_version,
+                expected_storyboard_version=request.expected_storyboard_version,
+            ).model_dump(mode="json"), storyboard_id=storyboard_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_storyboard_version,
+        )
+
+    def edit_comic_shot(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicShotEditRequest.model_validate(data)
+        shot = self.comic_storyboards.get_shot(shot_id)
+        return self._comic_tracked_action(
+            shot.project_id, "shot.edit",
+            lambda _progress: self.comic_storyboards.edit_shot(
+                shot_id, request.shot, expected_project_version=request.expected_project_version,
+                expected_version=request.expected_version, status=ShotStatus(request.status),
+            ).model_dump(mode="json"), storyboard_id=shot.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
+
+    def change_comic_shot(
+        self, shot_id: str, action: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        shot = self.comic_storyboards.get_shot(shot_id)
+        if action == "restore":
+            request = ComicVersionRestoreRequest.model_validate(data)
+
+            def operation() -> Any:
+                return self.comic_storyboards.restore_shot(
+                    shot_id, expected_project_version=request.expected_project_version,
+                    expected_version=request.expected_version, version=request.version,
+                )
+        elif action == "delete":
+            request = ComicShotDeleteRequest.model_validate(data)
+
+            def operation() -> Any:
+                return self.comic_storyboards.delete_shot(
+                    shot_id, expected_project_version=request.expected_project_version,
+                    expected_version=request.expected_version,
+                )
+        else:
+            raise ToolError("镜头操作不受支持")
+        return self._comic_tracked_action(
+            shot.project_id, f"shot.{action}",
+            lambda _progress: operation().model_dump(mode="json"),
+            storyboard_id=shot.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
 
     def get_comic_director(self, project_id: str) -> dict[str, Any]:
         return self.comic_projects.get_director(project_id).model_dump(mode="json")
@@ -2193,6 +2447,10 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 context["project_id"] = parts[2]
                 if len(parts) >= 5 and parts[3] == "assets":
                     context["asset_id"] = parts[4]
+            elif len(parts) >= 3 and parts[:2] == ["comic", "storyboards"]:
+                context["storyboard_id"] = parts[2]
+            elif len(parts) >= 3 and parts[:2] == ["comic", "shots"]:
+                context["shot_id"] = parts[2]
             failure = getattr(error, "_kantoku_public_failure", None)
             if failure is None:
                 failure = public_error(error, **context)
@@ -2355,6 +2613,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         ))
                     elif len(comic_parts) == 4 and comic_parts[3] == "tasks":
                         self.json_reply(200, app.list_comic_project_tasks(comic_parts[2]))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "storyboards":
+                        self.json_reply(200, app.list_comic_storyboards(comic_parts[2]))
                     elif len(comic_parts) == 5 and comic_parts[3] == "assets":
                         self.json_reply(200, app.get_comic_asset(
                             comic_parts[2], comic_parts[4], version=version,
@@ -2372,6 +2632,37 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(200, app.list_comic_director_versions(comic_parts[2]))
                     else:
                         self.json_reply(404, {"error": "Comic API 路径不存在"})
+                elif request_path.startswith("/api/comic/storyboards/"):
+                    comic_parts = request_path.strip("/").split("/")
+                    storyboard_id = comic_parts[3]
+                    if len(comic_parts) == 4:
+                        self.json_reply(200, app.get_comic_storyboard(storyboard_id))
+                    elif len(comic_parts) == 5 and comic_parts[4] == "shots":
+                        self.json_reply(200, {"shots": [
+                            item.model_dump(mode="json")
+                            for item in app.comic_storyboards.list_shots(storyboard_id)
+                        ]})
+                    elif len(comic_parts) == 5 and comic_parts[4] == "versions":
+                        self.json_reply(200, {"versions": [
+                            item.model_dump(mode="json")
+                            for item in app.comic_storyboards.versions(storyboard_id)
+                        ]})
+                    else:
+                        self.json_reply(404, {"error": "Storyboard API 路径不存在"})
+                elif request_path.startswith("/api/comic/shots/"):
+                    comic_parts = request_path.strip("/").split("/")
+                    shot_id = comic_parts[3]
+                    if len(comic_parts) == 4:
+                        self.json_reply(200, app.comic_storyboards.get_shot(
+                            shot_id,
+                        ).model_dump(mode="json"))
+                    elif len(comic_parts) == 5 and comic_parts[4] == "versions":
+                        self.json_reply(200, {"versions": [
+                            item.model_dump(mode="json")
+                            for item in app.comic_storyboards.shot_versions(shot_id)
+                        ]})
+                    else:
+                        self.json_reply(404, {"error": "Shot API 路径不存在"})
                 elif request_path == "/api/runs":
                     self.json_reply(200, {"runs": app.list_core_runs()})
                 elif request_path.startswith("/api/runs/"):
@@ -2501,6 +2792,18 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 4 \
                         and comic_parts[3] == "director-spec":
                     self.json_reply(201, app.create_comic_director(comic_parts[2], data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 4 \
+                        and comic_parts[3] == "storyboards":
+                    self.json_reply(201, app.create_comic_storyboard(comic_parts[2], data))
+                elif len(parts) == 5 and parts[:3] == ["api", "comic", "storyboards"] \
+                        and parts[4] == "shots":
+                    self.json_reply(201, app.create_comic_shot(parts[3], data))
+                elif len(parts) == 5 and parts[:3] == ["api", "comic", "storyboards"] \
+                        and parts[4] == "restore":
+                    self.json_reply(201, app.restore_comic_storyboard(parts[3], data))
+                elif len(parts) == 5 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4] in {"restore", "delete"}:
+                    self.json_reply(201, app.change_comic_shot(parts[3], parts[4], data))
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
                         and comic_parts[3:] == ["director-spec", "restore"]:
                     self.json_reply(201, app.restore_comic_director(comic_parts[2], data))
@@ -2573,7 +2876,9 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 length = int(self.headers.get("Content-Length", "0"))
                 is_brief = len(parts) == 4 and parts[3] == "brief"
                 is_asset = len(parts) == 5 and parts[3] == "assets"
-                if (parts[:2] != ["comic", "projects"] or not (is_brief or is_asset)
+                is_storyboard = len(parts) == 3 and parts[:2] == ["comic", "storyboards"]
+                is_shot = len(parts) == 3 and parts[:2] == ["comic", "shots"]
+                if (not (is_brief or is_asset or is_storyboard or is_shot)
                         or not 0 < length <= 65536
                         or not request_path.startswith(("/api/comic/", "/comic/"))):
                     raise ToolError("请求格式不合法")
@@ -2582,8 +2887,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     raise ToolError("请求格式不合法")
                 if is_brief:
                     self.json_reply(200, app.update_comic_brief(parts[2], data))
-                else:
+                elif is_asset:
                     self.json_reply(200, app.edit_comic_asset(parts[2], parts[4], data))
+                elif is_storyboard:
+                    self.json_reply(200, app.edit_comic_storyboard(parts[2], data))
+                else:
+                    self.json_reply(200, app.edit_comic_shot(parts[2], data))
             except (ValueError, ValidationError, KantokuError) as error:
                 self.error_reply(400, error)
 

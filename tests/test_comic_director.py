@@ -156,4 +156,8 @@ def test_migrates_phase2_database_without_changing_legacy_rows(tmp_path: Path) -
         assert connection.execute("SELECT * FROM shot").fetchall() == [("旧作品", 1)]
         assert connection.execute(
             "SELECT version FROM comic_schema_migrations ORDER BY version"
-        ).fetchall() == [(1,), (2,), (3,)]
+        ).fetchall() == [(1,), (2,), (3,), (4,)]
+        assert connection.execute(
+            "SELECT name FROM sqlite_master WHERE name IN "
+            "('comic_storyboards','comic_shots') ORDER BY name"
+        ).fetchall() == [("comic_shots",), ("comic_storyboards",)]

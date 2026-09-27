@@ -44,28 +44,6 @@ class ComicAssetStore:
             connection, project_id, "comic_asset", asset_id, int(row["current_version"]),
         ))
 
-    def _write_project(
-        self, connection: sqlite3.Connection, project_id: str, current_version: int,
-    ) -> int:
-        snapshot = self.projects._snapshot(connection, project_id, current_version)
-        now = utc_now()
-        revised = snapshot.project.model_copy(update={
-            "current_version": current_version + 1, "updated_at": now,
-        })
-        result = connection.execute(
-            "UPDATE comic_projects SET current_version=?,updated_at=? "
-            "WHERE project_id=? AND current_version=?",
-            (revised.current_version, now.isoformat(), project_id, current_version),
-        )
-        if result.rowcount != 1:
-            raise ToolError("作品已由其他操作更新，请刷新后重试")
-        self.projects._insert_version(
-            connection, project_id=project_id, entity_type="project", entity_id=project_id,
-            version=revised.current_version, payload_json=revised.model_dump_json(),
-            created_at=now,
-        )
-        return revised.current_version
-
     @staticmethod
     def _draft(asset: ComicAsset) -> ComicAssetDraft:
         return ComicAssetDraft.model_validate(
@@ -85,7 +63,7 @@ class ComicAssetStore:
                 raise ToolError("找不到指定漫剧作品")
             if int(row["current_version"]) != expected_project_version:
                 raise ToolError("作品已由其他操作更新，请刷新后重试")
-            project_version = self._write_project(
+            project_version = self.projects._advance_project(
                 connection, project_id, expected_project_version,
             )
             now = utc_now()
@@ -208,7 +186,7 @@ class ComicAssetStore:
             else:
                 raise ToolError("资产操作不受支持")
             self._validate_references(next_draft)
-            project_version = self._write_project(
+            project_version = self.projects._advance_project(
                 connection, project_id, expected_project_version,
             )
             now = utc_now()

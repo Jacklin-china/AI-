@@ -2136,6 +2136,292 @@ def test_comic_director_interrupted_task_keeps_checkpoint_without_resubmit(
     assert len(calls) == 1
 
 
+def _comic_planning_project(app: web_studio.StudioApplication) -> tuple[str, dict[str, str]]:
+    created = app.create_comic_project({
+        "title": "东方仙侠少女雨夜战斗",
+        "brief": {
+            "original_request": "制作东方仙侠少女雨夜竹林战斗漫画",
+            "hard_constraints": ["东方仙侠", "少女", "雨夜", "战斗"],
+        },
+    })
+    project_id = created["project"]["project_id"]
+    app.create_comic_director(project_id, {
+        "expected_project_version": 1,
+        "draft": {
+            "visual_direction": "以雨夜竹林的空间与人物行动建立张力",
+            "storytelling_goal": "展示少女从警觉到迎战的转折",
+            "camera_language": "镜头距离随着行动节奏变化",
+            "composition": "利用竹林深度引导视线",
+            "lighting": "雨夜环境光与角色局部反光",
+            "color_language": "冷色环境与剑光形成层次",
+            "emotion": "警觉而坚定",
+            "character_focus": "少女的决心和动作",
+            "constraints": ["东方仙侠", "少女", "雨夜", "战斗"],
+            "creative_choices": ["环境先建立风险，再通过拔剑表现决断。"],
+        },
+    })
+    assets: dict[str, str] = {}
+    for kind, name, details in (
+        ("character", "阿青", {"kind": "character", "appearance": "黑发少女剑士"}),
+        ("scene", "竹林", {"kind": "scene", "location": "雨夜竹林"}),
+        ("style", "电影风格", {"kind": "style", "art_direction": "东方仙侠电影感"}),
+    ):
+        version = app.comic_projects.get(project_id).project.current_version
+        asset = app.create_comic_asset(project_id, {
+            "expected_project_version": version,
+            "asset": {"name": name, "details": details},
+        })
+        assets[kind] = asset["asset_id"]
+    return project_id, assets
+
+
+def test_comic_storyboard_ai_plan_versions_assets_and_recovery(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, assets = _comic_planning_project(app)
+    seen: list[list[dict[str, str]]] = []
+    refs = {
+        "character_asset_versions": [{"asset_id": assets["character"], "version": 1}],
+        "scene_asset_versions": [{"asset_id": assets["scene"], "version": 1}],
+        "style_version": {"asset_id": assets["style"], "version": 1},
+    }
+    plan = {
+        "title": "雨夜竹林交锋", "description": "由警觉过渡到拔剑",
+        "shots": [
+            {"purpose": "建立危险环境", "subject": "阿青站在竹林里",
+             "action": "听见竹叶异动", "environment": "雨夜竹林", "emotion": "警觉",
+             "shot_size": "远景", "camera_angle": "略低机位", "camera_movement": "缓推",
+             **refs},
+            {"purpose": "表现战斗爆发", "subject": "阿青拔剑",
+             "action": "拔剑迎敌", "environment": "雨夜竹林", "emotion": "坚定",
+             "shot_size": "近景", "camera_angle": "平视", "camera_movement": "跟随",
+             **refs},
+        ],
+    }
+
+    def model_call(messages: list[dict[str, str]]) -> str:
+        seen.append(messages)
+        return json.dumps(plan, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_storyboard_model", model_call)
+    version = app.comic_projects.get(project_id).project.current_version
+    result = app.create_comic_storyboard(project_id, {
+        "expected_project_version": version, "generate": True,
+        "task": "规划阿青在雨夜竹林交锋的节奏",
+        "asset_ids": list(assets.values()),
+    })
+    storyboard = result["storyboard"]
+    shots = result["shots"]
+    assert len(shots) == 2
+    assert storyboard["director_spec_version"] == 1
+    assert [shot["sequence_number"] for shot in shots] == [1, 2]
+    assert shots[0]["character_asset_versions"] == refs["character_asset_versions"]
+    assert shots[1]["purpose"] == "表现战斗爆发"
+    assert "director_spec" in seen[0][1]["content"]
+    assert len(app.comic_storyboards.list_shots(storyboard["storyboard_id"])) == 2
+    runs = app.list_comic_project_tasks(project_id)["tasks"]
+    assert any(item["workflow"] == "comic.storyboard.create" and
+               item["status"] == "completed" for item in runs)
+    assert app.list_core_runs() == []
+
+    asset_version = app.comic_projects.get(project_id).project.current_version
+    app.edit_comic_asset(project_id, assets["character"], {
+        "expected_project_version": asset_version, "expected_asset_version": 1,
+        "asset": {"name": "阿青", "details": {
+            "kind": "character", "appearance": "黑发少女剑士", "outfit": "新增披风",
+        }},
+    })
+    assert app.comic_storyboards.get_shot(shots[0]["shot_id"]).character_asset_versions[
+        0
+    ].version == 1
+
+    shot_id = shots[0]["shot_id"]
+    version = app.comic_projects.get(project_id).project.current_version
+    revised = app.edit_comic_shot(shot_id, {
+        "expected_project_version": version, "expected_version": 1,
+        "status": "planned",
+        "shot": {**{key: shots[0][key] for key in (
+            "purpose", "subject", "action", "environment", "emotion", "shot_size",
+            "camera_angle", "camera_movement", "character_asset_versions",
+            "scene_asset_versions", "style_version",
+        )}, "action": "转身拔剑"},
+    })
+    assert revised["version"] == 2
+    assert app.comic_storyboards.shot_versions(shot_id)[-1].action == "听见竹叶异动"
+    version = app.comic_projects.get(project_id).project.current_version
+    reordered = app.edit_comic_storyboard(storyboard["storyboard_id"], {
+        "expected_project_version": version, "expected_version": 1,
+        "draft": {"title": "雨夜竹林交锋", "description": "节奏调整"},
+        "status": "planning", "shot_ids": [shots[1]["shot_id"], shot_id],
+    })
+    assert reordered["shot_ids"] == [shots[1]["shot_id"], shot_id]
+    assert [shot.sequence_number for shot in app.comic_storyboards.list_shots(
+        storyboard["storyboard_id"]
+    )] == [1, 2]
+    version = app.comic_projects.get(project_id).project.current_version
+    restored = app.restore_comic_storyboard(storyboard["storyboard_id"], {
+        "expected_project_version": version, "expected_version": 2, "version": 1,
+    })
+    assert restored["version"] == 3
+    assert restored["shot_ids"] == storyboard["shot_ids"]
+
+    version = app.comic_projects.get(project_id).project.current_version
+    current_shot = app.comic_storyboards.get_shot(shot_id)
+    deleted = app.change_comic_shot(shot_id, "delete", {
+        "expected_project_version": version, "expected_version": current_shot.version,
+    })
+    assert deleted["status"] == "deleted"
+    assert len(app.comic_storyboards.list_shots(storyboard["storyboard_id"])) == 1
+    version = app.comic_projects.get(project_id).project.current_version
+    revived = app.change_comic_shot(shot_id, "restore", {
+        "expected_project_version": version, "expected_version": deleted["version"],
+        "version": 2,
+    })
+    assert revived["shot_id"] == shot_id
+    assert revived["source"] == "restored"
+    assert len(app.comic_storyboards.list_shots(storyboard["storyboard_id"])) == 2
+    restarted = web_studio.StudioApplication()
+    assert len(restarted.comic_storyboards.list_shots(storyboard["storyboard_id"])) == 2
+    assert any(item["workflow"] == "comic.storyboard.create"
+               for item in restarted.list_comic_project_tasks(project_id)["tasks"])
+
+
+def test_comic_storyboard_http_routes_and_asset_validation(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    project_id, assets = _comic_planning_project(app)
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(method: str, path: str, body: dict[str, object] | None = None):
+        connection.request(method, path, body=json.dumps(body) if body else None, headers=headers)
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    try:
+        version = app.comic_projects.get(project_id).project.current_version
+        status, created = request("POST", f"/api/comic/projects/{project_id}/storyboards", {
+            "expected_project_version": version,
+            "draft": {"title": "雨夜竹林", "description": "两镜头规划"},
+        })
+        assert status == 201
+        storyboard_id = created["storyboard"]["storyboard_id"]
+        assert created["shots"] == []
+        status, listed = request("GET", f"/api/comic/projects/{project_id}/storyboards")
+        assert status == 200
+        assert listed["storyboards"][0]["storyboard_id"] == storyboard_id
+        version = app.comic_projects.get(project_id).project.current_version
+        status, shot = request("POST", f"/api/comic/storyboards/{storyboard_id}/shots", {
+            "expected_project_version": version, "expected_storyboard_version": 1,
+            "shot": {"purpose": "建立场景", "subject": "阿青与竹林",
+                     "character_asset_versions": [
+                         {"asset_id": assets["character"], "version": 1}],
+                     "scene_asset_versions": [
+                         {"asset_id": assets["scene"], "version": 1}],
+                     "style_version": {"asset_id": assets["style"], "version": 1}},
+        })
+        assert status == 201
+        assert shot["sequence_number"] == 1
+        status, shots = request("GET", f"/api/comic/storyboards/{storyboard_id}/shots")
+        assert status == 200
+        assert shots["shots"][0]["shot_id"] == shot["shot_id"]
+        status, loaded = request("GET", f"/api/comic/storyboards/{storyboard_id}")
+        assert status == 200 and loaded["storyboard"]["version"] == 2
+        status, edited_shot = request("PUT", f"/api/comic/shots/{shot['shot_id']}", {
+            "expected_project_version": version + 1, "expected_version": 1,
+            "status": "planned", "shot": {
+                "purpose": "建立场景", "subject": "阿青拔剑",
+                "character_asset_versions": [
+                    {"asset_id": assets["character"], "version": 1}],
+                "scene_asset_versions": [{"asset_id": assets["scene"], "version": 1}],
+                "style_version": {"asset_id": assets["style"], "version": 1},
+            },
+        })
+        assert status == 200 and edited_shot["version"] == 2
+        status, edited_board = request("PUT", f"/api/comic/storyboards/{storyboard_id}", {
+            "expected_project_version": version + 2, "expected_version": 2,
+            "draft": {"title": "雨夜竹林新版", "description": "调整叙事"},
+            "status": "planning",
+        })
+        assert status == 200 and edited_board["version"] == 3
+        status, restored = request(
+            "POST", f"/api/comic/storyboards/{storyboard_id}/restore",
+            {"expected_project_version": version + 3, "expected_version": 3,
+             "version": 2},
+        )
+        assert status == 201 and restored["title"] == "雨夜竹林"
+        status, board_versions = request(
+            "GET", f"/api/comic/storyboards/{storyboard_id}/versions",
+        )
+        assert status == 200 and len(board_versions["versions"]) == 4
+        status, versions = request("GET", f"/api/comic/shots/{shot['shot_id']}/versions")
+        assert status == 200 and len(versions["versions"]) == 2
+        status, invalid = request("POST", f"/api/comic/storyboards/{storyboard_id}/shots", {
+            "expected_project_version": version + 4, "expected_storyboard_version": 4,
+            "shot": {"purpose": "非法引用", "subject": "不存在角色",
+                     "character_asset_versions": [{"asset_id": "missing", "version": 1}]},
+        })
+        assert status == 400
+        assert invalid["error_id"].startswith("ERR-")
+        assert len(app.comic_storyboards.list_shots(storyboard_id)) == 1
+        assert any(
+            item["state"].get("error_id") == invalid["error_id"]
+            for item in app.list_comic_project_tasks(project_id)["tasks"]
+        )
+    finally:
+        connection.close()
+
+
+def test_comic_storyboard_rejects_invented_assets_and_stale_versions(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, assets = _comic_planning_project(app)
+    original_version = app.comic_projects.get(project_id).project.current_version
+    monkeypatch.setattr(app, "_comic_storyboard_model", lambda _messages: json.dumps({
+        "title": "无效规划", "shots": [{
+            "purpose": "建立场景", "subject": "阿青",
+            "character_asset_versions": [{"asset_id": assets["character"], "version": 1}],
+            "scene_asset_versions": [{"asset_id": assets["scene"], "version": 1}],
+            "style_version": {"asset_id": "invented-style", "version": 1},
+        }],
+    }, ensure_ascii=False))
+    with pytest.raises(ToolError, match="上下文之外"):
+        app.create_comic_storyboard(project_id, {
+            "expected_project_version": original_version, "generate": True,
+            "asset_ids": list(assets.values()),
+        })
+    assert app.comic_projects.get(project_id).project.current_version == original_version
+    assert app.comic_storyboards.list(project_id) == []
+    failed = app.list_comic_project_tasks(project_id)["tasks"][0]
+    assert failed["status"] == "failed"
+    assert failed["state"]["error_id"].startswith("ERR-")
+
+    created = app.create_comic_storyboard(project_id, {
+        "expected_project_version": original_version,
+        "draft": {"title": "手动规划"},
+    })["storyboard"]
+    storyboard_id = created["storyboard_id"]
+    with pytest.raises(ToolError, match="刷新"):
+        app.create_comic_shot(storyboard_id, {
+            "expected_project_version": original_version,
+            "expected_storyboard_version": 1,
+            "shot": {"purpose": "过期镜头", "subject": "阿青"},
+        })
+    assert app.comic_storyboards.list_shots(storyboard_id) == []
+
+    current = app.comic_projects.get(project_id)
+    app.update_comic_brief(project_id, {
+        "expected_version": current.project.current_version,
+        "original_request": "改成雪夜战斗", "hard_constraints": ["雪夜"],
+    })
+    with pytest.raises(ToolError, match="导演方案"):
+        app.create_comic_shot(storyboard_id, {
+            "expected_project_version": current.project.current_version + 1,
+            "expected_storyboard_version": 1,
+            "shot": {"purpose": "旧方案镜头", "subject": "阿青"},
+        })
+
+
 def test_comic_asset_api_versions_and_bounded_context(
     server: int, app: web_studio.StudioApplication,
 ) -> None:

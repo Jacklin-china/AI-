@@ -119,6 +119,16 @@ Kantoku 的资产契约：`ComicAsset` 有稳定 `asset_id`、`project_id`、`ki
 
 Context Builder 现在可组合当前/指定作品版本的 Brief、与该 Brief 对齐的 DirectorSpec，以及有限的相关资产。显式 `asset_id` 优先；随后只用任务中的**名称/别名精确包含**选择角色和场景；若仅有一个有效 StyleBible 则自动带入。最多选择 8 个，返回每个资产的真实修订号和参考 Artifact ID；不发送全资产库，也不声称已有语义搜索。HTTP 入口为 `/api/comic/projects/{id}/assets`（POST 创建、GET 列表）、`/{asset_id}`（GET、PUT 编辑）、`/{asset_id}/versions`（GET）、`/{asset_id}/lock|restore|delete`（POST）；原 `/context` 可用 `task` 或重复的 `asset_id` 参数选择。尚未建设上传素材、资产自动提取、分镜关联、Prompt Compiler、生图、QC 或视频。
 
+### Phase 5：作品级 Storyboard 与 Shot
+
+迁移 v4 仅增 `comic_storyboards`、`comic_shots` 当前指针表；不可变内容继续写入已有 `comic_entity_versions`，作品版本在同一 SQLite 事务中递增。旧 `tools/storyboard.py` 的固定 20 镜/按剧集覆盖工具与历史 `shot` 表保持兼容，不导入、覆盖或删除旧数据；它的结构与新的可变镜数、资产版本引用不同，不能直接当新作品存储。
+
+`ComicStoryboard` 固定 `project_id` 与创建时的 `director_spec_version`，保存标题、描述、状态及有序 Shot ID；镜头数不固定，单次规划上限 100 仅用于防止异常输出。`ComicShot` 有稳定 `shot_id`、序号、目的、主体、行动、环境、情绪与摄影建议，只引用明确的 Character/Scene/Style 资产 ID **及版本**，不复制完整外观或场景描述。编辑、重排、删除和恢复追加新修订；删除是墓碑，恢复生成新版本。历史 Storyboard 恢复若镜头集合已变，必须先恢复相应 Shot，不能悄悄丢弃镜头。Brief/Director 变更后旧 Storyboard 保留可读，但不能继续编辑为当前制作方案。Phase 5 手动 Shot 仅允许 `draft/planned`；`generating/checking/approved/failed/repairing` 预留给后续真实生产步骤，不允许通过编辑接口冒充执行。
+
+创建分镜可提交手动草案，或明确设置 `generate=true`。AI 规划只接收当前 Project、CreativeBrief、DirectorSpec、最多 8 个相关资产与当前任务，调用现有共享文本模型；模型自行决定镜头数量和节奏。模型输出的资产引用必须出现在传入上下文，存储前还要核验项目、类型、状态与固定修订号。生成或写操作沿用 Core Run/Event 与现有 `trace_id/error_id` 日志，记录作品、分镜、镜头和版本；这些规划 Run 不进入生产任务中心。模型调用的供应商、请求 ID、token、耗时与重试由共享 LLM 日志记录。本阶段不调用图片/视频 Provider，也不创建 Prompt Artifact、预算预占或 QC 结果。
+
+HTTP：`POST/GET /api/comic/projects/{id}/storyboards`；`GET/PUT /api/comic/storyboards/{id}`；`GET /api/comic/storyboards/{id}/versions`；`POST /api/comic/storyboards/{id}/restore`；`POST/GET /api/comic/storyboards/{id}/shots`；`GET/PUT /api/comic/shots/{id}`；`GET /api/comic/shots/{id}/versions`；`POST /api/comic/shots/{id}/delete|restore`。所有写操作需要预期作品版本及相应对象版本，避免并发静默覆盖。Phase 6 应从当前 Storyboard/Shot 修订和固定资产版本编译 Prompt，再复用现有 Image Capability、预算、Artifact 与恢复链路；不能让用户编辑 Shot 等同于已生成图片。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

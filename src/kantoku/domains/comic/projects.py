@@ -29,7 +29,7 @@ from .models import (
     ProjectStatus,
 )
 
-_SCHEMA_VERSION = 3
+_SCHEMA_VERSION = 4
 
 
 class ComicProjectStore:
@@ -105,7 +105,7 @@ class ComicProjectStore:
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
                     (2, utc_now().isoformat()),
                 )
-            if _SCHEMA_VERSION not in applied:
+            if 3 not in applied:
                 connection.execute(
                     "CREATE TABLE comic_assets ("
                     "asset_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
@@ -118,6 +118,33 @@ class ComicProjectStore:
                 connection.execute(
                     "CREATE INDEX idx_comic_assets_project ON comic_assets "
                     "(project_id,kind,state)"
+                )
+                connection.execute(
+                    "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
+                    (3, utc_now().isoformat()),
+                )
+            if _SCHEMA_VERSION not in applied:
+                connection.execute(
+                    "CREATE TABLE comic_storyboards ("
+                    "storyboard_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                    "current_version INTEGER NOT NULL CHECK(current_version > 0), "
+                    "status TEXT NOT NULL, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                    "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id))"
+                )
+                connection.execute(
+                    "CREATE INDEX idx_comic_storyboards_project ON comic_storyboards(project_id)"
+                )
+                connection.execute(
+                    "CREATE TABLE comic_shots ("
+                    "shot_id TEXT PRIMARY KEY, storyboard_id TEXT NOT NULL, "
+                    "project_id TEXT NOT NULL, current_version INTEGER NOT NULL "
+                    "CHECK(current_version > 0), status TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                    "FOREIGN KEY(storyboard_id) REFERENCES comic_storyboards(storyboard_id), "
+                    "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id))"
+                )
+                connection.execute(
+                    "CREATE INDEX idx_comic_shots_storyboard ON comic_shots(storyboard_id)"
                 )
                 connection.execute(
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
@@ -149,6 +176,29 @@ class ComicProjectStore:
         if row is None:
             raise ToolError("找不到指定作品版本")
         return str(row["payload_json"])
+
+    def _advance_project(
+        self, connection: sqlite3.Connection, project_id: str, current_version: int,
+    ) -> int:
+        """在调用方事务中追加通用作品修订，供资产与镜头共用。"""
+        snapshot = self._snapshot(connection, project_id, current_version)
+        now = utc_now()
+        revised = snapshot.project.model_copy(update={
+            "current_version": current_version + 1, "updated_at": now,
+        })
+        result = connection.execute(
+            "UPDATE comic_projects SET current_version=?,updated_at=? "
+            "WHERE project_id=? AND current_version=?",
+            (revised.current_version, now.isoformat(), project_id, current_version),
+        )
+        if result.rowcount != 1:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        self._insert_version(
+            connection, project_id=project_id, entity_type="project", entity_id=project_id,
+            version=revised.current_version, payload_json=revised.model_dump_json(),
+            created_at=now,
+        )
+        return revised.current_version
 
     def _snapshot(
         self, connection: sqlite3.Connection, project_id: str, version: int,

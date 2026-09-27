@@ -280,3 +280,138 @@ class ComicAssetDeleteRequest(BaseModel):
 
     expected_project_version: int = Field(ge=1)
     expected_asset_version: int = Field(ge=1)
+
+
+class StoryboardStatus(StrEnum):
+    DRAFT = "draft"
+    PLANNING = "planning"
+    APPROVED = "approved"
+    ARCHIVED = "archived"
+
+
+class ShotStatus(StrEnum):
+    DRAFT = "draft"
+    PLANNED = "planned"
+    GENERATING = "generating"
+    CHECKING = "checking"
+    APPROVED = "approved"
+    FAILED = "failed"
+    REPAIRING = "repairing"
+    DELETED = "deleted"
+
+
+class ComicShotAssetRef(ComicAssetRef):
+    """Shot 永远固定到具体资产版本，不追随最新版本漂移。"""
+
+    version: int = Field(ge=1)
+
+
+class ComicShotDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    purpose: BriefText
+    subject: BriefText
+    action: str = Field(default="", max_length=2000)
+    environment: str = Field(default="", max_length=2000)
+    emotion: str = Field(default="", max_length=1000)
+    shot_size: str = Field(default="", max_length=300)
+    camera_angle: str = Field(default="", max_length=300)
+    camera_movement: str = Field(default="", max_length=300)
+    character_asset_versions: list[ComicShotAssetRef] = Field(default_factory=list, max_length=8)
+    scene_asset_versions: list[ComicShotAssetRef] = Field(default_factory=list, max_length=8)
+    style_version: ComicShotAssetRef | None = None
+
+
+class ComicShot(ComicShotDraft):
+    shot_id: str
+    storyboard_id: str
+    project_id: str
+    sequence_number: int = Field(ge=1)
+    version: int = Field(ge=1)
+    project_version: int = Field(ge=1)
+    status: ShotStatus
+    created_at: datetime
+    source: Literal["created", "edited", "restored", "reordered", "deleted", "model"]
+    restored_from_version: int | None = Field(default=None, ge=1)
+
+
+class ComicStoryboardDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    title: ProjectText
+    description: str = Field(default="", max_length=2000)
+
+
+class ComicStoryboard(ComicStoryboardDraft):
+    storyboard_id: str
+    project_id: str
+    director_spec_version: int = Field(ge=1)
+    version: int = Field(ge=1)
+    project_version: int = Field(ge=1)
+    status: StoryboardStatus
+    shot_ids: list[str]
+    created_at: datetime
+    source: Literal["created", "edited", "restored", "reordered", "model"]
+    restored_from_version: int | None = Field(default=None, ge=1)
+
+
+class ComicStoryboardPlan(ComicStoryboardDraft):
+    shots: list[ComicShotDraft] = Field(min_length=1, max_length=100)
+
+
+class ComicStoryboardCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    draft: ComicStoryboardDraft | None = None
+    generate: bool = False
+    task: str | None = Field(default=None, max_length=1000)
+    asset_ids: list[str] = Field(default_factory=list, max_length=8)
+
+    @model_validator(mode="after")
+    def check_mode(self) -> ComicStoryboardCreateRequest:
+        if self.generate == (self.draft is not None):
+            raise ValueError("只能选择 AI 规划或提供手动分镜草案")
+        return self
+
+
+class ComicStoryboardEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    draft: ComicStoryboardDraft
+    status: Literal["draft", "planning", "approved", "archived"]
+    shot_ids: list[str] | None = None
+
+
+class ComicShotCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_storyboard_version: int = Field(ge=1)
+    shot: ComicShotDraft
+
+
+class ComicShotEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    shot: ComicShotDraft
+    status: Literal["draft", "planned"]
+
+
+class ComicVersionRestoreRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    version: int = Field(ge=1)
+
+
+class ComicShotDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
