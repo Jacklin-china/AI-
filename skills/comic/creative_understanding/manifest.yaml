@@ -1,0 +1,35 @@
+id: comic.creative_understanding
+name: Comic Creative Understanding
+domain: comic
+description: 将创作简报和有界上下文整理为公开的 CreativeDecision。
+version: 1.0.0
+required_tools: []
+input_schema:
+  type: object
+  required: [creative_brief, project_context, relevant_assets, current_task]
+  properties:
+    creative_brief: {type: object}
+    project_context: {type: object}
+    relevant_assets: {type: array}
+    current_task: {type: [string, 'null']}
+output_schema:
+  type: object
+  required: [creative_decision]
+  properties:
+    creative_decision:
+      type: object
+      required: [intent_summary, narrative_context, emotional_target, audience_experience, narrative_focus]
+execution_policy:
+  allowed_execution_modes: [fast, professional]
+  side_effects: []
+  provider_binding: false
+  coordinator_owned: true
+  contract_only: true
+knowledge_refs: [director.intent-first, director.constraint-priority]
+test_cases:
+  - id: accepts_bounded_context
+    description: 只接受 Brief、项目上下文、相关资产和当前任务。
+  - id: rejects_prompt_output
+    description: 输出不得包含 Prompt 或 Provider 参数。
+handler_file: ../director/handler.py
+handler: execute_creative_understanding

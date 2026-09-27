@@ -46,6 +46,7 @@ from kantoku.capabilities.web_search import plan_web_search, search_web, visit_s
 from kantoku.config import KantokuError, ToolError, get_settings
 from kantoku.config.logging_setup import redact_secrets
 from kantoku.config.observability import (
+    current_run_id,
     current_trace_id,
     public_error,
     request_trace,
@@ -97,6 +98,9 @@ from kantoku.domains.comic.models import (
     ComicAssetRef,
     ComicAssetVersionRequest,
     ComicProjectInput,
+    ComicPromptCompileRequest,
+    ComicPromptDraft,
+    ComicPromptEditRequest,
     ComicShotCreateRequest,
     ComicShotDeleteRequest,
     ComicShotEditRequest,
@@ -112,6 +116,7 @@ from kantoku.domains.comic.models import (
     StoryboardStatus,
 )
 from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
+from kantoku.domains.comic.prompts import ComicPromptStore, compiler_for_model
 from kantoku.domains.comic.services import StudioComicServices
 from kantoku.domains.comic.storyboards import ComicStoryboardStore, plan_storyboard
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
@@ -387,6 +392,10 @@ class StudioApplication:
         self.comic_projects = ComicProjectStore(self.runtime_store.path)
         self.comic_assets = ComicAssetStore(self.comic_projects, self.runtime_store)
         self.comic_storyboards = ComicStoryboardStore(self.comic_projects, self.comic_assets)
+        self.comic_prompts = ComicPromptStore(
+            self.comic_projects, self.comic_storyboards, self.comic_assets,
+            self.runtime_store,
+        )
         self.runtime = GraphRuntime(self.runtime_store)
         self.skills = SkillRegistry()
         SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
@@ -1640,7 +1649,7 @@ class StudioApplication:
             for record in records
             if record.id not in self._legacy_home_run_ids
             and not record.workflow.startswith((
-                "comic.director-spec", "comic.storyboard.", "comic.shot.",
+                "comic.director-spec", "comic.storyboard.", "comic.shot.", "comic.prompt.",
             ))
         ]
 
@@ -1921,7 +1930,7 @@ class StudioApplication:
         tasks = []
         for run in runs:
             if (not run.workflow.startswith((
-                    "comic.director-spec", "comic.storyboard.", "comic.shot.",
+                    "comic.director-spec", "comic.storyboard.", "comic.shot.", "comic.prompt.",
                 )) or run.state.get("project_id") != project_id):
                 continue
             payload = self._run_payload(run.id)
@@ -1973,7 +1982,8 @@ class StudioApplication:
             )
 
         with request_trace(trace_id), run_trace(run.id, task_type), logger.contextualize(
-            component="comic.storyboard", project_id=project_id, task_id=task_id,
+            component=f"comic.{task_type.split('.')[0]}",
+            project_id=project_id, task_id=task_id,
             storyboard_id=storyboard_id or "-", shot_id=shot_id or "-",
         ):
             logger.info(
@@ -1989,6 +1999,12 @@ class StudioApplication:
                 saved_storyboard_id = entity.get("storyboard_id", storyboard_id)
                 saved_shot_id = entity.get("shot_id", shot_id)
                 saved_version = entity.get("version")
+                if artifact_id := entity.get("artifact_id"):
+                    self.runtime_store.append_event(
+                        run.id, RuntimeEventType.ARTIFACT_CREATED, node_id=task_type,
+                        payload={"artifact_id": artifact_id, "type": "prompt",
+                                 "version": saved_version},
+                    )
                 state.update(
                     task_status="completed", last_completed_step="version_saved",
                     storyboard_id=saved_storyboard_id, shot_id=saved_shot_id,
@@ -2010,7 +2026,8 @@ class StudioApplication:
                 return result
             except Exception as error:
                 failure = public_error(
-                    error, component="comic.storyboard", project_id=project_id,
+                    error, component=f"comic.{task_type.split('.')[0]}",
+                    project_id=project_id,
                     run_id=run.id, task_id=task_id,
                     storyboard_id=storyboard_id or "-", shot_id=shot_id or "-",
                 )
@@ -2167,6 +2184,108 @@ class StudioApplication:
             shot.project_id, f"shot.{action}",
             lambda _progress: operation().model_dump(mode="json"),
             storyboard_id=shot.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
+
+    def compile_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicPromptCompileRequest.model_validate(data)
+        shot = self.comic_storyboards.get_shot(shot_id)
+
+        def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            snapshot, director, storyboard, current_shot, assets = self.comic_prompts.source(
+                shot_id,
+            )
+            if snapshot.project.current_version != request.expected_project_version:
+                raise ToolError("作品已由其他操作更新，请刷新后重试")
+            if current_shot.version != request.expected_shot_version:
+                raise ToolError("镜头版本已变化，请重新编译 Prompt")
+            model_target = get_settings().image.model
+            compiler = compiler_for_model(model_target)
+            progress("generating", "context_selected")
+            draft = compiler.compile(
+                snapshot=snapshot, director=director, storyboard=storyboard,
+                shot=current_shot, assets=assets, model_target=model_target,
+                model_call=self._comic_storyboard_model,
+            )
+            progress("checking", "prompt_compiled")
+            run_id = current_run_id()
+            if run_id is None:
+                raise ToolError("Prompt 编译缺少 Run 追踪")
+            prompt = self.comic_prompts.save(
+                shot_id, draft, expected_project_version=request.expected_project_version,
+                expected_shot_version=request.expected_shot_version,
+                model_target=model_target, compiler_version=compiler.version, run_id=run_id,
+            )
+            return prompt.model_dump(mode="json")
+
+        return self._comic_tracked_action(
+            shot.project_id, "prompt.compile", execute,
+            storyboard_id=shot.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_shot_version,
+        )
+
+    def edit_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicPromptEditRequest.model_validate(data)
+        current = self.comic_prompts.get(shot_id)
+
+        def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            if current.shot_version != self.comic_storyboards.get_shot(shot_id).version:
+                raise ToolError("镜头已变化，请先重新编译 Prompt")
+            run_id = current_run_id()
+            if run_id is None:
+                raise ToolError("Prompt 编辑缺少 Run 追踪")
+            prompt = self.comic_prompts.save(
+                shot_id, request.draft,
+                expected_project_version=request.expected_project_version,
+                expected_shot_version=self.comic_storyboards.get_shot(shot_id).version,
+                expected_version=request.expected_version,
+                model_target=current.model_target,
+                compiler_version=current.compiler_version, run_id=run_id, source="edited",
+            )
+            return prompt.model_dump(mode="json")
+
+        return self._comic_tracked_action(
+            current.project_id, "prompt.edit", execute,
+            storyboard_id=current.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version,
+        )
+
+    def restore_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicVersionRestoreRequest.model_validate(data)
+        current = self.comic_prompts.get(shot_id)
+        old = self.comic_prompts.get(shot_id, version=request.version)
+
+        def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            if current.version != request.expected_version:
+                raise ToolError("Prompt 已由其他操作更新，请刷新后重试")
+            shot = self.comic_storyboards.get_shot(shot_id)
+            if (old.shot_version != shot.version
+                    or old.creative_brief_version != current.creative_brief_version
+                    or old.director_spec_version != current.director_spec_version
+                    or old.character_asset_versions != current.character_asset_versions
+                    or old.scene_asset_versions != current.scene_asset_versions
+                    or old.style_version != current.style_version):
+                raise ToolError("历史 Prompt 来源版本已变化，请重新编译")
+            run_id = current_run_id()
+            if run_id is None:
+                raise ToolError("Prompt 恢复缺少 Run 追踪")
+            prompt = self.comic_prompts.save(
+                shot_id, ComicPromptDraft.model_validate(old.model_dump(include={
+                    "director_summary", "positive_prompt", "negative_prompt",
+                })),
+                expected_project_version=request.expected_project_version,
+                expected_shot_version=shot.version, expected_version=request.expected_version,
+                model_target=old.model_target, compiler_version=old.compiler_version,
+                run_id=run_id, source="restored", restored_from_version=request.version,
+            )
+            return prompt.model_dump(mode="json")
+
+        return self._comic_tracked_action(
+            current.project_id, "prompt.restore", execute,
+            storyboard_id=current.storyboard_id, shot_id=shot_id,
             expected_project_version=request.expected_project_version,
             expected_version=request.expected_version,
         )
@@ -2652,6 +2771,10 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif request_path.startswith("/api/comic/shots/"):
                     comic_parts = request_path.strip("/").split("/")
                     shot_id = comic_parts[3]
+                    raw_version = parse_qs(parsed.query).get("version", [None])[0]
+                    version = None if raw_version is None else int(raw_version)
+                    if version is not None and version < 1:
+                        raise ToolError("Prompt 版本必须大于零")
                     if len(comic_parts) == 4:
                         self.json_reply(200, app.comic_storyboards.get_shot(
                             shot_id,
@@ -2660,6 +2783,15 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(200, {"versions": [
                             item.model_dump(mode="json")
                             for item in app.comic_storyboards.shot_versions(shot_id)
+                        ]})
+                    elif len(comic_parts) == 5 and comic_parts[4] == "prompt":
+                        self.json_reply(200, app.comic_prompts.get(
+                            shot_id, version=version,
+                        ).model_dump(mode="json"))
+                    elif len(comic_parts) == 6 and comic_parts[4:] == ["prompt", "versions"]:
+                        self.json_reply(200, {"versions": [
+                            item.model_dump(mode="json")
+                            for item in app.comic_prompts.versions(shot_id)
                         ]})
                     else:
                         self.json_reply(404, {"error": "Shot API 路径不存在"})
@@ -2804,6 +2936,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif len(parts) == 5 and parts[:3] == ["api", "comic", "shots"] \
                         and parts[4] in {"restore", "delete"}:
                     self.json_reply(201, app.change_comic_shot(parts[3], parts[4], data))
+                elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4:] == ["prompt", "compile"]:
+                    self.json_reply(201, app.compile_comic_prompt(parts[3], data))
+                elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4:] == ["prompt", "restore"]:
+                    self.json_reply(201, app.restore_comic_prompt(parts[3], data))
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
                         and comic_parts[3:] == ["director-spec", "restore"]:
                     self.json_reply(201, app.restore_comic_director(comic_parts[2], data))
@@ -2878,7 +3016,9 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 is_asset = len(parts) == 5 and parts[3] == "assets"
                 is_storyboard = len(parts) == 3 and parts[:2] == ["comic", "storyboards"]
                 is_shot = len(parts) == 3 and parts[:2] == ["comic", "shots"]
-                if (not (is_brief or is_asset or is_storyboard or is_shot)
+                is_prompt = len(parts) == 4 and parts[:2] == ["comic", "shots"] \
+                    and parts[3] == "prompt"
+                if (not (is_brief or is_asset or is_storyboard or is_shot or is_prompt)
                         or not 0 < length <= 65536
                         or not request_path.startswith(("/api/comic/", "/comic/"))):
                     raise ToolError("请求格式不合法")
@@ -2891,6 +3031,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     self.json_reply(200, app.edit_comic_asset(parts[2], parts[4], data))
                 elif is_storyboard:
                     self.json_reply(200, app.edit_comic_storyboard(parts[2], data))
+                elif is_prompt:
+                    self.json_reply(200, app.edit_comic_prompt(parts[2], data))
                 else:
                     self.json_reply(200, app.edit_comic_shot(parts[2], data))
             except (ValueError, ValidationError, KantokuError) as error:

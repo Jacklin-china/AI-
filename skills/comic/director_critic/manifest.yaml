@@ -1,0 +1,32 @@
+id: comic.director_critic
+name: Comic Director Critic
+domain: comic
+description: 审核 DirectorSpec v2 的意图、约束、资产和视觉因果。
+version: 1.0.0
+required_tools: []
+input_schema:
+  type: object
+  required: [director_spec]
+  properties:
+    director_spec: {type: object}
+output_schema:
+  type: object
+  required: [critic_result]
+  properties:
+    critic_result:
+      type: object
+      required: [verdict, public_summary, findings, suggested_patches, confidence]
+execution_policy:
+  allowed_execution_modes: [fast, professional]
+  side_effects: []
+  provider_binding: false
+  coordinator_owned: true
+  contract_only: true
+knowledge_refs: [director.constraint-priority, director.anti-template]
+test_cases:
+  - id: checks_hard_constraints
+    description: 检查用户硬约束是否被保留。
+  - id: reports_public_findings
+    description: 只输出公开审核结论，不保存隐藏思维链。
+handler_file: ../director/handler.py
+handler: execute_director_critic

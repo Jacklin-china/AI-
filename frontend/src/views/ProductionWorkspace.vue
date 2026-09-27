@@ -24,6 +24,7 @@ const previewUrl = ref('')
 const previewLoading = ref(false)
 const assetsOpen = ref(false)
 const inspectorOpen = ref(false)
+const previewOpen = ref(true)
 const compactView = ref<'chat' | 'preview'>('chat')
 let unsubscribe: (() => void) | null = null
 
@@ -149,11 +150,23 @@ function follow(): void {
   })
 }
 
+function setCompactView(view: 'chat' | 'preview'): void {
+  compactView.value = view
+  if (view === 'preview') previewOpen.value = true
+}
+
+function togglePreview(): void {
+  previewOpen.value = !previewOpen.value
+  if (!previewOpen.value) compactView.value = 'chat'
+}
+
 watch(() => props.runId, async () => {
   unsubscribe?.()
   selectedArtifactId.value = ''
   assetsOpen.value = false
   inspectorOpen.value = false
+  previewOpen.value = !!props.runId
+  compactView.value = 'chat'
   if (props.runId) {
     await refresh()
     follow()
@@ -176,7 +189,7 @@ onBeforeUnmount(() => {
         <strong>漫剧创作</strong>
         <small v-if="run">{{ String(run.state.project ?? '当前制作') }}</small>
       </div>
-      <nav v-if="run" class="comic-phase-strip" aria-label="制作进度">
+      <nav v-if="phases.length" class="comic-phase-strip" aria-label="制作进度">
         <span v-for="phase in phases" :key="phase.id" :data-status="phase.status">
           <Check v-if="phase.status === 'completed'" :size="12" />
           <i v-else aria-hidden="true" />
@@ -185,9 +198,10 @@ onBeforeUnmount(() => {
       </nav>
       <div class="comic-studio-actions">
         <div v-if="run" class="comic-compact-switch" aria-label="工作区视图">
-          <button type="button" :aria-pressed="compactView === 'chat'" @click="compactView = 'chat'"><MessageSquareText :size="14" /> 对话</button>
-          <button type="button" :aria-pressed="compactView === 'preview'" @click="compactView = 'preview'"><Film :size="14" /> 预览</button>
+          <button type="button" :aria-pressed="compactView === 'chat'" @click="setCompactView('chat')"><MessageSquareText :size="14" /> 对话</button>
+          <button type="button" :aria-pressed="compactView === 'preview'" @click="setCompactView('preview')"><Film :size="14" /> 预览</button>
         </div>
+        <button v-if="run" type="button" class="comic-header-button" :aria-expanded="previewOpen" aria-label="结果画布" @click="togglePreview"><Film :size="16" /><span>{{ previewOpen ? '收起画布' : '打开画布' }}</span></button>
         <button v-if="run" type="button" class="comic-header-button" :aria-expanded="inspectorOpen" aria-label="制作详情" @click="inspectorOpen = !inspectorOpen; assetsOpen = false"><PanelRight :size="16" /><span>详情</span></button>
       </div>
     </header>
@@ -197,12 +211,12 @@ onBeforeUnmount(() => {
       </nav>
       <main class="comic-main">
         <Splitpanes class="comic-main-splitpanes" :class="{ 'has-run': !!run }">
-          <Pane :size="run ? 58 : 100" :min-size="run ? 36 : 100">
+          <Pane :size="run && previewOpen ? 72 : 100" :min-size="run && previewOpen ? 58 : 100">
             <div class="comic-director-chat">
               <HomeView :key="domain" :domain="domain" :embedded="true" :studio-focus="true" :initial-run-id="runId" :runs="run ? [run] : []" :approvals="[]" @refresh="refresh" @run-created="(created) => navigate({ name: 'workspace_run', domain, runId: created.id })" @chatting="(active) => (chatActive = active)" />
             </div>
           </Pane>
-          <Pane v-if="run" :size="42" :min-size="26">
+          <Pane v-if="run && previewOpen" :size="28" :min-size="22">
             <section class="comic-preview" aria-label="制作结果预览">
               <header class="comic-preview-header"><strong>结果预览</strong><small>{{ currentStage }}</small></header>
               <div class="comic-preview-stage">

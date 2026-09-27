@@ -23,13 +23,13 @@ from kantoku.core.skills import SkillLoader, SkillRegistry
 def test_skill_loader_discovers_file_skills() -> None:
     registry = SkillRegistry()
     metadata = SkillLoader(ROOT / "skills", project_root=ROOT).load(registry)
-    assert {item.id for item in metadata} == {
+    assert {
         "comic.archive_image",
         "comic.compose_prompt",
         "commerce.calculate_pricing",
         "commerce.localize_listing",
         "commerce.product_image",
-    }
+    } <= {item.id for item in metadata}
     assert all(item.handler_ref and not Path(item.handler_ref.split(":")[0]).is_absolute()
                for item in metadata)
     prompt = registry.execute("comic.compose_prompt", {

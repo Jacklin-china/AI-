@@ -999,15 +999,7 @@ class RuntimeStore:
     def save_artifact(self, record: ArtifactRecord) -> ArtifactRecord:
         """保存 Artifact；ID 重复会明确失败。"""
         with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO artifacts "
-                "(id,type,run_id,conversation_id,node_id,source,status,created_at,"
-                "metadata_json,location,version) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
-                (record.id, record.type, record.run_id, record.conversation_id,
-                 record.node_id, record.source,
-                 record.status, record.created_at.isoformat(), _dump(record.metadata),
-                 record.location, record.version),
-            )
+            self.insert_artifact(connection, record)
         if record.run_id is not None:
             self.append_event(
                 record.run_id, RuntimeEventType.ARTIFACT_CREATED, node_id=record.node_id,
@@ -1018,6 +1010,18 @@ class RuntimeStore:
                 },
             )
         return record
+
+    @staticmethod
+    def insert_artifact(connection: sqlite3.Connection, record: ArtifactRecord) -> None:
+        """在调用方事务中原子保存 Artifact 与其领域版本指针。"""
+        connection.execute(
+            "INSERT INTO artifacts "
+            "(id,type,run_id,conversation_id,node_id,source,status,created_at,"
+            "metadata_json,location,version) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (record.id, record.type, record.run_id, record.conversation_id,
+             record.node_id, record.source, record.status, record.created_at.isoformat(),
+             _dump(record.metadata), record.location, record.version),
+        )
 
     def create_artifact(
         self, *, type: ArtifactType, run_id: str | None = None,

@@ -29,7 +29,7 @@ from .models import (
     ProjectStatus,
 )
 
-_SCHEMA_VERSION = 4
+_SCHEMA_VERSION = 5
 
 
 class ComicProjectStore:
@@ -123,7 +123,7 @@ class ComicProjectStore:
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
                     (3, utc_now().isoformat()),
                 )
-            if _SCHEMA_VERSION not in applied:
+            if 4 not in applied:
                 connection.execute(
                     "CREATE TABLE comic_storyboards ("
                     "storyboard_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
@@ -145,6 +145,24 @@ class ComicProjectStore:
                 )
                 connection.execute(
                     "CREATE INDEX idx_comic_shots_storyboard ON comic_shots(storyboard_id)"
+                )
+                connection.execute(
+                    "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
+                    (4, utc_now().isoformat()),
+                )
+            if 5 not in applied:
+                connection.execute(
+                    "CREATE TABLE comic_prompts ("
+                    "prompt_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                    "storyboard_id TEXT NOT NULL, shot_id TEXT NOT NULL UNIQUE, "
+                    "current_version INTEGER NOT NULL CHECK(current_version > 0), "
+                    "created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                    "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id), "
+                    "FOREIGN KEY(storyboard_id) REFERENCES comic_storyboards(storyboard_id), "
+                    "FOREIGN KEY(shot_id) REFERENCES comic_shots(shot_id))"
+                )
+                connection.execute(
+                    "CREATE INDEX idx_comic_prompts_project ON comic_prompts(project_id)"
                 )
                 connection.execute(
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
@@ -459,10 +477,11 @@ class ComicContextBuilder:
                     or director.creative_brief_version != brief.version):
                 raise ToolError("导演方案与当前作品或创作理解版本不一致")
             stable_context["director_spec"] = director.model_dump(include={
-                "visual_direction", "storytelling_goal", "camera_language", "composition",
-                "lighting", "color_language", "emotion", "character_focus", "constraints",
-                "creative_choices",
-            })
+                "schema_version", "visual_direction", "storytelling_goal", "camera_language",
+                "composition", "lighting", "color_language", "emotion", "character_focus",
+                "constraints", "creative_choices", "creative_decision", "director_plan",
+                "cinematography", "critic_result", "knowledge_refs",
+            }, exclude_none=True)
             source_versions["director_spec"] = director.version
         if len(assets or []) > 8:
             raise ToolError("单次上下文引用的资产过多")

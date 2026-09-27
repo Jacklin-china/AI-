@@ -2175,6 +2175,110 @@ def _comic_planning_project(app: web_studio.StudioApplication) -> tuple[str, dic
     return project_id, assets
 
 
+def test_comic_prompt_http_compile_edit_restore_and_history(
+    server: int, app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id, assets = _comic_planning_project(app)
+    web_studio.get_settings().image.model = "qwen-image-3.0"
+    board = app.create_comic_storyboard(project_id, {
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+        "draft": {"title": "雨夜交锋"},
+    })["storyboard"]
+    shot = app.create_comic_shot(board["storyboard_id"], {
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+        "expected_storyboard_version": 1,
+        "shot": {
+            "purpose": "展现拔剑决心", "subject": "少女阿青", "action": "拔剑",
+            "environment": "雨夜竹林",
+            "character_asset_versions": [{"asset_id": assets["character"], "version": 1}],
+            "scene_asset_versions": [{"asset_id": assets["scene"], "version": 1}],
+            "style_version": {"asset_id": assets["style"], "version": 1},
+        },
+    })
+    calls: list[object] = []
+
+    def model_call(messages: object) -> str:
+        calls.append(messages)
+        return json.dumps({
+            "director_summary": "雨夜拔剑前的克制张力",
+            "positive_prompt": "东方仙侠 少女 雨夜 战斗 竹林拔剑，阿青保持黑发剑士形象",
+            "negative_prompt": "避免身份漂移",
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_storyboard_model", model_call)
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(method: str, path: str, body: dict[str, object] | None = None):
+        connection.request(
+            method, path, body=None if body is None else json.dumps(body), headers=headers,
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    try:
+        prefix = f"/api/comic/shots/{shot['shot_id']}/prompt"
+        status, first = request("POST", prefix + "/compile", {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_shot_version": 1,
+        })
+        assert status == 201
+        assert first["version"] == 1
+        assert first["model_target"] == "qwen-image-3.0"
+        assert len(calls) == 1
+        assert app.runtime_store.get_artifact(first["artifact_id"]).type == ArtifactType.PROMPT
+        status, fetched = request("GET", prefix)
+        assert status == 200 and fetched == first
+        status, second = request("PUT", prefix, {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_version": 1,
+            "draft": {
+                "director_summary": "略加强动作",
+                "positive_prompt": first["positive_prompt"] + "，剑尖溅起雨滴",
+                "negative_prompt": first["negative_prompt"],
+            },
+        })
+        assert status == 200 and second["version"] == 2
+        status, versions = request("GET", prefix + "/versions")
+        assert status == 200 and [p["version"] for p in versions["versions"]] == [2, 1]
+        status, restored = request("POST", prefix + "/restore", {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_version": 2, "version": 1,
+        })
+        assert status == 201 and restored["version"] == 3
+        assert restored["positive_prompt"] == first["positive_prompt"]
+        assert restored["restored_from_version"] == 1
+        current_shot = app.comic_storyboards.get_shot(shot["shot_id"])
+        revised_shot = app.edit_comic_shot(shot["shot_id"], {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_version": current_shot.version, "status": "planned",
+            "shot": {**current_shot.model_dump(include={
+                "purpose", "subject", "action", "environment", "emotion",
+                "shot_size", "camera_angle", "camera_movement",
+                "character_asset_versions", "scene_asset_versions", "style_version",
+            }), "action": "拔剑后迎击"},
+        })
+        status, revised_prompt = request("POST", prefix + "/compile", {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_shot_version": revised_shot["version"],
+        })
+        assert status == 201 and revised_prompt["version"] == 4
+        assert revised_prompt["shot_version"] == revised_shot["version"]
+        status, historical = request("GET", prefix + "?version=1")
+        assert status == 200 and historical == first
+        status, stale = request("POST", prefix + "/restore", {
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "expected_version": 4, "version": 1,
+        })
+        assert status == 400 and stale["error_id"].startswith("ERR-")
+        assert app.runtime_store.list_artifacts(type=ArtifactType.IMAGE) == []
+        assert app.list_core_runs() == []
+        assert any(task["workflow"] == "comic.prompt.compile" for task in
+                   app.list_comic_project_tasks(project_id)["tasks"])
+    finally:
+        connection.close()
+
+
 def test_comic_storyboard_ai_plan_versions_assets_and_recovery(
     app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

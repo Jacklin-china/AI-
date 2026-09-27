@@ -1,0 +1,33 @@
+id: comic.cinematography
+name: Comic Cinematography
+domain: comic
+description: 根据导演计划与镜头上下文生成可编辑的摄影方案。
+version: 1.0.0
+required_tools: []
+input_schema:
+  type: object
+  required: [director_plan, shot_context]
+  properties:
+    director_plan: {type: object}
+    shot_context: {type: object}
+output_schema:
+  type: object
+  required: [cinematography]
+  properties:
+    cinematography:
+      type: object
+      required: [shot_size, camera_angle, spatial_feel, lighting, color_relationship, depth_strategy]
+execution_policy:
+  allowed_execution_modes: [fast, professional]
+  side_effects: []
+  provider_binding: false
+  coordinator_owned: true
+  contract_only: true
+knowledge_refs: [cinematography.language, cinematography.spatial-continuity]
+test_cases:
+  - id: accepts_shot_context
+    description: 摄影决策必须基于当前镜头上下文，而不是全量历史。
+  - id: keeps_video_fields_optional
+    description: 图片模式可不填写运动字段，为未来视频复用保留接口。
+handler_file: ../director/handler.py
+handler: execute_cinematography

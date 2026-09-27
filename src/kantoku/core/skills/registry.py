@@ -8,7 +8,7 @@ from typing import Any
 from uuid import uuid4
 
 from loguru import logger
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from kantoku.config import ToolError
 from kantoku.core.runtime.models import ExecutionStatus, SkillExecutionRecord, utc_now
@@ -28,6 +28,10 @@ class SkillMetadata(BaseModel):
     input_schema: dict[str, Any]
     output_schema: dict[str, Any]
     handler_ref: str | None = None
+    # 新字段对已有 Commerce/Comic manifest 保持可选；领域 manifest 可声明更细的执行策略。
+    execution_policy: dict[str, Any] = Field(default_factory=dict)
+    knowledge_refs: tuple[str, ...] = ()
+    test_cases: tuple[dict[str, Any], ...] = ()
 
 
 SkillExecutor = Callable[[Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]]

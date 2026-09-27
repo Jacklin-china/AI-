@@ -76,7 +76,7 @@
 - Phase 3：DirectorSpec 使用 Brief 修订、故事/角色/场景上下文；测试硬约束保持、修订溯源与无固定摄影公式。
 - Phase 4：资产项目隔离、引用 Artifact、锁定版本与跨镜头复用测试。
 - Phase 5：任意合法镜头数、稳定 Shot ID、重排/墓碑/恢复和状态转换测试；旧 20 镜接口继续兼容。
-- Phase 6：复用现有 Image Capability、Budget、Run、Artifact 和 Prompt 配方，验证首提、重启恢复、未知状态不重提、Retry/Regenerate 区分及多镜头版本引用。
+- Phase 6：先建立作品级 Prompt Compiler 与不可变 Prompt Artifact，不提交生图任务；图片能力、预算和供应商恢复验收顺延至下一图片生产阶段。
 - Phase 7：复用现有视觉 QC 与审批，验证 PASS/MINOR/MAJOR 的真实证据、返工版本和费用；没有可用局部编辑 Provider 时明确标记 `MINOR_ERROR` 需要人工处理或获批重生，不伪称局部修复成功。
 
 每阶段先运行相应回归测试，再运行全项目结构检查、ruff、pytest 与前端构建/类型检查；有真实供应商费用的验收另外确认预算。**不得在 Phase 1 一次实现 Phase 2–7，也不得在本图片阶段自动启用视频。**
@@ -94,6 +94,20 @@ HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id
 `domains/comic/director.py` 使用 Phase 2 的 `ComicContextBuilder`，只把当前 Project、CreativeBrief、可验证的相关记忆与当前任务送往现有共享 `core.llm.chat`。Phase 4 起导演生成可通过任务名称/别名或显式资产 ID 选取已有资产；未匹配时 `relevant_memory` 仍为空，不能伪造资产。它不会把全量聊天、旧作品或旧 Prompt 偷渡给模型。模型返回的是结构化、可编辑的 DirectorSpec（叙事目标、视觉方向、镜头语言、构图、光影、色彩、情绪、角色重点、约束与创作选择原因），**不是生图 Prompt**。导演指令禁止固定情绪词到摄影公式的映射；用户硬约束由服务补齐并在存储层再次检查，人工编辑也不能遗漏。
 
 DirectorSpec 与 `project_id`、`creative_brief_version` 绑定，在原有 `comic_entity_versions` 中追加不可变修订；迁移 v2 仅给 `comic_projects` 增加当前导演方案的 ID/版本指针，不改变旧业务表。Brief 实质更新会清除当前指针，但保留全部旧导演修订；旧 Brief 下的方案可查看，不可直接恢复为新版 Brief 的当前方案。恢复会复制旧内容成为**新修订**，不覆盖历史；提交需要当前作品版本以防并发覆盖。`source` 标明模型生成、人工编辑或历史恢复。
+
+### Phase 7.2 第一阶段：DirectorSpec v2 Schema
+
+DirectorSpec v2 在同一个领域实体上增加 `schema_version`、`creative_decision`、`director_plan`、`cinematography`、`critic_result` 与 `knowledge_refs`。这些字段保存公开、可编辑的导演决策，不保存模型私有思维链，也不包含供应商 Prompt 或生成参数。`schema_version=1` 继续表示现有扁平方案；读取没有版本字段的历史 JSON 时显式标记为 v1，分层字段保持空值，禁止凭空补全。只有完整提供创意理解、导演计划和摄影计划时才允许写入 v2。该阶段不改变表结构，仍使用 `comic_entity_versions` 的追加修订；Coordinator、Critic、Skill Registry 和 API 扩展在后续阶段接入。
+
+### Phase 7.2.2：Director Skill Registry
+
+导演 Skill 使用现有 Core `SkillRegistry`/`SkillLoader`，manifest 位于 `skills/comic/`。当前登记 `comic.creative_understanding`、`comic.visual_direction`、`comic.cinematography`、`comic.director_critic` 和 `comic.director_assemble`，每个 manifest 声明输入/输出 Schema、`execution_policy`、知识引用和契约测试。Skill 没有 `required_tools`，不绑定 Provider，也不修改 Asset；当前 handler 明确标记为 `contract_only`，只校验 Coordinator 提供的结构化结果。Fast 与 Professional 通过同一组 Skill 的 `allowed_execution_modes` 复用，不建立第二套 Skill 或 Runtime。
+
+### Phase 7.2.3：ComicDirectorCoordinator
+
+`domains/comic/coordinator.py` 使用现有 `SkillRegistry`、Core Run/Runtime Event/Trace 和作品版本存储。调用方须注入共享文本能力的阶段执行函数；Coordinator 本身不导入 Provider，也不会把契约 handler 冒充模型。Fast 顺序执行创意理解、视觉导演、摄影指导、组装；Professional 额外执行 Critic，逐阶段将公开结构化结果写入 Run state 与事件。专业模式可指定先前已完成 Run 和起始阶段，在输入 Brief/资产/分镜/镜头版本一致时复用前段结果并从该阶段重跑；重跑创建新的 Core Run，旧记录不覆盖。
+
+两种模式均追加保存同一 `DirectorSpec v2` 结构；输入资产、Storyboard、Shot 版本写入导演方案。若传入旧方案且依赖版本发生变化，Run state 与 `director_spec_created` 事件标记 `storyboard/shot/prompt_artifact` 为 stale，供后续 UI/API 阻止沿用旧结果；当前不改写这些实体的历史修订。失败写入具体 `skill_id`、`trace_id`、`error_id` 和脱敏 traceback，Run 标为 failed，禁止默认填充导演结果；已完成或失败的专业 Run 可在输入版本一致时从指定阶段重新执行。本阶段未新增 HTTP API，也未接入真实模型、图片或视频；下一阶段实现 Critic 的审核判断与修订策略。
 
 HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
 
@@ -127,7 +141,15 @@ Context Builder 现在可组合当前/指定作品版本的 Brief、与该 Brief
 
 创建分镜可提交手动草案，或明确设置 `generate=true`。AI 规划只接收当前 Project、CreativeBrief、DirectorSpec、最多 8 个相关资产与当前任务，调用现有共享文本模型；模型自行决定镜头数量和节奏。模型输出的资产引用必须出现在传入上下文，存储前还要核验项目、类型、状态与固定修订号。生成或写操作沿用 Core Run/Event 与现有 `trace_id/error_id` 日志，记录作品、分镜、镜头和版本；这些规划 Run 不进入生产任务中心。模型调用的供应商、请求 ID、token、耗时与重试由共享 LLM 日志记录。本阶段不调用图片/视频 Provider，也不创建 Prompt Artifact、预算预占或 QC 结果。
 
-HTTP：`POST/GET /api/comic/projects/{id}/storyboards`；`GET/PUT /api/comic/storyboards/{id}`；`GET /api/comic/storyboards/{id}/versions`；`POST /api/comic/storyboards/{id}/restore`；`POST/GET /api/comic/storyboards/{id}/shots`；`GET/PUT /api/comic/shots/{id}`；`GET /api/comic/shots/{id}/versions`；`POST /api/comic/shots/{id}/delete|restore`。所有写操作需要预期作品版本及相应对象版本，避免并发静默覆盖。Phase 6 应从当前 Storyboard/Shot 修订和固定资产版本编译 Prompt，再复用现有 Image Capability、预算、Artifact 与恢复链路；不能让用户编辑 Shot 等同于已生成图片。
+HTTP：`POST/GET /api/comic/projects/{id}/storyboards`；`GET/PUT /api/comic/storyboards/{id}`；`GET /api/comic/storyboards/{id}/versions`；`POST /api/comic/storyboards/{id}/restore`；`POST/GET /api/comic/storyboards/{id}/shots`；`GET/PUT /api/comic/shots/{id}`；`GET /api/comic/shots/{id}/versions`；`POST /api/comic/shots/{id}/delete|restore`。所有写操作需要预期作品版本及相应对象版本，避免并发静默覆盖。Phase 6 从当前 Storyboard/Shot 修订和固定资产版本编译 Prompt；不能让用户编辑 Shot 等同于已生成图片。
+
+### Phase 6：Prompt Compiler 与 Prompt Artifact
+
+`domains/comic/prompts.py` 只做作品级镜头提示词编译。它复用当前 Project/Brief/Director、当前 Storyboard/Shot 和 Shot **显式固定的**角色/场景/风格资产版本；不装入全聊天、其他镜头、旧 Prompt 或无关资产。共享文本模型依据镜头目的、导演方案和目标模型特点生成结构化正向/负向 Prompt，编译器及存储层均拒绝遗漏用户硬约束或资产固定约束的结果。模型标识由 `config/settings.yaml` 提供；编译适配接口可按目标模型扩展，不改图片 Provider。共享 LLM 日志记录模型调用、耗时和可用的 token 用量；领域日志记录版本、资产、编译器和输入输出长度，不写密钥或私有思维链。
+
+迁移 v5 仅追加 `comic_prompts` 当前指针表；每次编译、人工编辑或恢复都在已有 `comic_entity_versions` 中追加 `prompt` 修订，并在**同一 SQLite 事务**写入 Core `ArtifactType.PROMPT`。Prompt 正文与溯源元数据随 Artifact 持久化，领域修订保留完整可比较快照；旧版本与旧 Artifact 不覆盖。每版保存 Brief/Director/Storyboard/Shot、资产 ID/版本、编译器版本、模型、来源 Run 和 Prompt 哈希。作品与 Prompt 的预期版本防止并发写入；镜头变更后须重新编译，旧来源不匹配时禁止直接恢复。复用 Core Run/Event/Trace，不建立第二套任务或媒体存储。当前版本**没有**图片生成、预算预占、视频或 QC。
+
+HTTP：`POST /api/comic/shots/{id}/prompt/compile`（`expected_project_version`、`expected_shot_version`）；`GET /api/comic/shots/{id}/prompt[?version=n]`；`GET /api/comic/shots/{id}/prompt/versions`；`PUT /api/comic/shots/{id}/prompt`（人工编辑，含预期作品/Prompt 版本）；`POST /api/comic/shots/{id}/prompt/restore`（从兼容的旧版本追加新修订）。下一图片生产阶段才把已选定的 Prompt Artifact 作为不可变输入，调用共享 Image Capability，并沿用预算预占、幂等、Artifact、Provider Job 恢复和 QC 的既有基础设施。
 
 ## 唯一入口
 

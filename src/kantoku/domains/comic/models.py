@@ -127,11 +127,95 @@ class ComicContext(BaseModel):
     source_versions: dict[str, int]
 
 
-class DirectorSpecDraft(BaseModel):
-    """可编辑的导演决策，不包含供应商 Prompt 或生成参数。"""
+class CreativeDecision(BaseModel):
+    """公开的创意理解结果，不包含模型私有思维链或供应商 Prompt。"""
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
+    intent_summary: BriefText
+    narrative_context: BriefText
+    emotional_target: BriefText
+    audience_experience: BriefText
+    narrative_focus: BriefText
+    hard_constraints: list[BriefItem] = Field(default_factory=list, max_length=50)
+    soft_preferences: list[BriefItem] = Field(default_factory=list, max_length=50)
+    creative_freedom: list[BriefItem] = Field(default_factory=list, max_length=50)
+    unresolved_questions: list[BriefItem] = Field(default_factory=list, max_length=20)
+
+
+class DirectorPlan(BaseModel):
+    """导演对视觉表达的决策，而不是固定关键词到镜头的映射。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    visual_strategy: BriefText
+    visual_focus: BriefText
+    subject_environment_relation: BriefText
+    composition_strategy: BriefText
+    color_strategy: BriefText
+    continuity_rules: list[BriefItem] = Field(default_factory=list, max_length=50)
+    creative_choices: list[BriefItem] = Field(default_factory=list, max_length=20)
+    risk_flags: list[BriefItem] = Field(default_factory=list, max_length=20)
+
+
+class CinematographyPlan(BaseModel):
+    """把导演意图转成可编辑的摄影决策；不直接生成供应商参数。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    shot_size: BriefText
+    camera_angle: BriefText
+    camera_distance: BriefText
+    spatial_feel: BriefText
+    lens_or_spatial_feel: BriefText
+    movement: BriefText | None = None
+    lighting: BriefText
+    light_source: BriefText
+    light_direction: BriefText
+    color_relationship: BriefText
+    depth_strategy: BriefText
+    material_language: BriefText
+
+
+class DirectorCriticFinding(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    severity: Literal["info", "warning", "error"]
+    category: BriefItem
+    message: BriefText
+
+
+class DirectorCriticPatch(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    field: BriefItem
+    reason: BriefText
+
+
+class DirectorCriticResult(BaseModel):
+    """生成前的公开审核结果；不保存模型隐藏推理。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    verdict: Literal["pass", "needs_revision", "blocked"]
+    public_summary: BriefText
+    findings: list[DirectorCriticFinding] = Field(default_factory=list, max_length=50)
+    suggested_patches: list[DirectorCriticPatch] = Field(default_factory=list, max_length=20)
+    confidence: float = Field(ge=0, le=1)
+    knowledge_refs: list[BriefItem] = Field(default_factory=list, max_length=50)
+
+
+class DirectorSpecDraft(BaseModel):
+    """可编辑的导演决策，不包含供应商 Prompt 或生成参数。
+
+    ``schema_version=1`` 表示现有扁平 DirectorSpec；
+    ``schema_version=2`` 才允许保存分层导演决策。这样旧调用方可以继续写入
+    v1，而 Phase 7.2 Coordinator 准备好完整结构后再显式写入 v2。
+    """
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    schema_version: Literal[1, 2] = 1
     visual_direction: BriefText
     storytelling_goal: BriefText
     camera_language: BriefText
@@ -142,6 +226,26 @@ class DirectorSpecDraft(BaseModel):
     character_focus: BriefText
     constraints: list[BriefItem] = Field(default_factory=list, max_length=50)
     creative_choices: list[BriefItem] = Field(min_length=1, max_length=20)
+    creative_decision: CreativeDecision | None = None
+    director_plan: DirectorPlan | None = None
+    cinematography: CinematographyPlan | None = None
+    critic_result: DirectorCriticResult | None = None
+    knowledge_refs: list[BriefItem] = Field(default_factory=list, max_length=50)
+    asset_versions: dict[str, int] = Field(default_factory=dict, max_length=50)
+    storyboard_version: int | None = Field(default=None, ge=1)
+    shot_version: int | None = Field(default=None, ge=1)
+
+    @model_validator(mode="after")
+    def validate_layered_v2(self) -> DirectorSpecDraft:
+        if self.schema_version == 2 and (
+            self.creative_decision is None
+            or self.director_plan is None
+            or self.cinematography is None
+        ):
+            raise ValueError(
+                "DirectorSpec v2 必须包含 creative_decision、director_plan 和 cinematography"
+            )
+        return self
 
 
 class DirectorSpec(DirectorSpecDraft):
@@ -152,7 +256,6 @@ class DirectorSpec(DirectorSpecDraft):
     created_at: datetime
     source: Literal["model", "manual", "restored"]
     restored_from_version: int | None = Field(default=None, ge=1)
-
 
 class DirectorSpecRequest(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
@@ -415,3 +518,51 @@ class ComicShotDeleteRequest(BaseModel):
 
     expected_project_version: int = Field(ge=1)
     expected_version: int = Field(ge=1)
+
+
+class ComicPromptDraft(BaseModel):
+    """编译结果；内容可编辑，但不能伪装成已经调用生图模型。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    director_summary: BriefText
+    positive_prompt: BriefText
+    negative_prompt: str = Field(default="", max_length=4000)
+
+
+class ComicPromptArtifact(ComicPromptDraft):
+    prompt_id: str
+    artifact_id: str
+    project_id: str
+    storyboard_id: str
+    shot_id: str
+    version: int = Field(ge=1)
+    project_version: int = Field(ge=1)
+    creative_brief_version: int = Field(ge=1)
+    director_spec_version: int = Field(ge=1)
+    storyboard_version: int = Field(ge=1)
+    shot_version: int = Field(ge=1)
+    character_asset_versions: list[ComicShotAssetRef]
+    scene_asset_versions: list[ComicShotAssetRef]
+    style_version: ComicShotAssetRef | None
+    original_intent: BriefText
+    model_target: ProjectText
+    compiler_version: ProjectText
+    created_at: datetime
+    source: Literal["compiled", "edited", "restored"]
+    restored_from_version: int | None = Field(default=None, ge=1)
+
+
+class ComicPromptCompileRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_shot_version: int = Field(ge=1)
+
+
+class ComicPromptEditRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    draft: ComicPromptDraft

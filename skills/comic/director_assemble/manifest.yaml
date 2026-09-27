@@ -1,0 +1,36 @@
+id: comic.director_assemble
+name: Comic Director Assemble
+domain: comic
+description: 汇总导演各层结构化结果，形成 DirectorSpec v2 草案。
+version: 1.0.0
+required_tools: []
+input_schema:
+  type: object
+  required: [creative_decision, director_plan, cinematography]
+  properties:
+    creative_decision: {type: object}
+    director_plan: {type: object}
+    cinematography: {type: object}
+    critic_result: {type: [object, 'null']}
+output_schema:
+  type: object
+  required: [director_spec]
+  properties:
+    director_spec:
+      type: object
+      required: [schema_version, creative_decision, director_plan, cinematography]
+execution_policy:
+  allowed_execution_modes: [fast, professional]
+  side_effects: []
+  provider_binding: false
+  coordinator_owned: true
+  contract_only: true
+  optional_in_fast: [critic_result]
+knowledge_refs: [director.schema-v2, director.provenance]
+test_cases:
+  - id: produces_director_spec_v2
+    description: 汇总结果必须能被 DirectorSpec v2 Schema 接收。
+  - id: preserves_versions
+    description: 不改变 Project、Brief 或 Asset 的版本和持久化记录。
+handler_file: ../director/handler.py
+handler: execute_director_assemble

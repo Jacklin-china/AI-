@@ -1,0 +1,35 @@
+id: comic.visual_direction
+name: Comic Visual Direction
+domain: comic
+description: 根据创意决策与项目资产生成可编辑的 DirectorPlan。
+version: 1.0.0
+required_tools: []
+input_schema:
+  type: object
+  required: [creative_decision, character_assets, scene_assets, style_bible]
+  properties:
+    creative_decision: {type: object}
+    character_assets: {type: array}
+    scene_assets: {type: array}
+    style_bible: {type: [object, 'null']}
+output_schema:
+  type: object
+  required: [director_plan]
+  properties:
+    director_plan:
+      type: object
+      required: [visual_strategy, visual_focus, composition_strategy, color_strategy, continuity_rules, creative_choices]
+execution_policy:
+  allowed_execution_modes: [fast, professional]
+  side_effects: []
+  provider_binding: false
+  coordinator_owned: true
+  contract_only: true
+knowledge_refs: [director.contextual-expression, director.continuity]
+test_cases:
+  - id: preserves_asset_context
+    description: 输出必须保留资产关系，不复制第二套资产记录。
+  - id: avoids_fixed_emotion_mapping
+    description: 不使用情绪到固定镜头的硬编码映射。
+handler_file: ../director/handler.py
+handler: execute_visual_direction
