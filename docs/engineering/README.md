@@ -85,17 +85,33 @@
 
 `domains/comic/projects.py` 在现有 Core SQLite 文件中追加 `comic_schema_migrations`、`comic_projects` 和 `comic_entity_versions`，后者保存不可变的 Project/CreativeBrief 修订。创建作品同时创建 Brief v1；更新 Brief 必须提交当前作品 `expected_version`，并原子追加 Brief 与 Project 修订。重复提交完全相同的内容不增加版本；并发不同修改不能静默覆盖。`GET` 可按作品版本读取旧 Brief，Context 响应带明确的来源版本。
 
-HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id}`、`PUT /api/comic/projects/{project_id}/brief`、`GET /api/comic/projects/{project_id}/context`，同时兼容请求中的 `/comic/projects` 写法；均沿用现有本机会话令牌、Trace 和错误处理。创建请求可直接提供结构化 Brief；若只提供标题，则仅把标题保存为原始需求，其他字段保持空列表，**不会凭空推断用户约束或偏好**。当前 Context 只含 Project、Brief、可选当前任务与来源修订；`relevant_memory` 为空，因为角色/场景/镜头资产尚未在 Phase 4/5 接入。Context 是可按版本重建的派生视图，不另存一套会漂移的内容表。
+HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id}`、`PUT /api/comic/projects/{project_id}/brief`、`GET /api/comic/projects/{project_id}/context`，同时兼容请求中的 `/comic/projects` 写法；均沿用现有本机会话令牌、Trace 和错误处理。创建请求可直接提供结构化 Brief；若只提供标题，则仅把标题保存为原始需求，其他字段保持空列表，**不会凭空推断用户约束或偏好**。Phase 2 的 Context 最初只含 Project、Brief、可选当前任务与来源修订，`relevant_memory` 为空；Phase 4 才加入有界资产选择。Context 是可按版本重建的派生视图，不另存一套会漂移的内容表。
 
 本次迁移只建新表，不导入、改写或删除旧 `shot/persona/recipe`、StudioTask、账单、Run、Artifact；旧入口保持原样。历史数据自动归属作品会出现同名冲突，因此必须等待显式映射与对照测试，不能按作品名猜测迁移。
 
 ### Phase 3 已实现的导演决策边界
 
-`domains/comic/director.py` 使用 Phase 2 的 `ComicContextBuilder`，只把当前 Project、CreativeBrief、可验证的相关记忆与当前任务送往现有共享 `core.llm.chat`。目前相关资产尚未接入，所以 `relevant_memory` 为空；不会把全量聊天、旧作品或旧 Prompt 偷渡给模型。模型返回的是结构化、可编辑的 DirectorSpec（叙事目标、视觉方向、镜头语言、构图、光影、色彩、情绪、角色重点、约束与创作选择原因），**不是生图 Prompt**。导演指令禁止固定情绪词到摄影公式的映射；用户硬约束由服务补齐并在存储层再次检查，人工编辑也不能遗漏。
+`domains/comic/director.py` 使用 Phase 2 的 `ComicContextBuilder`，只把当前 Project、CreativeBrief、可验证的相关记忆与当前任务送往现有共享 `core.llm.chat`。Phase 4 起导演生成可通过任务名称/别名或显式资产 ID 选取已有资产；未匹配时 `relevant_memory` 仍为空，不能伪造资产。它不会把全量聊天、旧作品或旧 Prompt 偷渡给模型。模型返回的是结构化、可编辑的 DirectorSpec（叙事目标、视觉方向、镜头语言、构图、光影、色彩、情绪、角色重点、约束与创作选择原因），**不是生图 Prompt**。导演指令禁止固定情绪词到摄影公式的映射；用户硬约束由服务补齐并在存储层再次检查，人工编辑也不能遗漏。
 
 DirectorSpec 与 `project_id`、`creative_brief_version` 绑定，在原有 `comic_entity_versions` 中追加不可变修订；迁移 v2 仅给 `comic_projects` 增加当前导演方案的 ID/版本指针，不改变旧业务表。Brief 实质更新会清除当前指针，但保留全部旧导演修订；旧 Brief 下的方案可查看，不可直接恢复为新版 Brief 的当前方案。恢复会复制旧内容成为**新修订**，不覆盖历史；提交需要当前作品版本以防并发覆盖。`source` 标明模型生成、人工编辑或历史恢复。
 
 HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Run、Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
+
+### Phase 4：小范围资产研究与实现
+
+只参考资产管理的三个案例，不照搬其产品流程：
+
+| 案例 | 可借鉴结构 | 不适合 Kantoku 的部分 |
+| --- | --- | --- |
+| [Figma 组件变体与版本历史](https://help.figma.com/hc/en-us/articles/360056440594-Create-and-use-variants)、[恢复版本](https://help.figma.com/hc/en-us/articles/360038006754-View-a-file-s-version-history) | 稳定的资产身份、可控属性差异、非破坏性恢复。 | 全文件版本及变体组合不等于角色/场景逐项修订；大量变体会使资产库臃肿。 |
+| [InvokeAI Gallery](https://invoke.ai/features/gallery/) | 区分生成结果与外部参考素材，保留可追溯的生成元数据。 | Board 是媒体整理视图，不应复制为第二个 Artifact 库或替代作品关系。 |
+| [Mem0 检索](https://github.com/mem0ai/mem0/blob/main/docs/core-concepts/memory-operations/search.mdx) | 先限定所属范围，再按相关性与数量选择记忆。 | 当前项目没有经验证的向量索引；不能把名称/别名匹配冒充语义召回，也不引入独立记忆服务。 |
+
+Kantoku 的资产契约：`ComicAsset` 有稳定 `asset_id`、`project_id`、`kind`、名称/别名、`version`、`project_version`、状态和可选 `pinned_version`；`details` 按 `CharacterAsset`（外观、服装、特征）、`SceneAsset`（地点、时间、天气、光线、氛围、环境特点）或 `StyleBible`（艺术方向、色彩、材质、镜头语言、光影）严格校验。共通字段包括固定约束、标签、`reference_artifact_ids`。参考图只引用已有且就绪的 Core 图片 Artifact，不保存第二份媒体记录。资产描述由用户/现有调用方提供；Phase 4 不自行猜测角色外观或自动生成参考图。
+
+迁移 v3 只增加 `comic_assets` 当前指针表，资产内容继续追加到已有 `comic_entity_versions`；旧 StudioTask、Persona、Shot、Run、Budget、Artifact 不迁移、不删除。编辑、锁定、解锁、删除和恢复均追加修订，作品版本同步递增并用预期版本阻止并发覆盖。锁定版本供后续多个镜头引用；编辑仍保存新修订，锁定指针不会暗中漂移。删除写墓碑，恢复写新修订，历史保留。过去某个 Project 版本的上下文只会读取当时已存在的资产修订，不混入未来资产。
+
+Context Builder 现在可组合当前/指定作品版本的 Brief、与该 Brief 对齐的 DirectorSpec，以及有限的相关资产。显式 `asset_id` 优先；随后只用任务中的**名称/别名精确包含**选择角色和场景；若仅有一个有效 StyleBible 则自动带入。最多选择 8 个，返回每个资产的真实修订号和参考 Artifact ID；不发送全资产库，也不声称已有语义搜索。HTTP 入口为 `/api/comic/projects/{id}/assets`（POST 创建、GET 列表）、`/{asset_id}`（GET、PUT 编辑）、`/{asset_id}/versions`（GET）、`/{asset_id}/lock|restore|delete`（POST）；原 `/context` 可用 `task` 或重复的 `asset_id` 参数选择。尚未建设上传素材、资产自动提取、分镜关联、Prompt Compiler、生图、QC 或视频。
 
 ## 唯一入口
 

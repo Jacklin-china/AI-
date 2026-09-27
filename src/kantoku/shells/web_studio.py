@@ -79,8 +79,15 @@ from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
+from kantoku.domains.comic.assets import ComicAssetStore
 from kantoku.domains.comic.director import plan_director_spec
 from kantoku.domains.comic.models import (
+    ComicAssetCreateRequest,
+    ComicAssetDeleteRequest,
+    ComicAssetEditRequest,
+    ComicAssetLockRequest,
+    ComicAssetRef,
+    ComicAssetVersionRequest,
     ComicProjectInput,
     CreativeBriefUpdate,
     DirectorSpecDraft,
@@ -359,6 +366,7 @@ class StudioApplication:
         database_path = configured if configured.is_absolute() else ROOT / configured
         self.runtime_store = RuntimeStore(database_path)
         self.comic_projects = ComicProjectStore(self.runtime_store.path)
+        self.comic_assets = ComicAssetStore(self.comic_projects, self.runtime_store)
         self.runtime = GraphRuntime(self.runtime_store)
         self.skills = SkillRegistry()
         SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
@@ -1667,9 +1675,90 @@ class StudioApplication:
 
     def get_comic_context(
         self, project_id: str, *, task: str | None = None, version: int | None = None,
+        asset_ids: list[str] | None = None,
     ) -> dict[str, Any]:
         snapshot = self.comic_projects.get(project_id, version=version)
-        return ComicContextBuilder.build(snapshot, task=task).model_dump(mode="json")
+        director = None
+        if snapshot.project.director_id is not None:
+            director = self.comic_projects.get_director(
+                project_id, project_version=snapshot.project.current_version,
+            )
+        refs = [ComicAssetRef(asset_id=item) for item in asset_ids or []]
+        assets = self.comic_assets.select_relevant(
+            project_id, task=task, refs=refs,
+            project_version=snapshot.project.current_version,
+        )
+        return ComicContextBuilder.build(
+            snapshot, task=task, director=director, assets=assets,
+        ).model_dump(mode="json")
+
+    def create_comic_asset(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicAssetCreateRequest.model_validate(data)
+        return self.comic_assets.create(
+            project_id, request.asset,
+            expected_project_version=request.expected_project_version,
+        ).model_dump(mode="json")
+
+    def get_comic_asset(
+        self, project_id: str, asset_id: str, *, version: int | None = None,
+    ) -> dict[str, Any]:
+        return self.comic_assets.get(project_id, asset_id, version=version).model_dump(mode="json")
+
+    def list_comic_assets(
+        self, project_id: str, *, project_version: int | None = None,
+    ) -> dict[str, Any]:
+        return {"assets": [
+            asset.model_dump(mode="json") for asset in self.comic_assets.list(
+                project_id, project_version=project_version,
+            )
+        ]}
+
+    def list_comic_asset_versions(self, project_id: str, asset_id: str) -> dict[str, Any]:
+        return {"versions": [
+            asset.model_dump(mode="json")
+            for asset in self.comic_assets.versions(project_id, asset_id)
+        ]}
+
+    def edit_comic_asset(
+        self, project_id: str, asset_id: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        request = ComicAssetEditRequest.model_validate(data)
+        return self.comic_assets.change(
+            project_id, asset_id, expected_project_version=request.expected_project_version,
+            expected_asset_version=request.expected_asset_version,
+            action="edit", draft=request.asset,
+        ).model_dump(mode="json")
+
+    def change_comic_asset(
+        self, project_id: str, asset_id: str, action: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        if action == "restore":
+            request = ComicAssetVersionRequest.model_validate(data)
+            asset = self.comic_assets.change(
+                project_id, asset_id,
+                expected_project_version=request.expected_project_version,
+                expected_asset_version=request.expected_asset_version,
+                action="restore", target_version=request.version,
+            )
+        elif action == "lock":
+            lock_request = ComicAssetLockRequest.model_validate(data)
+            asset = self.comic_assets.change(
+                project_id, asset_id,
+                expected_project_version=lock_request.expected_project_version,
+                expected_asset_version=lock_request.expected_asset_version,
+                action="lock", target_version=lock_request.version,
+            )
+        elif action == "delete":
+            delete_request = ComicAssetDeleteRequest.model_validate(data)
+            asset = self.comic_assets.change(
+                project_id, asset_id,
+                expected_project_version=delete_request.expected_project_version,
+                expected_asset_version=delete_request.expected_asset_version,
+                action="delete",
+            )
+        else:
+            raise ToolError("资产操作不受支持")
+        return asset.model_dump(mode="json")
 
     @staticmethod
     def _comic_director_model(messages: list[dict[str, str]]) -> str:
@@ -1682,8 +1771,14 @@ class StudioApplication:
         if snapshot.project.current_version != request.expected_project_version:
             raise ToolError("作品已由其他操作更新，请刷新后重试")
         if request.draft is None:
+            assets = self.comic_assets.select_relevant(
+                project_id, task=request.task,
+                refs=[ComicAssetRef(asset_id=item) for item in request.asset_ids],
+                project_version=snapshot.project.current_version,
+            )
             draft = plan_director_spec(
                 snapshot, task=request.task, model_call=self._comic_director_model,
+                assets=assets,
             )
             source = "model"
         else:
@@ -2117,7 +2212,20 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     elif len(comic_parts) == 4 and comic_parts[3] == "context":
                         self.json_reply(200, app.get_comic_context(
                             comic_parts[2], task=query.get("task", [None])[0],
-                            version=version,
+                            version=version, asset_ids=query.get("asset_id", []),
+                        ))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "assets":
+                        self.json_reply(200, app.list_comic_assets(
+                            comic_parts[2], project_version=version,
+                        ))
+                    elif len(comic_parts) == 5 and comic_parts[3] == "assets":
+                        self.json_reply(200, app.get_comic_asset(
+                            comic_parts[2], comic_parts[4], version=version,
+                        ))
+                    elif len(comic_parts) == 6 and comic_parts[3] == "assets" \
+                            and comic_parts[5] == "versions":
+                        self.json_reply(200, app.list_comic_asset_versions(
+                            comic_parts[2], comic_parts[4],
                         ))
                     elif len(comic_parts) == 4 and comic_parts[3] == "director-spec":
                         self.json_reply(200, app.get_comic_director(comic_parts[2]))
@@ -2245,6 +2353,15 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 if request_path in {"/api/comic/projects", "/comic/projects"}:
                     self.json_reply(201, app.create_comic_project(data))
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 4 \
+                        and comic_parts[3] == "assets":
+                    self.json_reply(201, app.create_comic_asset(comic_parts[2], data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 6 \
+                        and comic_parts[3] == "assets" \
+                        and comic_parts[5] in {"restore", "lock", "delete"}:
+                    self.json_reply(201, app.change_comic_asset(
+                        comic_parts[2], comic_parts[4], comic_parts[5], data,
+                    ))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 4 \
                         and comic_parts[3] == "director-spec":
                     self.json_reply(201, app.create_comic_director(comic_parts[2], data))
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
@@ -2317,14 +2434,19 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 request_path = urlsplit(self.path).path
                 parts = request_path.removeprefix("/api").strip("/").split("/")
                 length = int(self.headers.get("Content-Length", "0"))
-                if (len(parts) != 4 or parts[:2] != ["comic", "projects"]
-                        or parts[3] != "brief" or not 0 < length <= 65536
+                is_brief = len(parts) == 4 and parts[3] == "brief"
+                is_asset = len(parts) == 5 and parts[3] == "assets"
+                if (parts[:2] != ["comic", "projects"] or not (is_brief or is_asset)
+                        or not 0 < length <= 65536
                         or not request_path.startswith(("/api/comic/", "/comic/"))):
                     raise ToolError("请求格式不合法")
                 data = json.loads(self.rfile.read(length))
                 if not isinstance(data, dict):
                     raise ToolError("请求格式不合法")
-                self.json_reply(200, app.update_comic_brief(parts[2], data))
+                if is_brief:
+                    self.json_reply(200, app.update_comic_brief(parts[2], data))
+                else:
+                    self.json_reply(200, app.edit_comic_asset(parts[2], parts[4], data))
             except (ValueError, ValidationError, KantokuError) as error:
                 self.error_reply(400, error)
 

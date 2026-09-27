@@ -11,6 +11,7 @@ from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.parse import quote
 
 import pytest
 from test_image_gen import _settings
@@ -2001,6 +2002,77 @@ def test_comic_director_api_generates_edits_lists_and_restores(
         assert restored["version"] == 3
         assert restored["restored_from_version"] == 1
         assert restored["lighting"] == first["lighting"]
+        assert app.runtime_store.list_runs() == []
+    finally:
+        connection.close()
+
+
+def test_comic_asset_api_versions_and_bounded_context(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(
+        method: str, path: str, payload: dict[str, object] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        connection.request(
+            method, path, body=None if payload is None else json.dumps(payload), headers=headers,
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    try:
+        status, created = request("POST", "/api/comic/projects", {
+            "title": "竹林雨夜", "brief": {"original_request": "阿青在竹林雨夜迎战"},
+        })
+        assert status == 201
+        project_id = created["project"]["project_id"]
+        asset = {
+            "name": "阿青", "details": {
+                "kind": "character", "appearance": "黑发少年剑士", "outfit": "蓝色长袍",
+            },
+        }
+        status, first = request("POST", f"/api/comic/projects/{project_id}/assets", {
+            "expected_project_version": 1, "asset": asset,
+        })
+        assert status == 201
+        asset_id = first["asset_id"]
+        status, context = request(
+            "GET", f"/api/comic/projects/{project_id}/context?task={quote('阿青 行动')}",
+        )
+        assert status == 200
+        assert len(context["relevant_memory"]) == 1
+        assert context["source_versions"][f"asset:{asset_id}"] == 1
+        status, old_context = request("GET", f"/api/comic/projects/{project_id}/context?version=1")
+        assert status == 200
+        assert old_context["relevant_memory"] == []
+
+        status, changed = request("PUT", f"/api/comic/projects/{project_id}/assets/{asset_id}", {
+            "expected_project_version": 2, "expected_asset_version": 1,
+            "asset": {**asset, "details": {**asset["details"], "outfit": "深色披风"}},
+        })
+        assert status == 200
+        assert changed["version"] == 2
+        status, locked = request(
+            "POST", f"/api/comic/projects/{project_id}/assets/{asset_id}/lock",
+            {"expected_project_version": 3, "expected_asset_version": 2, "version": 1},
+        )
+        assert status == 201
+        assert locked["pinned_version"] == 1
+        status, context = request(
+            "GET", f"/api/comic/projects/{project_id}/context?asset_id={asset_id}",
+        )
+        assert status == 200
+        assert context["source_versions"][f"asset:{asset_id}"] == 1
+        status, versions = request(
+            "GET", f"/api/comic/projects/{project_id}/assets/{asset_id}/versions",
+        )
+        assert status == 200
+        assert [item["version"] for item in versions["versions"]] == [3, 2, 1]
+        status, listed = request("GET", f"/api/comic/projects/{project_id}/assets")
+        assert status == 200
+        assert [item["asset_id"] for item in listed["assets"]] == [asset_id]
         assert app.runtime_store.list_runs() == []
     finally:
         connection.close()

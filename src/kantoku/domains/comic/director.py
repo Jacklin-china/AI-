@@ -9,7 +9,7 @@ from pydantic import ValidationError
 
 from kantoku.config import ToolError
 
-from .models import ComicProjectSnapshot, DirectorSpecDraft
+from .models import ComicAsset, ComicProjectSnapshot, DirectorSpecDraft
 from .projects import ComicContextBuilder
 
 DirectorModel = Callable[[list[dict[str, str]]], str]
@@ -17,9 +17,10 @@ DirectorModel = Callable[[list[dict[str, str]]], str]
 
 def plan_director_spec(
     snapshot: ComicProjectSnapshot, *, task: str | None, model_call: DirectorModel,
+    assets: list[ComicAsset] | None = None,
 ) -> DirectorSpecDraft:
     """仅传 Project、当前 Brief、相关记忆和当前任务；不读取完整历史。"""
-    context = ComicContextBuilder.build(snapshot, task=task)
+    context = ComicContextBuilder.build(snapshot, task=task, assets=assets)
     messages = [
         {
             "role": "system",

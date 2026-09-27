@@ -16,6 +16,7 @@ from kantoku.config import ToolError
 from kantoku.core.runtime.models import utc_now
 
 from .models import (
+    ComicAsset,
     ComicContext,
     ComicProjectInput,
     ComicProjectSnapshot,
@@ -28,7 +29,7 @@ from .models import (
     ProjectStatus,
 )
 
-_SCHEMA_VERSION = 2
+_SCHEMA_VERSION = 3
 
 
 class ComicProjectStore:
@@ -97,9 +98,27 @@ class ComicProjectStore:
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
                     (1, utc_now().isoformat()),
                 )
-            if _SCHEMA_VERSION not in applied:
+            if 2 not in applied:
                 connection.execute("ALTER TABLE comic_projects ADD COLUMN director_id TEXT")
                 connection.execute("ALTER TABLE comic_projects ADD COLUMN director_version INTEGER")
+                connection.execute(
+                    "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
+                    (2, utc_now().isoformat()),
+                )
+            if _SCHEMA_VERSION not in applied:
+                connection.execute(
+                    "CREATE TABLE comic_assets ("
+                    "asset_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, "
+                    "kind TEXT NOT NULL CHECK(kind IN ('character','scene','style')), "
+                    "name TEXT NOT NULL, current_version INTEGER NOT NULL, "
+                    "state TEXT NOT NULL CHECK(state IN ('active','deleted')), "
+                    "pinned_version INTEGER, created_at TEXT NOT NULL, updated_at TEXT NOT NULL, "
+                    "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id))"
+                )
+                connection.execute(
+                    "CREATE INDEX idx_comic_assets_project ON comic_assets "
+                    "(project_id,kind,state)"
+                )
                 connection.execute(
                     "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
                     (_SCHEMA_VERSION, utc_now().isoformat()),
@@ -247,8 +266,10 @@ class ComicProjectStore:
             )
         return ComicProjectSnapshot(project=project, creative_brief=brief)
 
-    def get_director(self, project_id: str) -> DirectorSpec:
-        snapshot = self.get(project_id)
+    def get_director(
+        self, project_id: str, *, project_version: int | None = None,
+    ) -> DirectorSpec:
+        snapshot = self.get(project_id, version=project_version)
         project = snapshot.project
         if project.director_id is None or project.director_version is None:
             raise ToolError("当前作品尚无导演方案")
@@ -353,33 +374,67 @@ class ComicProjectStore:
 
 
 class ComicContextBuilder:
-    """从指定作品修订选择稳定上下文；不读取聊天全文或旧 Prompt。"""
+    """只组合调用方确实选中的导演方案与资产；不读聊天全文。"""
 
     @staticmethod
-    def build(snapshot: ComicProjectSnapshot, *, task: str | None = None) -> ComicContext:
+    def build(
+        snapshot: ComicProjectSnapshot, *, task: str | None = None,
+        director: DirectorSpec | None = None,
+        assets: list[ComicAsset] | None = None,
+    ) -> ComicContext:
         description = task.strip() if task is not None else None
         if description is not None and len(description) > 1000:
             raise ToolError("当前任务描述过长")
         project = snapshot.project
         brief = snapshot.creative_brief
+        stable_context = {
+            "project": {
+                "project_id": project.project_id,
+                "title": project.title,
+                "description": project.description,
+            },
+            "creative_brief": {
+                "original_request": brief.original_request,
+                "hard_constraints": brief.hard_constraints,
+                "soft_preferences": brief.soft_preferences,
+                "creative_freedom": brief.creative_freedom,
+            },
+        }
+        source_versions = {
+            "project": project.current_version,
+            "creative_brief": brief.version,
+        }
+        if director is not None:
+            if (director.project_id != project.project_id
+                    or director.creative_brief_version != brief.version):
+                raise ToolError("导演方案与当前作品或创作理解版本不一致")
+            stable_context["director_spec"] = director.model_dump(include={
+                "visual_direction", "storytelling_goal", "camera_language", "composition",
+                "lighting", "color_language", "emotion", "character_focus", "constraints",
+                "creative_choices",
+            })
+            source_versions["director_spec"] = director.version
+        if len(assets or []) > 8:
+            raise ToolError("单次上下文引用的资产过多")
+        relevant_memory: list[dict[str, object]] = []
+        seen_assets: set[str] = set()
+        for asset in assets or []:
+            if asset.asset_id in seen_assets:
+                raise ToolError("上下文中存在重复资产引用")
+            seen_assets.add(asset.asset_id)
+            if (asset.project_id != project.project_id
+                    or asset.project_version > project.current_version):
+                raise ToolError("资产与当前作品或版本不一致")
+            if asset.state != "active":
+                raise ToolError("已删除资产不能进入创作上下文")
+            relevant_memory.append(asset.model_dump(include={
+                "asset_id", "name", "aliases", "details", "fixed_constraints",
+                "reference_artifact_ids", "tags", "version",
+            }))
+            source_versions[f"asset:{asset.asset_id}"] = asset.version
         return ComicContext(
-            stable_context={
-                "project": {
-                    "project_id": project.project_id,
-                    "title": project.title,
-                    "description": project.description,
-                },
-                "creative_brief": {
-                    "original_request": brief.original_request,
-                    "hard_constraints": brief.hard_constraints,
-                    "soft_preferences": brief.soft_preferences,
-                    "creative_freedom": brief.creative_freedom,
-                },
-            },
-            relevant_memory=[],  # Phase 4/5 才有可验证的资产与镜头引用。
+            stable_context=stable_context,
+            relevant_memory=relevant_memory,
             current_task=description or None,
-            source_versions={
-                "project": project.current_version,
-                "creative_brief": brief.version,
-            },
+            source_versions=source_versions,
         )

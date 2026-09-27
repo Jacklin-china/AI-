@@ -160,6 +160,7 @@ class DirectorSpecRequest(BaseModel):
     expected_project_version: int = Field(ge=1)
     task: str | None = Field(default=None, max_length=1000)
     draft: DirectorSpecDraft | None = None
+    asset_ids: list[str] = Field(default_factory=list, max_length=8)
 
 
 class DirectorSpecRestore(BaseModel):
@@ -167,3 +168,114 @@ class DirectorSpecRestore(BaseModel):
 
     expected_project_version: int = Field(ge=1)
     version: int = Field(ge=1)
+
+
+class CharacterAsset(BaseModel):
+    """角色的稳定视觉锚点；未知细节保持空值，不由存储层猜测。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["character"] = "character"
+    appearance: str = Field(default="", max_length=2000)
+    outfit: str = Field(default="", max_length=2000)
+    features: list[BriefItem] = Field(default_factory=list, max_length=30)
+
+
+class SceneAsset(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["scene"] = "scene"
+    location: str = Field(default="", max_length=1000)
+    time_of_day: str = Field(default="", max_length=300)
+    weather: str = Field(default="", max_length=300)
+    lighting: str = Field(default="", max_length=1000)
+    atmosphere: str = Field(default="", max_length=1000)
+    environment_features: list[BriefItem] = Field(default_factory=list, max_length=30)
+
+
+class StyleBible(BaseModel):
+    """作品风格参考，不是固定提示词模板。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    kind: Literal["style"] = "style"
+    art_direction: str = Field(default="", max_length=2000)
+    color_language: str = Field(default="", max_length=1000)
+    materials: str = Field(default="", max_length=1000)
+    camera_language: str = Field(default="", max_length=1000)
+    lighting: str = Field(default="", max_length=1000)
+
+
+class ComicAssetDraft(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    name: ProjectText
+    aliases: list[BriefItem] = Field(default_factory=list, max_length=20)
+    details: Annotated[CharacterAsset | SceneAsset | StyleBible, Field(discriminator="kind")]
+    fixed_constraints: list[BriefItem] = Field(default_factory=list, max_length=50)
+    reference_artifact_ids: list[BriefItem] = Field(default_factory=list, max_length=20)
+    tags: list[BriefItem] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def check_asset(self) -> ComicAssetDraft:
+        for name in ("aliases", "fixed_constraints", "reference_artifact_ids", "tags"):
+            items = getattr(self, name)
+            if len(items) != len(set(items)):
+                raise ValueError(f"{name} 不允许重复")
+        content = self.details.model_dump(exclude={"kind"})
+        if not any(value for value in content.values()):
+            raise ValueError("资产至少需要一项实际描述")
+        return self
+
+
+class ComicAsset(ComicAssetDraft):
+    asset_id: str
+    project_id: str
+    version: int = Field(ge=1)
+    project_version: int = Field(ge=1)
+    created_at: datetime
+    state: Literal["active", "deleted"] = "active"
+    pinned_version: int | None = Field(default=None, ge=1)
+    source: Literal["created", "edited", "restored", "locked", "deleted"]
+    restored_from_version: int | None = Field(default=None, ge=1)
+
+
+class ComicAssetRef(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    asset_id: str = Field(min_length=1, max_length=100)
+    version: int | None = Field(default=None, ge=1)
+
+
+class ComicAssetCreateRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    asset: ComicAssetDraft
+
+
+class ComicAssetEditRequest(ComicAssetCreateRequest):
+    expected_asset_version: int = Field(ge=1)
+
+
+class ComicAssetVersionRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_asset_version: int = Field(ge=1)
+    version: int = Field(ge=1)
+
+
+class ComicAssetLockRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_asset_version: int = Field(ge=1)
+    version: int | None = Field(default=None, ge=1)
+
+
+class ComicAssetDeleteRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    expected_asset_version: int = Field(ge=1)
