@@ -44,7 +44,13 @@ from kantoku.capabilities.image import ConversationImageService
 from kantoku.capabilities.video import MockVideoProvider, VideoService
 from kantoku.capabilities.web_search import plan_web_search, search_web, visit_search_result
 from kantoku.config import KantokuError, ToolError, get_settings
-from kantoku.config.observability import current_trace_id, public_error, request_trace
+from kantoku.config.logging_setup import redact_secrets
+from kantoku.config.observability import (
+    current_trace_id,
+    public_error,
+    request_trace,
+    run_trace,
+)
 from kantoku.config.settings import (
     CONFIG_PATH,
     EXAMPLE_PATH,
@@ -73,7 +79,9 @@ from kantoku.core.runtime.models import (
     TERMINAL_STATUSES,
     ApprovalDecision,
     ArtifactType,
+    ExecutionStatus,
     RunRecord,
+    RuntimeEventType,
 )
 from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
@@ -360,6 +368,7 @@ class StudioApplication:
 
     def __init__(self) -> None:
         self.token = secrets.token_urlsafe(32)
+        self._instance_id = f"studio-{uuid4().hex}"
         self.lock = threading.Lock()
         self.job: dict[str, Any] = {"state": "idle"}
         configured = get_settings().storage.sqlite_path
@@ -1617,7 +1626,9 @@ class StudioApplication:
             )
         return [
             self._run_payload(record.id)
-            for record in records if record.id not in self._legacy_home_run_ids
+            for record in records
+            if record.id not in self._legacy_home_run_ids
+            and record.workflow != "comic.director-spec"
         ]
 
     def _legacy_autonomous_run_ids(self, records: list[RunRecord]) -> set[str]:
@@ -1694,10 +1705,15 @@ class StudioApplication:
 
     def create_comic_asset(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = ComicAssetCreateRequest.model_validate(data)
-        return self.comic_assets.create(
+        asset = self.comic_assets.create(
             project_id, request.asset,
             expected_project_version=request.expected_project_version,
-        ).model_dump(mode="json")
+        )
+        logger.bind(component="comic.assets", project_id=project_id).info(
+            "asset created asset_id={} kind={} version={} project_version={}",
+            asset.asset_id, asset.details.kind, asset.version, asset.project_version,
+        )
+        return asset.model_dump(mode="json")
 
     def get_comic_asset(
         self, project_id: str, asset_id: str, *, version: int | None = None,
@@ -1770,25 +1786,136 @@ class StudioApplication:
         snapshot = self.comic_projects.get(project_id)
         if snapshot.project.current_version != request.expected_project_version:
             raise ToolError("作品已由其他操作更新，请刷新后重试")
-        if request.draft is None:
-            assets = self.comic_assets.select_relevant(
-                project_id, task=request.task,
-                refs=[ComicAssetRef(asset_id=item) for item in request.asset_ids],
-                project_version=snapshot.project.current_version,
-            )
-            draft = plan_director_spec(
-                snapshot, task=request.task, model_call=self._comic_director_model,
-                assets=assets,
-            )
-            source = "model"
-        else:
-            draft = DirectorSpecDraft.model_validate(request.draft)
-            source = "manual"
-        spec = self.comic_projects.save_director(
-            project_id, draft, expected_project_version=request.expected_project_version,
-            source=source,
+        configured_model = get_settings().llm.model_chat
+        task_id = f"task-{uuid4().hex}"
+        trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
+        state: dict[str, Any] = {
+            "project_id": project_id, "task_id": task_id, "trace_id": trace_id,
+            "conversation_id": request.conversation_id,
+            "task_type": "director_spec", "task_status": "draft",
+            "last_completed_step": None,
+            "creative_brief_version": snapshot.creative_brief.version,
+            "project_version": snapshot.project.current_version,
+            "requested_asset_ids": request.asset_ids,
+            "configured_model": configured_model,
+            "worker_instance_id": self._instance_id,
+        }
+        run = self.runtime_store.create_run(
+            "comic", "comic.director-spec", state, "director_spec",
+            interaction_mode=InteractionMode.GUIDED,
         )
-        return spec.model_dump(mode="json")
+        self.runtime_store.append_event(
+            run.id, RuntimeEventType.RUN_STARTED, node_id="director_spec",
+            payload={"project_id": project_id, "task_id": task_id},
+        )
+
+        def step(status: str, completed_step: str | None) -> None:
+            state["task_status"] = status
+            state["last_completed_step"] = completed_step
+            self.runtime_store.update_run(
+                run.id, status=ExecutionStatus.RUNNING, state=state,
+                current_node="director_spec",
+            )
+            self.runtime_store.append_event(
+                run.id, RuntimeEventType.NODE_PROGRESS, node_id="director_spec",
+                payload={"task_status": status, "last_completed_step": completed_step},
+            )
+
+        with request_trace(trace_id), run_trace(run.id, "director_spec"), logger.contextualize(
+            component="comic.director", project_id=project_id, task_id=task_id,
+            conversation_id=request.conversation_id or "-",
+        ):
+            logger.info(
+                "task received task_type=director_spec brief_version={} created_at={} "
+                "user_input={}", snapshot.creative_brief.version,
+                run.started_at.isoformat(),
+                redact_secrets(request.task or snapshot.creative_brief.original_request)[:1000],
+            )
+            try:
+                step("planning", "brief_loaded")
+                if request.draft is None:
+                    assets = self.comic_assets.select_relevant(
+                        project_id, task=request.task,
+                        refs=[ComicAssetRef(asset_id=item) for item in request.asset_ids],
+                        project_version=snapshot.project.current_version,
+                    )
+                    state["selected_assets"] = [
+                        {"asset_id": asset.asset_id, "version": asset.version}
+                        for asset in assets
+                    ]
+                    logger.info(
+                        "context selected brief_version={} project_version={} assets={} "
+                        "context_scope=project,brief,relevant_assets,current_task "
+                        "model={}",
+                        snapshot.creative_brief.version, snapshot.project.current_version,
+                        state["selected_assets"], configured_model,
+                    )
+                    step("generating", "assets_selected")
+                    draft = plan_director_spec(
+                        snapshot, task=request.task, model_call=self._comic_director_model,
+                        assets=assets,
+                    )
+                    source = "model"
+                else:
+                    draft = DirectorSpecDraft.model_validate(request.draft)
+                    source = "manual"
+                step("checking", "director_draft_ready")
+                spec = self.comic_projects.save_director(
+                    project_id, draft, expected_project_version=request.expected_project_version,
+                    source=source,
+                )
+                state.update(
+                    task_status="completed", last_completed_step="director_spec_saved",
+                    director_spec_id=spec.spec_id, director_spec_version=spec.version,
+                )
+                self.runtime_store.update_run(
+                    run.id, status=ExecutionStatus.COMPLETED, state=state,
+                    current_node="director_spec",
+                )
+                self.runtime_store.append_event(
+                    run.id, RuntimeEventType.RUN_COMPLETED, node_id="director_spec",
+                    payload={"spec_id": spec.spec_id, "version": spec.version},
+                )
+                logger.info(
+                    "director spec saved source={} spec_id={} version={} brief_version={} "
+                    "decision_summary={}", source, spec.spec_id, spec.version,
+                    spec.creative_brief_version, redact_secrets(spec.visual_direction)[:300],
+                )
+                return spec.model_dump(mode="json")
+            except Exception as error:
+                failure = public_error(
+                    error, component="comic.director", project_id=project_id,
+                    run_id=run.id, task_id=task_id,
+                    brief_version=snapshot.creative_brief.version,
+                    asset_ids=request.asset_ids, model=configured_model,
+                )
+                error._kantoku_public_failure = failure
+                state.update(task_status="failed", error_id=failure["error_id"])
+                self.runtime_store.update_run(
+                    run.id, status=ExecutionStatus.FAILED, state=state,
+                    current_node="director_spec", error=failure["error_id"],
+                )
+                self.runtime_store.append_event(
+                    run.id, RuntimeEventType.RUN_FAILED, node_id="director_spec",
+                    payload={"error_id": failure["error_id"]},
+                )
+                raise
+
+    def list_comic_project_tasks(self, project_id: str) -> dict[str, Any]:
+        """从共享 Run Store 读取作品任务；重启后不重提模型请求。"""
+        self.comic_projects.get(project_id)
+        runs = self.runtime_store.list_runs(limit=100000, domain="comic")
+        tasks = []
+        for run in runs:
+            if run.workflow != "comic.director-spec" or run.state.get("project_id") != project_id:
+                continue
+            payload = self._run_payload(run.id)
+            payload["recovery_required"] = (
+                run.status is ExecutionStatus.RUNNING
+                and run.state.get("worker_instance_id") != self._instance_id
+            )
+            tasks.append(payload)
+        return {"tasks": tasks}
 
     def get_comic_director(self, project_id: str) -> dict[str, Any]:
         return self.comic_projects.get_director(project_id).model_dump(mode="json")
@@ -2060,7 +2187,15 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 self.send_header("Access-Control-Expose-Headers", "X-Trace-ID")
 
         def error_reply(self, status: int, error: Exception) -> None:
-            failure = public_error(error, component="api")
+            parts = urlsplit(self.path).path.removeprefix("/api").strip("/").split("/")
+            context: dict[str, Any] = {"component": "api"}
+            if len(parts) >= 3 and parts[:2] == ["comic", "projects"]:
+                context["project_id"] = parts[2]
+                if len(parts) >= 5 and parts[3] == "assets":
+                    context["asset_id"] = parts[4]
+            failure = getattr(error, "_kantoku_public_failure", None)
+            if failure is None:
+                failure = public_error(error, **context)
             self.json_reply(status, {**failure, "error": failure["safe_message"]})
 
         def reply(self, status: int, body: bytes, media_type: str) -> None:
@@ -2218,6 +2353,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(200, app.list_comic_assets(
                             comic_parts[2], project_version=version,
                         ))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "tasks":
+                        self.json_reply(200, app.list_comic_project_tasks(comic_parts[2]))
                     elif len(comic_parts) == 5 and comic_parts[3] == "assets":
                         self.json_reply(200, app.get_comic_asset(
                             comic_parts[2], comic_parts[4], version=version,

@@ -4,8 +4,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
-from time import perf_counter, sleep
+from time import monotonic, perf_counter, sleep
 from typing import Any, Literal
+from urllib.parse import urlsplit
 from uuid import uuid4
 
 from loguru import logger
@@ -143,6 +144,7 @@ def _request_with_retry(
     client: OpenAI,
     *,
     provider: str,
+    provider_host: str,
     retry: int,
     messages: Sequence[ChatCompletionMessageParam],
     model: str,
@@ -154,9 +156,11 @@ def _request_with_retry(
     extra_body: Mapping[str, Any] | None,
 ) -> ChatCompletion:
     """执行一次请求，并仅对可恢复错误做指数退避重试。"""
+    request_id = f"llm-{uuid4().hex[:12]}"
     for attempt in range(retry + 1):
+        started_at = monotonic()
         try:
-            return _request_once(
+            response = _request_once(
                 client,
                 messages=messages,
                 model=model,
@@ -167,7 +171,33 @@ def _request_with_retry(
                 tools=tools,
                 extra_body=extra_body,
             )
+            usage = response.usage
+            usage_reported = usage is not None and all(
+                type(value) is int and value >= 0
+                for value in (usage.prompt_tokens, usage.completion_tokens)
+            )
+            logger.bind(
+                component="llm", provider=provider_host, provider_role=provider,
+                request_id=request_id,
+            ).info(
+                "provider request completed model={} provider_request_id={} "
+                "input_tokens={} output_tokens={} usage_reported={} latency_ms={} "
+                "retry_count={}",
+                model, getattr(response, "id", "unknown"),
+                usage.prompt_tokens if usage_reported else "unknown",
+                usage.completion_tokens if usage_reported else "unknown",
+                usage_reported, round((monotonic() - started_at) * 1000), attempt,
+            )
+            return response
         except Exception as error:
+            logger.bind(
+                component="llm", provider=provider_host, provider_role=provider,
+                request_id=request_id,
+            ).warning(
+                "provider request failed model={} error_type={} latency_ms={} "
+                "retry_count={}", model, type(error).__name__,
+                round((monotonic() - started_at) * 1000), attempt,
+            )
             if not _is_retryable(error) or attempt == retry:
                 raise
 
@@ -240,6 +270,7 @@ def _call_provider(
         response = _request_with_retry(
             client,
             provider=provider,
+            provider_host=urlsplit(base_url).hostname or "unknown",
             retry=retry,
             messages=messages,
             model=model,

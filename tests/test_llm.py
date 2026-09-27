@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, call
 
 import pytest
+from loguru import logger
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AuthenticationError
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageParam
 
@@ -78,7 +79,9 @@ def _settings() -> Settings:
 def _response(content: str = "你好") -> SimpleNamespace:
     message = ChatCompletionMessage(role="assistant", content=content)
     usage = SimpleNamespace(prompt_tokens=12, completion_tokens=7)
-    return SimpleNamespace(choices=[SimpleNamespace(message=message)], usage=usage)
+    return SimpleNamespace(
+        id="provider-response-test", choices=[SimpleNamespace(message=message)], usage=usage,
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -191,6 +194,30 @@ def test_chat_retries_connection_error_with_increasing_delay(
     assert [record.ok for record in records] == [False, False, True]
     assert [record.usage_reported for record in records] == [False, False, True]
     assert all(record.kind == "llm.chat.attempt" for record in records)
+
+
+def test_chat_logs_provider_usage_latency_and_retry_without_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.chat.completions.create.side_effect = [
+        APIConnectionError(request=MagicMock()), _response(),
+    ]
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+    monkeypatch.setattr(llm_module, "sleep", lambda _seconds: None)
+    records: list[dict[str, object]] = []
+    sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    try:
+        llm_module.chat([{"role": "user", "content": "private user text"}])
+    finally:
+        logger.remove(sink)
+    attempts = [item for item in records if "provider request" in item["message"]]
+    assert len(attempts) == 2
+    assert attempts[0]["extra"]["request_id"] == attempts[1]["extra"]["request_id"]
+    assert "retry_count=1" in attempts[1]["message"]
+    assert "input_tokens=12" in attempts[1]["message"]
+    assert "provider_request_id=provider-response-test" in attempts[1]["message"]
+    assert "private user text" not in " ".join(item["message"] for item in attempts)
 
 
 def test_chat_uses_fallback_for_missing_primary_model(

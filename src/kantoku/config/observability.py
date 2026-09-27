@@ -100,8 +100,12 @@ def public_error(error: Exception, **context: Any) -> dict[str, Any]:
     stack = redact_secrets("".join(traceback.format_exception(error)))
     trace_id = str(context.pop("trace_id", None) or current_trace_id() or "-")
     logger.bind(error_id=error_id, trace_id=trace_id, **context).error(
-        "operation failed kind={} exception={} detail={} traceback={} cause={}",
-        kind.value, type(error).__name__, redact_secrets(str(error))[:500], stack,
+        "operation failed error_id={} kind={} exception={} detail={} "
+        "scope={} traceback={} cause={}",
+        error_id, kind.value, type(error).__name__, redact_secrets(str(error))[:500],
+        {key: value for key, value in context.items()
+         if key in {"project_id", "run_id", "task_id", "asset_id", "brief_version", "model"}},
+        stack,
         type(error.__cause__).__name__ if error.__cause__ else "-",
     )
     return {

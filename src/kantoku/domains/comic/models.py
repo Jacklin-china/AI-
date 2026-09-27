@@ -161,6 +161,7 @@ class DirectorSpecRequest(BaseModel):
     task: str | None = Field(default=None, max_length=1000)
     draft: DirectorSpecDraft | None = None
     asset_ids: list[str] = Field(default_factory=list, max_length=8)
+    conversation_id: str | None = Field(default=None, max_length=100)
 
 
 class DirectorSpecRestore(BaseModel):

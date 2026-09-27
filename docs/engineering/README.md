@@ -95,7 +95,13 @@ HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id
 
 DirectorSpec 与 `project_id`、`creative_brief_version` 绑定，在原有 `comic_entity_versions` 中追加不可变修订；迁移 v2 仅给 `comic_projects` 增加当前导演方案的 ID/版本指针，不改变旧业务表。Brief 实质更新会清除当前指针，但保留全部旧导演修订；旧 Brief 下的方案可查看，不可直接恢复为新版 Brief 的当前方案。恢复会复制旧内容成为**新修订**，不覆盖历史；提交需要当前作品版本以防并发覆盖。`source` 标明模型生成、人工编辑或历史恢复。
 
-HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Run、Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
+HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
+
+### 漫剧任务追踪补充（Storyboard 前）
+
+DirectorSpec 创建沿用 Core `runs` 与 `run_events`，每次请求有独立 `run_id`、`task_id`、`trace_id`、`project_id`；`state` 保存 `task_type`、`task_status`、`last_completed_step`、Brief/作品版本、选中资产 ID 与版本，失败时保存 `error_id`。领域任务状态词预留 `draft/planning/generating/checking/completed/failed`，目前只有 DirectorSpec 的实际步骤会推进这些状态；不把未来 Storyboard/Image/QC/Repair 冒充已实现。Run 的通用状态仍由 `ExecutionStatus` 管理。`GET /api/comic/projects/{id}/tasks` 从原有 Run Store 按作品读取；进程重启后可查询最后持久化状态，旧实例遗留的运行中任务标记 `recovery_required`，但**不会自动重发未确认的模型调用**。这些轻量追踪 Run 不进入生产任务中心，也不能通过 Graph Workflow resume 误启动。
+
+`data/logs/kantoku.log` 的结构化记录包含公开的任务输入摘要（脱敏且最多 1000 字）、创建时间、Brief 版本、上下文范围、资产选取原因与版本、模型请求 ID/供应商响应 ID、token 用量（未知时明示 unknown）、耗时与重试次数。错误经现有 `public_error` 记录 `trace_id`、`error_id`、异常类型和脱敏 traceback；HTTP 仅返回安全错误。`conversation_id` 仅在调用方传入时关联，独立作品 API 不伪造会话 ID。资产引用缺失时日志包含项目与资产 ID；不写 Secret、私有思维链或完整模型上下文。未来 Storyboard/Shot 生图/QC/Repair 应沿用同一 Run/事件与上下文约定，并按真实步骤推进状态，不另建 ComicRuntime 或 ComicTaskManager。
 
 ### Phase 4：小范围资产研究与实现
 

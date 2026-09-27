@@ -97,6 +97,7 @@ def setup_logging(level: str | None = None) -> None:
         level=console_level,
         format=("<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
                 "{extra[component]} | trace={extra[trace_id]} | "
+                "project={extra[project_id]} run={extra[run_id]} task={extra[task_id]} | "
                 "<cyan>{module}:{line}</cyan> | {message}"),
         colorize=None,
         diagnose=False,
@@ -116,7 +117,7 @@ def setup_logging(level: str | None = None) -> None:
     logger.configure(extra={
         "component": "app", "trace_id": "-", "conversation_id": "-", "run_id": "-", "node_id": "-",
         "message_id": "-", "skill": "-", "provider": "-", "provider_request_id": "-",
-        "request_id": "-", "error_id": "-",
+        "request_id": "-", "error_id": "-", "project_id": "-", "task_id": "-",
     })
 
 

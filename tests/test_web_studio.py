@@ -14,6 +14,7 @@ from types import SimpleNamespace
 from urllib.parse import quote
 
 import pytest
+from loguru import logger
 from test_image_gen import _settings
 
 from kantoku.capabilities import creative
@@ -27,6 +28,7 @@ from kantoku.core.conversations import (
     MessageType,
 )
 from kantoku.core.runtime.models import ArtifactType, ExecutionStatus
+from kantoku.core.runtime.store import RuntimeStore
 from kantoku.domains.comic import services as comic_services
 from kantoku.perception import report, review
 from kantoku.schemas.media import ImageGenerationResult
@@ -2002,9 +2004,136 @@ def test_comic_director_api_generates_edits_lists_and_restores(
         assert restored["version"] == 3
         assert restored["restored_from_version"] == 1
         assert restored["lighting"] == first["lighting"]
-        assert app.runtime_store.list_runs() == []
+        tasks = app.list_comic_project_tasks(project_id)["tasks"]
+        assert len(tasks) == 2
+        assert all(item["status"] == "completed" for item in tasks)
+        assert all(item["state"]["last_completed_step"] == "director_spec_saved"
+                   for item in tasks)
+        assert app.list_core_runs() == []  # lightweight director tracking is not a production Run
     finally:
         connection.close()
+
+
+def test_comic_director_failure_logs_and_survives_restart(
+    server: int, app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {
+        "X-Studio-Token": app.token, "Content-Type": "application/json",
+        "X-Trace-ID": "trace-director-failure",
+    }
+    records: list[dict[str, object]] = []
+    sink = logger.add(lambda message: records.append(message.record), level="DEBUG")
+    model_calls: list[object] = []
+
+    def invalid_model(messages: object) -> str:
+        model_calls.append(messages)
+        return "not json"
+
+    monkeypatch.setattr(app, "_comic_director_model", invalid_model)
+    try:
+        connection.request("POST", "/api/comic/projects", body=json.dumps({
+            "title": "雨夜战斗", "brief": {"original_request": "少女在雨夜战斗"},
+        }), headers=headers)
+        response = connection.getresponse()
+        project_id = json.loads(response.read())["project"]["project_id"]
+        connection.request(
+            "POST", f"/api/comic/projects/{project_id}/director-spec",
+            body=json.dumps({"expected_project_version": 1, "task": "设计战斗镜头"}),
+            headers=headers,
+        )
+        response = connection.getresponse()
+        failure = json.loads(response.read())
+        assert response.status == 400
+        assert failure["error_id"].startswith("ERR-")
+        assert failure["trace_id"] == "trace-director-failure"
+        runs = [
+            run for run in RuntimeStore(app.runtime_store.path).list_runs(domain="comic")
+            if run.workflow == "comic.director-spec"
+        ]
+        assert len(runs) == 1
+        run = runs[0]
+        assert run.status is ExecutionStatus.FAILED
+        assert run.state["project_id"] == project_id
+        assert run.state["task_id"].startswith("task-")
+        assert run.state["creative_brief_version"] == 1
+        assert run.state["last_completed_step"] == "assets_selected"
+        assert run.state["error_id"] == failure["error_id"]
+        assert RuntimeStore(app.runtime_store.path).list_events(run.id)[-1].event_type.value \
+            == "run_failed"
+        error_records = [item for item in records if item["extra"].get("error_id")
+                         == failure["error_id"]]
+        assert len(error_records) == 1
+        assert error_records[0]["extra"]["project_id"] == project_id
+        assert error_records[0]["extra"]["run_id"] == run.id
+        assert "director.py" in error_records[0]["message"]
+        connection.request("GET", f"/api/comic/projects/{project_id}/tasks", headers=headers)
+        response = connection.getresponse()
+        assert response.status == 200
+        assert json.loads(response.read())["tasks"][0]["id"] == run.id
+        restarted = web_studio.StudioApplication()
+        assert restarted.list_comic_project_tasks(project_id)["tasks"][0]["state"]["error_id"] \
+            == failure["error_id"]
+        assert len(model_calls) == 1  # querying after restart must not submit again
+    finally:
+        logger.remove(sink)
+        connection.close()
+
+
+def test_comic_missing_asset_error_identifies_project_and_asset(
+    server: int, app: web_studio.StudioApplication,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+    records: list[dict[str, object]] = []
+    sink = logger.add(lambda message: records.append(message.record), level="ERROR")
+    try:
+        connection.request("POST", "/api/comic/projects", body=json.dumps({
+            "title": "竹林", "brief": {"original_request": "竹林里的角色"},
+        }), headers=headers)
+        response = connection.getresponse()
+        project_id = json.loads(response.read())["project"]["project_id"]
+        connection.request(
+            "GET", f"/api/comic/projects/{project_id}/assets/missing-asset", headers=headers,
+        )
+        response = connection.getresponse()
+        failure = json.loads(response.read())
+        assert response.status == 400
+        match = next(item for item in records
+                     if item["extra"].get("error_id") == failure["error_id"])
+        assert match["extra"]["project_id"] == project_id
+        assert match["extra"]["asset_id"] == "missing-asset"
+        assert "assets.py" in match["message"]
+    finally:
+        logger.remove(sink)
+        connection.close()
+
+
+def test_comic_director_interrupted_task_keeps_checkpoint_without_resubmit(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = app.create_comic_project({
+        "title": "雨夜镜头", "brief": {"original_request": "雨夜中的少女"},
+    })
+    project_id = created["project"]["project_id"]
+    calls: list[object] = []
+
+    def interrupted(messages: object) -> str:
+        calls.append(messages)
+        raise SystemExit("simulated process stop")
+
+    monkeypatch.setattr(app, "_comic_director_model", interrupted)
+    with pytest.raises(SystemExit):
+        app.create_comic_director(project_id, {"expected_project_version": 1})
+
+    restarted = web_studio.StudioApplication()
+    task = restarted.list_comic_project_tasks(project_id)["tasks"][0]
+    assert task["status"] == "running"
+    assert task["state"]["task_status"] == "generating"
+    assert task["state"]["last_completed_step"] == "assets_selected"
+    assert task["state"]["trace_id"].startswith("trace-")
+    assert task["recovery_required"] is True
+    assert len(calls) == 1
 
 
 def test_comic_asset_api_versions_and_bounded_context(

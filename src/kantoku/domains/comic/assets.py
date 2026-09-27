@@ -7,6 +7,8 @@ from collections.abc import Sequence
 from typing import Literal
 from uuid import uuid4
 
+from loguru import logger
+
 from kantoku.config import ToolError
 from kantoku.core.runtime.models import ArtifactType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
@@ -37,7 +39,7 @@ class ComicAssetStore:
             (project_id, asset_id),
         ).fetchone()
         if row is None:
-            raise ToolError("找不到指定作品资产")
+            raise ToolError("找不到指定作品资产", detail=asset_id)
         return ComicAsset.model_validate_json(self.projects._version_payload(
             connection, project_id, "comic_asset", asset_id, int(row["current_version"]),
         ))
@@ -250,8 +252,9 @@ class ComicAssetStore:
         available = self.list(project_id, project_version=snapshot.project.current_version)
         by_id = {asset.asset_id: asset for asset in available}
         selected: dict[str, ComicAsset] = {}
+        reasons: dict[str, str] = {}
 
-        def add(asset: ComicAsset, *, version: int | None = None) -> None:
+        def add(asset: ComicAsset, *, version: int | None = None, reason: str) -> None:
             if asset.asset_id in selected:
                 return
             resolved_version = version if version is not None else asset.pinned_version
@@ -260,12 +263,13 @@ class ComicAssetStore:
                     or resolved.project_version > snapshot.project.current_version):
                 raise ToolError("引用的资产版本不可用于当前作品上下文")
             selected[asset.asset_id] = resolved
+            reasons[asset.asset_id] = reason
 
         for ref in refs:
             asset = by_id.get(ref.asset_id)
             if asset is None:
-                raise ToolError("引用的资产不属于当前作品或已删除")
-            add(asset, version=ref.version)
+                raise ToolError("引用的资产不属于当前作品或已删除", detail=ref.asset_id)
+            add(asset, version=ref.version, reason="explicit_reference")
         if task:
             lowered = task.casefold()
             for asset in available:
@@ -273,8 +277,18 @@ class ComicAssetStore:
                     break
                 names = [asset.name, *asset.aliases]
                 if any(len(name) >= 2 and name.casefold() in lowered for name in names):
-                    add(asset)
+                    add(asset, reason="name_or_alias_match")
         styles = [asset for asset in available if asset.details.kind == "style"]
         if len(styles) == 1 and len(selected) < limit:
-            add(styles[0])
+            add(styles[0], reason="single_project_style")
+        logger.bind(component="comic.assets", project_id=project_id).info(
+            "context assets selected project_version={} assets={}",
+            snapshot.project.current_version,
+            [
+                {"asset_id": asset.asset_id, "kind": asset.details.kind,
+                 "version": asset.version,
+                 "reason": reasons[asset.asset_id]}
+                for asset in selected.values()
+            ],
+        )
         return list(selected.values())
