@@ -79,7 +79,14 @@ from kantoku.core.runtime.runner import TaskRunner
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
-from kantoku.domains.comic.models import ComicProjectInput, CreativeBriefUpdate
+from kantoku.domains.comic.director import plan_director_spec
+from kantoku.domains.comic.models import (
+    ComicProjectInput,
+    CreativeBriefUpdate,
+    DirectorSpecDraft,
+    DirectorSpecRequest,
+    DirectorSpecRestore,
+)
 from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
 from kantoku.domains.comic.services import StudioComicServices
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
@@ -1664,6 +1671,47 @@ class StudioApplication:
         snapshot = self.comic_projects.get(project_id, version=version)
         return ComicContextBuilder.build(snapshot, task=task).model_dump(mode="json")
 
+    @staticmethod
+    def _comic_director_model(messages: list[dict[str, str]]) -> str:
+        """共享文本模型入口；Comic Domain 不持有 Provider 客户端。"""
+        return chat(messages, response_format={"type": "json_object"}).content or ""
+
+    def create_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = DirectorSpecRequest.model_validate(data)
+        snapshot = self.comic_projects.get(project_id)
+        if snapshot.project.current_version != request.expected_project_version:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        if request.draft is None:
+            draft = plan_director_spec(
+                snapshot, task=request.task, model_call=self._comic_director_model,
+            )
+            source = "model"
+        else:
+            draft = DirectorSpecDraft.model_validate(request.draft)
+            source = "manual"
+        spec = self.comic_projects.save_director(
+            project_id, draft, expected_project_version=request.expected_project_version,
+            source=source,
+        )
+        return spec.model_dump(mode="json")
+
+    def get_comic_director(self, project_id: str) -> dict[str, Any]:
+        return self.comic_projects.get_director(project_id).model_dump(mode="json")
+
+    def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:
+        return {"versions": [
+            spec.model_dump(mode="json")
+            for spec in self.comic_projects.director_versions(project_id)
+        ]}
+
+    def restore_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = DirectorSpecRestore.model_validate(data)
+        spec = self.comic_projects.restore_director(
+            project_id, version=request.version,
+            expected_project_version=request.expected_project_version,
+        )
+        return spec.model_dump(mode="json")
+
     def _run_payload(self, run_id: str) -> dict[str, Any]:
         run = self.runtime_store.get_run(run_id)
         payload = run.model_dump(mode="json")
@@ -2071,6 +2119,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                             comic_parts[2], task=query.get("task", [None])[0],
                             version=version,
                         ))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "director-spec":
+                        self.json_reply(200, app.get_comic_director(comic_parts[2]))
+                    elif len(comic_parts) == 5 and comic_parts[3:] == [
+                        "director-spec", "versions",
+                    ]:
+                        self.json_reply(200, app.list_comic_director_versions(comic_parts[2]))
                     else:
                         self.json_reply(404, {"error": "Comic API 路径不存在"})
                 elif request_path == "/api/runs":
@@ -2183,12 +2237,19 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 data = json.loads(self.rfile.read(length))
                 request_path = urlsplit(self.path).path
                 if not isinstance(data, dict) or not (
-                    request_path.startswith("/api/") or request_path == "/comic/projects"
+                    request_path.startswith(("/api/", "/comic/projects"))
                 ):
                     raise ToolError("请求格式不合法")
                 parts = request_path.strip("/").split("/")
+                comic_parts = request_path.removeprefix("/api").strip("/").split("/")
                 if request_path in {"/api/comic/projects", "/comic/projects"}:
                     self.json_reply(201, app.create_comic_project(data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 4 \
+                        and comic_parts[3] == "director-spec":
+                    self.json_reply(201, app.create_comic_director(comic_parts[2], data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
+                        and comic_parts[3:] == ["director-spec", "restore"]:
+                    self.json_reply(201, app.restore_comic_director(comic_parts[2], data))
                 elif request_path == "/api/runs":
                     self.json_reply(201, app.create_core_run(data))
                 elif request_path == "/api/conversations":

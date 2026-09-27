@@ -1920,3 +1920,87 @@ def test_comic_project_api_persists_brief_versions_and_context(
         assert app.runtime_store.list_runs() == []
     finally:
         connection.close()
+
+
+def test_comic_director_api_generates_edits_lists_and_restores(
+    server: int, app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(
+        method: str, path: str, payload: dict[str, object] | None = None,
+    ) -> tuple[int, dict[str, object]]:
+        connection.request(
+            method, path, body=None if payload is None else json.dumps(payload), headers=headers,
+        )
+        response = connection.getresponse()
+        return response.status, json.loads(response.read())
+
+    draft: dict[str, object] = {
+        "visual_direction": "东方仙侠电影感，突出人物在雨夜的孤独",
+        "storytelling_goal": "展现少女独自迎战的决心",
+        "camera_language": "远景建立环境，再靠近人物情绪",
+        "composition": "让环境空间强化人物与世界关系",
+        "lighting": "冷色雨光与人物局部暖光",
+        "color_language": "冷色背景，少量暖色引导视线",
+        "emotion": "孤独与战斗张力",
+        "character_focus": "少女的仙侠身份和行动决心",
+        "constraints": ["东方仙侠"],
+        "creative_choices": ["先交代环境，再靠近人物以突出情绪转折。"],
+    }
+    seen: list[list[dict[str, str]]] = []
+
+    def model_call(messages: list[dict[str, str]]) -> str:
+        seen.append(messages)
+        return json.dumps(draft, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", model_call)
+    try:
+        status, created = request("POST", "/api/comic/projects", {
+            "title": "东方仙侠少女雨夜战斗场景",
+            "brief": {
+                "original_request": "制作一个东方仙侠少女雨夜战斗场景",
+                "hard_constraints": ["东方仙侠", "少女", "雨夜", "战斗"],
+            },
+        })
+        assert status == 201
+        project_id = created["project"]["project_id"]
+        status, first = request(
+            "POST", f"/api/comic/projects/{project_id}/director-spec",
+            {"expected_project_version": 1, "task": "设计雨夜战斗"},
+        )
+        assert status == 201
+        assert first["source"] == "model"
+        assert first["creative_brief_version"] == 1
+        assert first["constraints"] == ["东方仙侠", "少女", "雨夜", "战斗"]
+        assert "设计雨夜战斗" in seen[0][1]["content"]
+
+        edited = {**first, "lighting": "更柔和的雨夜侧光"}
+        edited = {key: value for key, value in edited.items() if key in draft}
+        status, second = request(
+            "POST", f"/comic/projects/{project_id}/director-spec",
+            {"expected_project_version": 2, "draft": edited},
+        )
+        assert status == 201
+        assert second["version"] == 2
+        assert second["source"] == "manual"
+        status, current = request("GET", f"/api/comic/projects/{project_id}/director-spec")
+        assert status == 200
+        assert current == second
+        status, versions = request(
+            "GET", f"/api/comic/projects/{project_id}/director-spec/versions",
+        )
+        assert status == 200
+        assert [item["version"] for item in versions["versions"]] == [2, 1]
+        status, restored = request(
+            "POST", f"/api/comic/projects/{project_id}/director-spec/restore",
+            {"expected_project_version": 3, "version": 1},
+        )
+        assert status == 201
+        assert restored["version"] == 3
+        assert restored["restored_from_version"] == 1
+        assert restored["lighting"] == first["lighting"]
+        assert app.runtime_store.list_runs() == []
+    finally:
+        connection.close()

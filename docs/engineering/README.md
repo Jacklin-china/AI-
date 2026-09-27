@@ -89,6 +89,14 @@ HTTP 入口为 `POST /api/comic/projects`、`GET /api/comic/projects/{project_id
 
 本次迁移只建新表，不导入、改写或删除旧 `shot/persona/recipe`、StudioTask、账单、Run、Artifact；旧入口保持原样。历史数据自动归属作品会出现同名冲突，因此必须等待显式映射与对照测试，不能按作品名猜测迁移。
 
+### Phase 3 已实现的导演决策边界
+
+`domains/comic/director.py` 使用 Phase 2 的 `ComicContextBuilder`，只把当前 Project、CreativeBrief、可验证的相关记忆与当前任务送往现有共享 `core.llm.chat`。目前相关资产尚未接入，所以 `relevant_memory` 为空；不会把全量聊天、旧作品或旧 Prompt 偷渡给模型。模型返回的是结构化、可编辑的 DirectorSpec（叙事目标、视觉方向、镜头语言、构图、光影、色彩、情绪、角色重点、约束与创作选择原因），**不是生图 Prompt**。导演指令禁止固定情绪词到摄影公式的映射；用户硬约束由服务补齐并在存储层再次检查，人工编辑也不能遗漏。
+
+DirectorSpec 与 `project_id`、`creative_brief_version` 绑定，在原有 `comic_entity_versions` 中追加不可变修订；迁移 v2 仅给 `comic_projects` 增加当前导演方案的 ID/版本指针，不改变旧业务表。Brief 实质更新会清除当前指针，但保留全部旧导演修订；旧 Brief 下的方案可查看，不可直接恢复为新版 Brief 的当前方案。恢复会复制旧内容成为**新修订**，不覆盖历史；提交需要当前作品版本以防并发覆盖。`source` 标明模型生成、人工编辑或历史恢复。
+
+HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Run、Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

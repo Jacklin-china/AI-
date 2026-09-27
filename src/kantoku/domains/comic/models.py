@@ -98,6 +98,8 @@ class CreativeProject(BaseModel):
     current_version: int = Field(ge=1)
     brief_id: str
     brief_version: int = Field(ge=1)
+    director_id: str | None = None
+    director_version: int | None = Field(default=None, ge=1)
 
 
 class CreativeBrief(CreativeBriefInput):
@@ -123,3 +125,45 @@ class ComicContext(BaseModel):
     relevant_memory: list[dict[str, Any]]
     current_task: str | None
     source_versions: dict[str, int]
+
+
+class DirectorSpecDraft(BaseModel):
+    """可编辑的导演决策，不包含供应商 Prompt 或生成参数。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    visual_direction: BriefText
+    storytelling_goal: BriefText
+    camera_language: BriefText
+    composition: BriefText
+    lighting: BriefText
+    color_language: BriefText
+    emotion: BriefText
+    character_focus: BriefText
+    constraints: list[BriefItem] = Field(default_factory=list, max_length=50)
+    creative_choices: list[BriefItem] = Field(min_length=1, max_length=20)
+
+
+class DirectorSpec(DirectorSpecDraft):
+    spec_id: str
+    project_id: str
+    creative_brief_version: int = Field(ge=1)
+    version: int = Field(ge=1)
+    created_at: datetime
+    source: Literal["model", "manual", "restored"]
+    restored_from_version: int | None = Field(default=None, ge=1)
+
+
+class DirectorSpecRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    task: str | None = Field(default=None, max_length=1000)
+    draft: DirectorSpecDraft | None = None
+
+
+class DirectorSpecRestore(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    expected_project_version: int = Field(ge=1)
+    version: int = Field(ge=1)

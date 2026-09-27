@@ -7,6 +7,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
+from typing import Literal
 from uuid import uuid4
 
 from pydantic import ValidationError
@@ -22,10 +23,12 @@ from .models import (
     CreativeBriefInput,
     CreativeBriefUpdate,
     CreativeProject,
+    DirectorSpec,
+    DirectorSpecDraft,
     ProjectStatus,
 )
 
-_SCHEMA_VERSION = 1
+_SCHEMA_VERSION = 2
 
 
 class ComicProjectStore:
@@ -65,36 +68,42 @@ class ComicProjectStore:
                 "CREATE TABLE IF NOT EXISTS comic_schema_migrations "
                 "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
             )
-            applied = connection.execute(
-                "SELECT 1 FROM comic_schema_migrations WHERE version=?", (_SCHEMA_VERSION,)
-            ).fetchone()
-            if applied is not None:
-                return
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS comic_projects ("
-                "project_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, "
-                "status TEXT NOT NULL CHECK(status IN "
-                "('draft','planning','production','completed','archived')), "
-                "current_version INTEGER NOT NULL CHECK(current_version > 0), "
-                "brief_id TEXT NOT NULL, brief_version INTEGER NOT NULL "
-                "CHECK(brief_version > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
-            )
-            connection.execute(
-                "CREATE TABLE IF NOT EXISTS comic_entity_versions ("
-                "project_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, "
-                "version INTEGER NOT NULL CHECK(version > 0), payload_json TEXT NOT NULL, "
-                "created_at TEXT NOT NULL, "
-                "PRIMARY KEY(project_id, entity_type, entity_id, version), "
-                "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id))"
-            )
-            connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_comic_entity_latest ON comic_entity_versions "
-                "(project_id, entity_type, entity_id, version DESC)"
-            )
-            connection.execute(
-                "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
-                (_SCHEMA_VERSION, utc_now().isoformat()),
-            )
+            applied = {int(row["version"]) for row in connection.execute(
+                "SELECT version FROM comic_schema_migrations"
+            )}
+            if 1 not in applied:
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS comic_projects ("
+                    "project_id TEXT PRIMARY KEY, title TEXT NOT NULL, description TEXT NOT NULL, "
+                    "status TEXT NOT NULL CHECK(status IN "
+                    "('draft','planning','production','completed','archived')), "
+                    "current_version INTEGER NOT NULL CHECK(current_version > 0), "
+                    "brief_id TEXT NOT NULL, brief_version INTEGER NOT NULL "
+                    "CHECK(brief_version > 0), created_at TEXT NOT NULL, updated_at TEXT NOT NULL)"
+                )
+                connection.execute(
+                    "CREATE TABLE IF NOT EXISTS comic_entity_versions ("
+                    "project_id TEXT NOT NULL, entity_type TEXT NOT NULL, entity_id TEXT NOT NULL, "
+                    "version INTEGER NOT NULL CHECK(version > 0), payload_json TEXT NOT NULL, "
+                    "created_at TEXT NOT NULL, "
+                    "PRIMARY KEY(project_id, entity_type, entity_id, version), "
+                    "FOREIGN KEY(project_id) REFERENCES comic_projects(project_id))"
+                )
+                connection.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_comic_entity_latest ON comic_entity_versions "
+                    "(project_id, entity_type, entity_id, version DESC)"
+                )
+                connection.execute(
+                    "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
+                    (1, utc_now().isoformat()),
+                )
+            if _SCHEMA_VERSION not in applied:
+                connection.execute("ALTER TABLE comic_projects ADD COLUMN director_id TEXT")
+                connection.execute("ALTER TABLE comic_projects ADD COLUMN director_version INTEGER")
+                connection.execute(
+                    "INSERT INTO comic_schema_migrations(version,applied_at) VALUES (?,?)",
+                    (_SCHEMA_VERSION, utc_now().isoformat()),
+                )
 
     @staticmethod
     def _insert_version(
@@ -217,9 +226,11 @@ class ComicProjectStore:
             project = current.project.model_copy(update={
                 "updated_at": now, "current_version": current_version + 1,
                 "brief_version": brief.version,
+                "director_id": None, "director_version": None,
             })
             connection.execute(
-                "UPDATE comic_projects SET current_version=?,brief_version=?,updated_at=? "
+                "UPDATE comic_projects SET current_version=?,brief_version=?,updated_at=?,"
+                "director_id=NULL,director_version=NULL "
                 "WHERE project_id=? AND current_version=?",
                 (project.current_version, brief.version, now.isoformat(),
                  project_id, current_version),
@@ -235,6 +246,110 @@ class ComicProjectStore:
                 payload_json=project.model_dump_json(), created_at=now,
             )
         return ComicProjectSnapshot(project=project, creative_brief=brief)
+
+    def get_director(self, project_id: str) -> DirectorSpec:
+        snapshot = self.get(project_id)
+        project = snapshot.project
+        if project.director_id is None or project.director_version is None:
+            raise ToolError("当前作品尚无导演方案")
+        with self._connect() as connection:
+            return DirectorSpec.model_validate_json(self._version_payload(
+                connection, project_id, "director_spec", project.director_id,
+                project.director_version,
+            ))
+
+    def director_versions(self, project_id: str) -> list[DirectorSpec]:
+        snapshot = self.get(project_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM comic_entity_versions "
+                "WHERE project_id=? AND entity_type='director_spec' ORDER BY version DESC",
+                (snapshot.project.project_id,),
+            ).fetchall()
+        return [DirectorSpec.model_validate_json(row["payload_json"]) for row in rows]
+
+    def save_director(
+        self, project_id: str, draft: DirectorSpecDraft, *,
+        expected_project_version: int,
+        source: Literal["model", "manual", "restored"] = "manual",
+        restored_from_version: int | None = None,
+    ) -> DirectorSpec:
+        """CAS 追加导演修订；Brief 改动会清除当前指针但保留历史。"""
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,)
+            ).fetchone()
+            if row is None:
+                raise ToolError("找不到指定漫剧作品")
+            current_version = int(row["current_version"])
+            if current_version != expected_project_version:
+                raise ToolError("作品已由其他操作更新，请刷新后重试")
+            snapshot = self._snapshot(connection, project_id, current_version)
+            project = snapshot.project
+            missing = [
+                item for item in snapshot.creative_brief.hard_constraints
+                if item not in draft.constraints
+            ]
+            if missing:
+                raise ToolError("导演方案不得遗漏创作理解中的硬约束")
+            version_row = connection.execute(
+                "SELECT entity_id,version FROM comic_entity_versions "
+                "WHERE project_id=? AND entity_type='director_spec' "
+                "ORDER BY version DESC LIMIT 1", (project_id,),
+            ).fetchone()
+            spec_id = (
+                str(version_row["entity_id"])
+                if version_row else f"comic-director-{uuid4().hex}"
+            )
+            next_version = int(version_row["version"]) + 1 if version_row else 1
+            now = utc_now()
+            spec = DirectorSpec(
+                **draft.model_dump(), spec_id=spec_id, project_id=project_id,
+                creative_brief_version=snapshot.creative_brief.version,
+                version=next_version, created_at=now, source=source,
+                restored_from_version=restored_from_version,
+            )
+            revised = project.model_copy(update={
+                "director_id": spec_id, "director_version": next_version,
+                "current_version": current_version + 1, "updated_at": now,
+            })
+            connection.execute(
+                "UPDATE comic_projects SET director_id=?,director_version=?,"
+                "current_version=?,updated_at=? WHERE project_id=?",
+                (spec_id, next_version, revised.current_version, now.isoformat(), project_id),
+            )
+            self._insert_version(
+                connection, project_id=project_id, entity_type="director_spec",
+                entity_id=spec_id, version=next_version,
+                payload_json=spec.model_dump_json(), created_at=now,
+            )
+            self._insert_version(
+                connection, project_id=project_id, entity_type="project",
+                entity_id=project_id, version=revised.current_version,
+                payload_json=revised.model_dump_json(), created_at=now,
+            )
+        return spec
+
+    def restore_director(
+        self, project_id: str, *, version: int, expected_project_version: int,
+    ) -> DirectorSpec:
+        snapshot = self.get(project_id)
+        if snapshot.project.current_version != expected_project_version:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        matches = [item for item in self.director_versions(project_id) if item.version == version]
+        if not matches:
+            raise ToolError("找不到指定导演方案版本")
+        historical = matches[0]
+        if historical.creative_brief_version != snapshot.creative_brief.version:
+            raise ToolError("导演方案关联旧版创作理解，请重新生成或编辑")
+        draft = DirectorSpecDraft.model_validate(
+            historical.model_dump(include=set(DirectorSpecDraft.model_fields))
+        )
+        return self.save_director(
+            project_id, draft, expected_project_version=expected_project_version,
+            source="restored", restored_from_version=version,
+        )
 
 
 class ComicContextBuilder:
