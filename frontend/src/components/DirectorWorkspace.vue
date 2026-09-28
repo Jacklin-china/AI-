@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Clapperboard, Layers, Lightbulb, History, FileText, Film, PanelLeft, PanelRight, ChevronUp, ChevronDown, X, Check } from 'lucide-vue-next'
+import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelLeft, PanelRight, ChevronUp, ChevronDown, X, Check } from 'lucide-vue-next'
 import { Pane, Splitpanes } from 'splitpanes'
 import 'splitpanes/dist/splitpanes.css'
 import MessageComposer from './chat/MessageComposer.vue'
@@ -58,10 +58,12 @@ let disposed = false
 let refreshing = false
 let pageRequest = 0
 const navigation = [
-  { id: 'creative', label: '创意', icon: Lightbulb }, { id: 'director', label: '导演', icon: Clapperboard },
-  { id: 'assets', label: '资产', icon: Layers }, { id: 'storyboard', label: '分镜', icon: Film },
-  { id: 'prompt', label: 'Prompt', icon: FileText }, { id: 'history', label: '历史', icon: History },
-  { id: 'works', label: '作品', icon: Film },
+  { id: 'conversation', label: '对话', icon: MessageSquareText },
+  { id: 'director', label: '导演', icon: Clapperboard },
+  { id: 'storyboard', label: '分镜', icon: Film },
+  { id: 'prompt', label: 'Prompt', icon: FileText },
+  { id: 'assets', label: '资产', icon: Layers },
+  { id: 'history', label: '历史', icon: History },
 ]
 const assetFieldLabels: Record<string, string> = {
   appearance: '外观', clothing: '服装', traits: '特征', location: '地点', time: '时间', weather: '天气',
@@ -83,6 +85,7 @@ const confirmable = computed(() => canConfirmDirector(restoredSpec.value ? 'comp
 const confirmed = computed(() => confirmable.value && !!confirmationKey.value && confirmedKey.value === confirmationKey.value)
 const editable = computed(() => !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const title = computed(() => section.value === 'director' ? directorNodeLabels[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
+const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
 const transcript = computed(() => chronologicalDirectorExecutions(executions.value, runs.value).map(item => {
   const run = runs.value[item.run_id]
@@ -266,6 +269,15 @@ function newProject(): void {
   if (props.initialRunId) emit('newProject')
 }
 function visitStage(stage: string): void { section.value = 'director'; selectedStage.value = stage }
+function openSection(id: string): void {
+  if (id === 'conversation') {
+    chatExpanded.value = true
+    inspectorOpen.value = false
+    return
+  }
+  section.value = id
+  chatExpanded.value = false
+}
 function scrollState(): void { const el = timeline.value; if (el) nearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }
 function previewReference(media: { url: string }): void { window.open(media.url, '_blank', 'noopener') }
 watch(section, () => { void loadPage() })
@@ -288,7 +300,7 @@ onMounted(async () => {
       mode.value = active.value?.director_execution_summary.mode ?? 'fast'
       confirmedKey.value = localStorage.getItem(`kantoku-director-confirmation:${id}`) ?? ''
     }
-    if (legacy && legacy.workflow !== 'comic.director') section.value = 'works'
+    if (legacy && legacy.workflow !== 'comic.director') section.value = 'assets'
   } catch (failure) { error.value = failureText(failure) }
   finally { loading.value = false }
   timer = setInterval(() => { void refresh().catch(failure => { error.value = failureText(failure) }) }, 2000)
@@ -305,9 +317,9 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
       <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="newProject">新作品</button>
     </header>
     <div class="workspace-body">
-      <nav class="workspace-navigation" :class="{ expanded: navOpen }" aria-label="项目导航">
+      <nav class="workspace-navigation" :class="{ expanded: navOpen }" aria-label="创作导航">
         <button :aria-expanded="navOpen" aria-label="展开项目导航" title="展开 / 收起导航" @click="navOpen = !navOpen"><PanelLeft :size="18" /></button>
-        <button v-for="item in navigation" :key="item.id" :title="item.id === 'prompt' && !confirmed ? '请先确认导演方案' : item.label" :aria-label="item.label" :disabled="item.id === 'prompt' && !confirmed" :aria-current="section === item.id ? 'page' : undefined" @click="section = item.id; chatExpanded = false"><component :is="item.icon" :size="18" /><span v-if="navOpen">{{ item.label }}</span></button>
+        <button v-for="item in navigation" :key="item.id" :title="item.id === 'prompt' && !confirmed ? '请先确认导演方案' : item.label" :aria-label="item.label" :disabled="item.id === 'prompt' && !confirmed" :aria-current="activeNavigation === item.id ? 'page' : undefined" @click="openSection(item.id)"><component :is="item.icon" :size="18" /><span v-if="navOpen">{{ item.label }}</span></button>
       </nav>
       <Splitpanes horizontal class="workspace-split" @resized="payload => { if (payload.event) chatSize = payload.panes.at(-1)?.size ?? chatSize }">
         <Pane v-if="!chatExpanded && (mode === 'professional' || section !== 'director')" :size="100 - chatSize" :min-size="20">
@@ -325,10 +337,6 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '本界面已确认' : '导演草案 · 待确认' }}</strong><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">进入 Prompt</button></div>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
-                <template v-else-if="section === 'creative'">
-                  <h3>原始创意</h3><p>{{ project?.creative_brief.original_request ?? '在下方对话中告诉 AI 你的创意。' }}</p>
-                  <section v-for="(label, key) in { hard_constraints: '不能改变的要求', soft_preferences: '偏好', creative_freedom: '可发挥空间' }" :key="key"><h3>{{ label }}</h3><p>{{ project?.creative_brief[key]?.join('；') || '尚未记录' }}</p></section>
-                </template>
                 <template v-else-if="section === 'assets'">
                   <section v-for="(label, kind) in { character: '角色资产', scene: '场景资产', style: '风格资产' }" :key="kind" class="asset-group"><h3>{{ label }}</h3>
                     <details v-for="asset in assets.filter(item => item.details.kind === kind && item.state !== 'deleted')" :key="asset.asset_id"><summary>{{ asset.name }} <small>v{{ asset.version }}{{ asset.pinned_version ? ` · 锁定 v${asset.pinned_version}` : '' }}</small></summary><dl><div v-for="(value, key) in Object.fromEntries(Object.entries(asset.details).filter(([key]) => key !== 'kind'))" :key="key"><dt>{{ assetFieldLabels[key] ?? key }}</dt><dd>{{ Array.isArray(value) ? value.join('；') : value }}</dd></div></dl><p>固定约束：{{ asset.fixed_constraints.join('；') || '未指定' }}</p><p>参考图：{{ asset.reference_artifact_ids.length }} 张</p></details>
@@ -343,13 +351,12 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <label v-if="boards.length">分镜 <select v-model="selectedBoard" @change="loadShots"><option v-for="board in boards" :key="board.storyboard_id" :value="board.storyboard_id">{{ board.title }} · v{{ board.version }}</option></select></label>
                   <p v-else class="pane-note">尚无作品分镜。此页面只展示已有分镜，不会自动开始制作。</p>
                   <template v-if="section === 'storyboard'"><article v-for="shot in shots" :key="shot.shot_id" class="shot-row"><strong>镜头 {{ shot.sequence_number }} · {{ shot.subject }}</strong><p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[shot.status] ?? shot.status }} · 角色 {{ shot.character_asset_versions.map(ref => `${ref.asset_id} v${ref.version}`).join('、') || '未引用' }}</small></article></template>
-                  <template v-else><label v-if="shots.length">镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="shot in shots" :key="shot.shot_id" :value="shot.shot_id">{{ shot.sequence_number }} · {{ shot.subject }}</option></select></label><details v-for="prompt in prompts" :key="String(prompt.prompt_id) + prompt.version"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }}</summary><p>{{ prompt.positive_prompt }}</p><h3>负向约束</h3><p>{{ prompt.negative_prompt }}</p><small>导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }} · {{ prompt.compiler_version }}</small></details><p v-if="selectedShot && !prompts.length" class="pane-note">当前镜头没有已保存的 Prompt 版本。</p><button v-if="selectedShot" class="ui-button primary sm" :disabled="!confirmed || compiling || busy || hasRunning || boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" @click="compilePrompt">{{ compiling ? '正在编译 Prompt' : '编译当前镜头 Prompt' }}</button><p v-if="selectedShot && boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" class="pane-note">分镜引用的导演版本与当前方案不同。请先更新分镜，旧 Prompt 可继续查看。</p><button class="ui-button sm" :disabled="!confirmed" @click="section = 'works'">查看制作结果</button></template>
+                  <template v-else><label v-if="shots.length">镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="shot in shots" :key="shot.shot_id" :value="shot.shot_id">{{ shot.sequence_number }} · {{ shot.subject }}</option></select></label><details v-for="prompt in prompts" :key="String(prompt.prompt_id) + prompt.version"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }}</summary><p>{{ prompt.positive_prompt }}</p><h3>负向约束</h3><p>{{ prompt.negative_prompt }}</p><small>导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }} · {{ prompt.compiler_version }}</small></details><p v-if="selectedShot && !prompts.length" class="pane-note">当前镜头没有已保存的 Prompt 版本。</p><button v-if="selectedShot" class="ui-button primary sm" :disabled="!confirmed || compiling || busy || hasRunning || boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" @click="compilePrompt">{{ compiling ? '正在编译 Prompt' : '编译当前镜头 Prompt' }}</button><p v-if="selectedShot && boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" class="pane-note">分镜引用的导演版本与当前方案不同。请先更新分镜，旧 Prompt 可继续查看。</p><button class="ui-button sm" :disabled="!confirmed" @click="section = 'assets'">查看生成结果</button></template>
                 </template>
                 <template v-else-if="section === 'history'">
                   <h3>方案版本</h3><article v-for="version in versions" :key="Number(version.version)" class="history-row"><strong>导演方案 v{{ version.version }}</strong><small>{{ version.created_at }}</small><AssistantMessageBlock :content="directorSummary(version) || '旧版方案（只读）'" :show-mark="false" /><button class="ui-button sm" :disabled="busy || hasRunning" @click="restoreChoice = Number(version.version)">恢复为新版本</button><div v-if="restoreChoice === Number(version.version)" class="review-notice" role="status"><p>将 v{{ version.version }} 恢复为新版本。历史保留，当前确认状态会清除。</p><button class="ui-button primary sm" :disabled="busy || hasRunning" @click="restore(Number(version.version))">确认恢复</button><button class="ui-button quiet sm" :disabled="busy" @click="restoreChoice = null">取消</button></div></article><p v-if="!versions.length" class="pane-note">暂无已保存方案版本。</p>
                   <h3>真实执行记录</h3><button v-for="item in executions" :key="item.run_id" class="history-task" @click="selectedRun = item.run_id; restoredSpec = null; visitStage('director_assemble')">{{ item.director_execution_summary.mode === 'fast' ? '普通模式' : '专业模式' }} · {{ directorStateLabels[item.status] ?? item.status }}<small>{{ item.run_id }}</small></button>
                 </template>
-                <template v-else-if="section === 'works'"><slot name="works"><p class="pane-note">作品级图片生产尚未接入；不会将导演方案完成显示成已出图。</p></slot></template>
               </div>
             </main>
             <aside v-if="inspectorOpen" class="workspace-inspector" aria-label="节点详情">

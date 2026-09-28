@@ -26,12 +26,19 @@ from .models import (
 
 REVIEW_VERSION = "director-critic-1"
 PATCH_FIELDS = frozenset({
+    "creative_decision.emotional_target", "director_plan.visual_focus",
     "director_plan.composition_strategy", "director_plan.color_strategy",
     "director_plan.subject_environment_relation", "cinematography.camera_angle",
-    "cinematography.camera_distance", "cinematography.lighting",
+    "cinematography.camera_distance", "cinematography.camera_language",
+    "cinematography.lighting",
     "cinematography.light_source", "cinematography.light_direction",
     "cinematography.color_relationship", "cinematography.depth_strategy",
 })
+PATCH_ALIASES = {
+    "emotion": "creative_decision.emotional_target",
+    "visual_direction": "director_plan.visual_focus",
+    "camera_language": "cinematography.camera_language",
+}
 ReviewModel = Callable[[list[dict[str, str]]], str]
 EventSink = Callable[[str, dict[str, Any]], None]
 QUALITY_WORDS = re.compile(r"\b(cinematic|masterpiece|beautiful|epic)\b", re.IGNORECASE)
@@ -100,6 +107,36 @@ def _value(data: dict[str, Any], path: str) -> Any:
             raise ToolError("导演审核字段路径无效", detail=path)
         value = value[key]
     return value
+
+
+def _normalize_patch_path(path: str) -> str:
+    """把审核模型的兼容字段收口到 DirectorSpec v2 的可编辑叶子字段。"""
+    normalized = path.strip()
+    if normalized.startswith("director_spec."):
+        normalized = normalized.removeprefix("director_spec.")
+    return PATCH_ALIASES.get(normalized, normalized)
+
+
+def _normalize_finding(item: PublicFinding) -> PublicFinding:
+    return item.model_copy(update={"field_path": _normalize_patch_path(item.field_path)})
+
+
+def _normalize_patch(
+    spec: DirectorSpecDraft, patch: DirectorCriticPatch,
+) -> DirectorCriticPatch:
+    raw_path = patch.field.strip()
+    if raw_path.startswith("director_spec."):
+        raw_path = raw_path.removeprefix("director_spec.")
+    normalized_path = _normalize_patch_path(raw_path)
+    expected = patch.expected_value
+    if normalized_path != raw_path and expected is not None:
+        data = spec.model_dump(include=set(DirectorSpecDraft.model_fields))
+        source_value = _value(data, raw_path)
+        target_value = _value(data, normalized_path)
+        # 兼容模型基于旧扁平投影返回 expected_value，同时仍绑定当前真实目标值。
+        if expected == source_value:
+            expected = target_value
+    return patch.model_copy(update={"field": normalized_path, "expected_value": expected})
 
 
 def _has_evidence(value: Any, evidence: str) -> bool:
@@ -267,7 +304,8 @@ class DirectorCriticEngine:
             # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
             raise ToolError("导演审核模型未返回有效的公开审核结构") from None
         evidence_context = {key: value for key, value in context.items() if key != "patch_fields"}
-        for item in semantic.findings:
+        semantic_findings = [_normalize_finding(item) for item in semantic.findings]
+        for item in semantic_findings:
             _value(data, item.field_path)
             if (
                 item.code == "LEGACY_FINDING" or not item.evidence or not item.expected
@@ -275,7 +313,7 @@ class DirectorCriticEngine:
             ):
                 raise ToolError("导演审核缺少可核验的公开证据")
         findings.extend(DirectorCriticFinding.model_validate(item.model_dump())
-                        for item in semantic.findings)
+                        for item in semantic_findings)
         return self._result(
             spec, findings, semantic.suggested_patches,
             semantic.public_summary, semantic.confidence,
@@ -296,22 +334,24 @@ class DirectorCriticEngine:
             "needs_revision" if errors or any(item.severity == "warning" for item in findings)
             else "pass"
         )
+        normalized_patches = [_normalize_patch(spec, patch) for patch in patches]
         allowed = sorted({
             item.field_path for item in findings
             if item.severity == "warning" and item.field_path in PATCH_FIELDS
         }) if verdict == "needs_revision" and not errors else []
-        if any(patch.field not in PATCH_FIELDS for patch in patches):
+        if any(patch.field not in PATCH_FIELDS for patch in normalized_patches):
             raise ToolError("导演 Patch 超出白名单")
-        if patches and verdict == "pass":
+        if normalized_patches and verdict == "pass":
             raise ToolError("通过的导演方案不得带有未解释的 Patch")
         if not allowed:
-            patches = []
-        for patch in patches:
+            normalized_patches = []
+        for patch in normalized_patches:
             if patch.field not in allowed or patch.value is None or patch.expected_value is None:
                 raise ToolError("导演 Patch 超出白名单或缺少预期值", detail=patch.field)
         return DirectorCriticResult(
             verdict=verdict, public_summary=summary, findings=findings,
-            suggested_patches=patches, confidence=confidence, allowed_patches=allowed,
+            suggested_patches=normalized_patches, confidence=confidence,
+            allowed_patches=allowed,
             review_version=REVIEW_VERSION, reviewed_spec_hash=director_hash(spec),
         )
 
@@ -339,12 +379,16 @@ class DirectorCriticEngine:
             data[parent][key] = patch.value
         # 兼容字段从分层方案投影；Patch 不能另改一份互相冲突的平面参数。
         data.update({
+            "emotion": data["creative_decision"]["emotional_target"],
+            "visual_direction": data["director_plan"]["visual_focus"],
             "composition": data["director_plan"]["composition_strategy"],
             "color_language": data["director_plan"]["color_strategy"],
             "lighting": data["cinematography"]["lighting"],
-            "camera_language": "；".join(data["cinematography"][key] for key in (
-                "shot_size", "camera_angle", "spatial_feel",
-            )),
+            "camera_language": data["cinematography"].get("camera_language") or "；".join(
+                data["cinematography"][key] for key in (
+                    "shot_size", "camera_angle", "spatial_feel",
+                )
+            ),
             "critic_result": None,
         })
         return DirectorSpecDraft.model_validate(data)

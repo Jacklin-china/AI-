@@ -181,6 +181,10 @@ HTTP：`POST /api/comic/shots/{id}/prompt/compile`（`expected_project_version`�
 
 布局参考 [Figma 导航](https://help.figma.com/hc/en-us/articles/360039831974-Explore-the-navigation-bar-and-left-sidebar)、[Runway 对话式创作](https://help.runwayml.com/hc/en-us/articles/51601639579667-Creating-with-Runway-Agent)、[InvokeAI](https://github.com/invoke-ai/InvokeAI)、[Langflow](https://github.com/langflow-ai/langflow) 与 [ComfyUI Frontend](https://github.com/Comfy-Org/ComfyUI_frontend)。只提炼可收起导航、节点工作区、上下文详情与结果历史，不复制节点 Runtime 或引入另一套组件体系。离线 UI 验收可运行 `frontend/tests/workspace-preview.mjs`，使用隔离端口与内存测试数据；测试数据不写入业务数据库，不冒充真实模型验收。
 
+左侧入口固定为对话、导演、分镜、Prompt、资产、历史。对话入口只是展开同一 Project Conversation，创意理解仍由导演节点和连续聊天共同呈现，不另建“原始创意”页面。已有生成结果作为资产页面的一部分展示，避免再出现覆盖聊天的 Drawer 或独立作品面板。
+
+Director Critic 接受少量旧字段别名时，必须先标准化为 v2 叶子路径再执行白名单校验：`emotion → creative_decision.emotional_target`、`visual_direction → director_plan.visual_focus`、`camera_language → cinematography.camera_language`。标准化不扩展可写范围；硬约束、Project 身份、资产版本及 StyleBible 引用始终不可 Patch。兼容字段由分层方案投影，不能维护两份互相漂移的导演决策。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

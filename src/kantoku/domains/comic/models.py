@@ -166,6 +166,8 @@ class CinematographyPlan(BaseModel):
     shot_size: BriefText
     camera_angle: BriefText
     camera_distance: BriefText
+    # 兼容审核模型可能使用的总括摄影语言；具体镜头字段仍是首选来源。
+    camera_language: BriefText | None = None
     spatial_feel: BriefText
     lens_or_spatial_feel: BriefText
     movement: BriefText | None = None
@@ -255,6 +257,15 @@ class DirectorSpecDraft(BaseModel):
         ):
             raise ValueError(
                 "DirectorSpec v2 必须包含 creative_decision、director_plan 和 cinematography"
+            )
+        if (
+            self.schema_version == 2
+            and self.cinematography is not None
+            and self.cinematography.camera_language is None
+        ):
+            # 旧 v2 记录只有顶层兼容字段。读取时投影到分层结构，避免迁移覆盖历史数据。
+            self.cinematography = self.cinematography.model_copy(
+                update={"camera_language": self.camera_language},
             )
         return self
 

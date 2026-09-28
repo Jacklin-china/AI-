@@ -625,7 +625,8 @@ class ComicDirectorCoordinator:
         camera = outputs["cinematography"]
         return DirectorSpecDraft.model_validate({
             "schema_version": 2,
-            "visual_direction": plan["visual_strategy"],
+            # v2 的兼容字段与 Patch Alias 指向同一公开视觉焦点，避免双份值漂移。
+            "visual_direction": plan["visual_focus"],
             "storytelling_goal": decision["intent_summary"],
             "camera_language": (
                 f"{camera['shot_size']}；{camera['camera_angle']}；"

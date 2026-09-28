@@ -190,6 +190,69 @@ def test_minor_patch_is_applied_once_and_passes_one_re_review() -> None:
     require_approved_director(outcome.director_spec)
 
 
+def test_patch_aliases_are_normalized_before_whitelist_validation() -> None:
+    spec = _spec()
+    assert spec.creative_decision is not None
+    assert spec.director_plan is not None
+    assert spec.cinematography is not None
+    findings = [
+        {
+            "code": "EMOTION_CAUSALITY", "severity": "warning",
+            "field_path": "emotion", "evidence": spec.creative_decision.emotional_target,
+            "expected": "情绪与故事处境建立具体关系", "suggested_action": "收紧情绪目标",
+        },
+        {
+            "code": "VISUAL_FOCUS", "severity": "warning",
+            "field_path": "director_spec.visual_direction",
+            "evidence": spec.director_plan.visual_focus,
+            "expected": "明确视觉焦点", "suggested_action": "收紧视觉焦点",
+        },
+        {
+            "code": "CAMERA_LANGUAGE", "severity": "warning",
+            "field_path": "camera_language", "evidence": spec.camera_language,
+            "expected": "摄影语言服务故事", "suggested_action": "调整摄影语言",
+        },
+    ]
+    patches = [
+        {"field": "emotion", "expected_value": spec.emotion,
+         "value": "孤独感来自人物与环境的距离", "reason": "连接故事处境"},
+        {"field": "visual_direction", "expected_value": spec.visual_direction,
+         "value": "人物面对雨夜竹林的选择", "reason": "明确视觉焦点"},
+        {"field": "director_spec.camera_language", "expected_value": spec.camera_language,
+         "value": "先建立空间压力，再靠近人物选择", "reason": "服务叙事"},
+    ]
+    replies = [_semantic(findings, patches), _semantic()]
+
+    outcome = DirectorCriticEngine(lambda _messages: replies.pop(0)).review_and_revise(
+        spec, _brief(),
+    )
+
+    assert outcome.revision_count == 1
+    assert not outcome.needs_review
+    assert outcome.director_spec.creative_decision.emotional_target == patches[0]["value"]
+    assert outcome.director_spec.director_plan.visual_focus == patches[1]["value"]
+    assert outcome.director_spec.cinematography.camera_language == patches[2]["value"]
+    assert outcome.director_spec.emotion == patches[0]["value"]
+    assert outcome.director_spec.visual_direction == patches[1]["value"]
+    assert outcome.director_spec.camera_language == patches[2]["value"]
+
+
+@pytest.mark.parametrize("field", [
+    "creative_decision.hard_constraints", "asset_versions", "project_id",
+    "style_bible", "director_spec.asset_versions",
+])
+def test_patch_normalizer_never_opens_identity_or_asset_fields(field: str) -> None:
+    spec = _spec()
+    result = DirectorCriticEngine(lambda _messages: _semantic([
+        _finding(spec),
+    ], [_patch(spec)])).review(spec, _brief())
+    malicious = result.model_copy(update={"suggested_patches": [DirectorCriticPatch(
+        field=field, reason="尝试修改受保护来源", value="other", expected_value="current",
+    )]})
+    with pytest.raises(ToolError, match="禁止修改"):
+        DirectorCriticEngine.apply_patches(spec, malicious)
+
+
 def test_second_review_failure_does_not_trigger_a_second_automatic_patch() -> None:
     calls: list[Any] = []
 
