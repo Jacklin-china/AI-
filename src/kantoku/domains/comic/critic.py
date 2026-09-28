@@ -8,10 +8,16 @@ import re
 from collections.abc import Callable
 from typing import Any, Literal
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from kantoku.config import ToolError
-from kantoku.config.observability import current_run_id, current_trace_id, public_error
+from kantoku.config.observability import (
+    current_run_id,
+    current_trace_id,
+    public_error,
+    redact_secrets,
+)
 
 from .models import (
     ComicAsset,
@@ -25,19 +31,70 @@ from .models import (
 )
 
 REVIEW_VERSION = "director-critic-1"
-PATCH_FIELDS = frozenset({
-    "creative_decision.emotional_target", "director_plan.visual_focus",
-    "director_plan.composition_strategy", "director_plan.color_strategy",
-    "director_plan.subject_environment_relation", "cinematography.camera_angle",
-    "cinematography.camera_distance", "cinematography.camera_language",
+CRITIC_ALLOWED_FIELD_PATHS = frozenset({
+    "creative_decision.intent_summary",
+    "creative_decision.emotional_target",
+    "creative_decision.narrative_focus",
+    "creative_decision.audience_experience",
+    "director_plan.visual_focus",
+    "director_plan.composition_strategy",
+    "director_plan.color_strategy",
+    "director_plan.subject_environment_relation",
+    "director_plan.style_boundary",
+    "director_plan.character_expression",
+    "director_plan.character_pose",
+    "director_plan.character_presence",
+    "cinematography.shot_size",
+    "cinematography.camera_angle",
+    "cinematography.camera_distance",
+    "cinematography.camera_language",
     "cinematography.lighting",
-    "cinematography.light_source", "cinematography.light_direction",
-    "cinematography.color_relationship", "cinematography.depth_strategy",
+    "cinematography.depth_strategy",
 })
-PATCH_ALIASES = {
+PATCH_FIELDS = frozenset({
+    "creative_decision.emotional_target",
+    "creative_decision.narrative_focus",
+    "creative_decision.audience_experience",
+    "director_plan.visual_focus",
+    "director_plan.composition_strategy",
+    "director_plan.color_strategy",
+    "director_plan.style_boundary",
+    "director_plan.character_expression",
+    "director_plan.character_pose",
+    "director_plan.character_presence",
+    "cinematography.camera_angle",
+    "cinematography.shot_size",
+    "cinematography.camera_language",
+    "cinematography.lighting",
+    "cinematography.depth_strategy",
+})
+FIELD_PATH_ALIASES = {
+    "creative_brief.original_request": "creative_decision.intent_summary",
     "emotion": "creative_decision.emotional_target",
+    "emotional_target": "creative_decision.emotional_target",
+    "narrative_focus": "creative_decision.narrative_focus",
+    "audience_experience": "creative_decision.audience_experience",
     "visual_direction": "director_plan.visual_focus",
+    "visual_focus": "director_plan.visual_focus",
+    "composition_strategy": "director_plan.composition_strategy",
+    "composition": "director_plan.composition_strategy",
+    "color_direction": "director_plan.color_strategy",
+    "color_language": "director_plan.color_strategy",
+    "color_strategy": "director_plan.color_strategy",
+    "director_plan.color_direction": "director_plan.color_strategy",
+    "style_boundary": "director_plan.style_boundary",
+    "character_expression": "director_plan.character_expression",
+    "character_pose": "director_plan.character_pose",
+    "character_presence": "director_plan.character_presence",
+    "director_plan.subject_environment_relationship": (
+        "director_plan.subject_environment_relation"
+    ),
+    "camera": "cinematography.camera_language",
     "camera_language": "cinematography.camera_language",
+    "camera_angle": "cinematography.camera_angle",
+    "shot_size": "cinematography.shot_size",
+    "lighting": "cinematography.lighting",
+    "depth_strategy": "cinematography.depth_strategy",
 }
 ReviewModel = Callable[[list[dict[str, str]]], str]
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -46,6 +103,14 @@ QUALITY_WORDS = re.compile(r"\b(cinematic|masterpiece|beautiful|epic)\b", re.IGN
 
 def director_hash(spec: DirectorSpecDraft) -> str:
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
+    # 新增的可选表现字段为空时不改变历史审核指纹。
+    plan = payload.get("director_plan")
+    if isinstance(plan, dict):
+        for key in (
+            "style_boundary", "character_expression", "character_pose", "character_presence",
+        ):
+            if plan.get(key) is None:
+                plan.pop(key, None)
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -109,16 +174,29 @@ def _value(data: dict[str, Any], path: str) -> Any:
     return value
 
 
-def _normalize_patch_path(path: str) -> str:
-    """把审核模型的兼容字段收口到 DirectorSpec v2 的可编辑叶子字段。"""
+def _normalize_field_path(path: str) -> str:
+    """把模型字段名收口到 DirectorSpec v2 的公开叶子字段。"""
     normalized = path.strip()
     if normalized.startswith("director_spec."):
         normalized = normalized.removeprefix("director_spec.")
-    return PATCH_ALIASES.get(normalized, normalized)
+    return FIELD_PATH_ALIASES.get(normalized, normalized)
 
 
-def _normalize_finding(item: PublicFinding) -> PublicFinding:
-    return item.model_copy(update={"field_path": _normalize_patch_path(item.field_path)})
+def _critic_warning(received_field: str, *, action: str = "ignored") -> None:
+    logger.warning(
+        "critic_warning received_field={} action={} trace_id={}",
+        redact_secrets(received_field),
+        action,
+        current_trace_id() or "-",
+    )
+
+
+def _normalize_finding(item: PublicFinding) -> PublicFinding | None:
+    normalized = _normalize_field_path(item.field_path)
+    if normalized not in CRITIC_ALLOWED_FIELD_PATHS:
+        _critic_warning(item.field_path)
+        return None
+    return item.model_copy(update={"field_path": normalized})
 
 
 def _normalize_patch(
@@ -127,14 +205,17 @@ def _normalize_patch(
     raw_path = patch.field.strip()
     if raw_path.startswith("director_spec."):
         raw_path = raw_path.removeprefix("director_spec.")
-    normalized_path = _normalize_patch_path(raw_path)
+    normalized_path = _normalize_field_path(raw_path)
     expected = patch.expected_value
-    if normalized_path != raw_path and expected is not None:
+    if normalized_path in PATCH_FIELDS and normalized_path != raw_path and expected is not None:
         data = spec.model_dump(include=set(DirectorSpecDraft.model_fields))
-        source_value = _value(data, raw_path)
         target_value = _value(data, normalized_path)
         # 兼容模型基于旧扁平投影返回 expected_value，同时仍绑定当前真实目标值。
-        if expected == source_value:
+        try:
+            source_value = _value(data, raw_path)
+        except ToolError:
+            source_value = None
+        if source_value is not None and expected == source_value:
             expected = target_value
     return patch.model_copy(update={"field": normalized_path, "expected_value": expected})
 
@@ -279,6 +360,7 @@ class DirectorCriticEngine:
             "shot": shot.model_dump(mode="json", include={
                 "purpose", "subject", "action", "environment", "emotion", "version",
             }) if shot else None,
+            "allowed_field_paths": sorted(CRITIC_ALLOWED_FIELD_PATHS),
             "patch_fields": sorted(PATCH_FIELDS),
         }
         raw = self.model_call([
@@ -290,6 +372,8 @@ class DirectorCriticEngine:
                 "findings、suggested_patches。不要输出思维链、reasoning 或 CoT。"
                 "findings 每项必须含 code、severity(info/warning/error)、field_path、"
                 "evidence(输入中的逐字公开片段)、expected、suggested_action。"
+                "field_path 只能来自 allowed_field_paths，不要引用 creative_brief、asset、"
+                "project 或 StyleBible 身份字段。"
                 "用户硬约束语义冲突使用 HARD_CONSTRAINT_CONFLICT，固定资产语义冲突使用"
                 " ASSET_CONSTRAINT_CONFLICT，视觉因果不匹配使用 VISUAL_CAUSALITY_MISMATCH。"
                 "error 表示重要创作冲突需人工；warning 为可局部修订的小问题。"
@@ -303,8 +387,14 @@ class DirectorCriticEngine:
         except (ValueError, ValidationError):
             # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
             raise ToolError("导演审核模型未返回有效的公开审核结构") from None
-        evidence_context = {key: value for key, value in context.items() if key != "patch_fields"}
-        semantic_findings = [_normalize_finding(item) for item in semantic.findings]
+        evidence_context = {
+            key: value for key, value in context.items()
+            if key not in {"patch_fields", "allowed_field_paths"}
+        }
+        semantic_findings = [
+            normalized for item in semantic.findings
+            if (normalized := _normalize_finding(item)) is not None
+        ]
         for item in semantic_findings:
             _value(data, item.field_path)
             if (
@@ -334,23 +424,39 @@ class DirectorCriticEngine:
             "needs_revision" if errors or any(item.severity == "warning" for item in findings)
             else "pass"
         )
-        normalized_patches = [_normalize_patch(spec, patch) for patch in patches]
+        normalized_patches: list[DirectorCriticPatch] = []
+        for patch in patches:
+            normalized = _normalize_patch(spec, patch)
+            if normalized.field not in PATCH_FIELDS:
+                _critic_warning(patch.field)
+                continue
+            normalized_patches.append(normalized)
         allowed = sorted({
             item.field_path for item in findings
             if item.severity == "warning" and item.field_path in PATCH_FIELDS
         }) if verdict == "needs_revision" and not errors else []
-        if any(patch.field not in PATCH_FIELDS for patch in normalized_patches):
-            raise ToolError("导演 Patch 超出白名单")
         if normalized_patches and verdict == "pass":
-            raise ToolError("通过的导演方案不得带有未解释的 Patch")
+            for patch in normalized_patches:
+                _critic_warning(patch.field)
+            normalized_patches = []
         if not allowed:
             normalized_patches = []
+        data = spec.model_dump(include=set(DirectorSpecDraft.model_fields))
+        usable_patches: list[DirectorCriticPatch] = []
+        seen: set[str] = set()
         for patch in normalized_patches:
-            if patch.field not in allowed or patch.value is None or patch.expected_value is None:
-                raise ToolError("导演 Patch 超出白名单或缺少预期值", detail=patch.field)
+            actual = _value(data, patch.field)
+            if (
+                patch.field not in allowed or patch.value is None
+                or patch.expected_value != actual or patch.field in seen
+            ):
+                _critic_warning(patch.field)
+                continue
+            seen.add(patch.field)
+            usable_patches.append(patch)
         return DirectorCriticResult(
             verdict=verdict, public_summary=summary, findings=findings,
-            suggested_patches=normalized_patches, confidence=confidence,
+            suggested_patches=usable_patches, confidence=confidence,
             allowed_patches=allowed,
             review_version=REVIEW_VERSION, reviewed_spec_hash=director_hash(spec),
         )
@@ -384,6 +490,10 @@ class DirectorCriticEngine:
             "composition": data["director_plan"]["composition_strategy"],
             "color_language": data["director_plan"]["color_strategy"],
             "lighting": data["cinematography"]["lighting"],
+            "character_focus": (
+                data["director_plan"].get("character_presence")
+                or data["director_plan"]["visual_focus"]
+            ),
             "camera_language": data["cinematography"].get("camera_language") or "；".join(
                 data["cinematography"][key] for key in (
                     "shot_size", "camera_angle", "spatial_feel",

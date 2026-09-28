@@ -9,7 +9,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ edit: []; rerun: []; save: []; cancel: []; field: [key: string, value: string]; revise: [] }>()
 const sections = computed(() => props.node && props.stage !== 'director_assemble'
-  ? [{ title: '', fields: Object.fromEntries(Object.entries(Object.values(props.node.output)[0] ?? {}).filter(([key]) => key in directorFieldLabels)) }]
+  ? [{ title: '', fields: Object.fromEntries(Object.entries(Object.values(props.node.output)[0] ?? {}).filter(([key, value]) => key in directorFieldLabels && value != null)) }]
   : props.stage === 'director_assemble' ? publicDirectorSections(props.spec)
     : publicDirectorSections(props.spec).filter(section => section.title === ({ creative_understanding: '创作理解', visual_direction: '导演方案', cinematography: '摄影方案' } as Record<string, string>)[props.stage]))
 const review = computed(() => props.critic ?? props.spec?.critic_result as typeof props.critic)
@@ -34,9 +34,9 @@ function display(value: unknown): string { return Array.isArray(value) ? value.j
       <section v-for="section in sections" :key="section.title"><h3 v-if="section.title">{{ section.title }}</h3>
         <dl><div v-for="(value, key) in section.fields" :key="key"><dt>{{ directorFieldLabels[key] ?? key }}</dt><dd>{{ display(value) }}</dd></div></dl>
       </section>
-      <p v-if="!sections.some(section => Object.keys(section.fields).length) && node?.stage !== 'director_critic'" class="pane-note">此节点尚无完成结果。先在对话中描述创意，或查看当前任务状态。</p>
+      <p v-if="!sections.some(section => Object.keys(section.fields).length) && stage !== 'director_critic'" class="pane-note">此节点尚无完成结果。先在对话中描述创意，或查看当前任务状态。</p>
     </template>
-    <section v-if="node?.stage === 'director_critic'">
+    <section v-if="stage === 'director_critic'">
       <template v-if="review"><h3>{{ review.verdict === 'pass' ? '审核通过' : review.verdict === 'blocked' ? '审核阻止继续' : '需要调整' }}</h3><p>{{ review.public_summary }}</p>
         <article v-for="finding in review.findings" :key="finding.code + finding.evidence" class="critic-finding"><strong>{{ finding.code }}</strong><p>{{ finding.evidence }}</p><p>{{ finding.suggested_action }}</p></article>
         <button v-if="review.verdict !== 'pass'" class="ui-button sm" @click="emit('revise')">前往视觉导演修改</button>

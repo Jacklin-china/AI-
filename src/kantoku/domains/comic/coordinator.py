@@ -59,6 +59,10 @@ FAST_LABELS = {
 }
 
 
+class _DirectorCancelled(Exception):
+    """阶段边界观察原 Core Run 的取消状态。"""
+
+
 def director_execution_summary(run: Any) -> dict[str, Any]:
     """用户可见投影；Fast 不传内部节点、输出或审核细节。"""
     mode = run.state["execution_mode"]
@@ -69,6 +73,8 @@ def director_execution_summary(run: Any) -> dict[str, Any]:
         label = "创作方案需要调整"
     elif status == "failed":
         label = "导演方案生成失败"
+    elif status == "cancelled":
+        label = "导演任务已取消"
     actions = ["view"]
     if status in {"failed", "waiting"}:
         actions.append("resume")
@@ -252,10 +258,17 @@ class ComicDirectorCoordinator:
             conversation_id=request.conversation_id or "-",
         ):
             logger.info(
-                "director task received versions={} user_input={}", input_versions,
+                "Director Input Snapshot project_id={} conversation_id={} user_request={} "
+                "brief_version={} memory_used={} asset_used={} previous_run={} trace_id={}",
+                project.project_id, request.conversation_id or "-",
                 redact_secrets(
                     request.task or request.snapshot.creative_brief.original_request,
                 )[:1000],
+                request.snapshot.creative_brief.version,
+                [{"asset_id": item["asset_id"], "version": item["version"]}
+                 for item in context.relevant_memory],
+                {key: value for key, value in input_versions.items() if key.startswith("asset:")},
+                request.previous_run_id or "-", trace_id,
             )
             self.runtime_store.update_run(
                 run.id, status=ExecutionStatus.RUNNING, state=state,
@@ -342,6 +355,7 @@ class ComicDirectorCoordinator:
                 })
                 draft = DirectorSpecDraft.model_validate(draft_data)
                 require_approved_director(draft)
+                self._check_cancelled(run.id)
                 spec = self.project_store.save_director(
                     project.project_id, draft,
                     expected_project_version=project.current_version,
@@ -380,7 +394,19 @@ class ComicDirectorCoordinator:
                     critic_result=spec.critic_result,
                     stages=stages, stale_dependents=stale,
                 )
+            except _DirectorCancelled:
+                logger.info("director cancelled at stage={} trace_id={}",
+                            state.get("active_skill_id"), trace_id)
+                return DirectorCoordinatorResult(
+                    run_id=run.id, trace_id=trace_id, project_id=project.project_id,
+                    execution_mode=request.execution_mode, director_spec=None, stages=stages,
+                )
             except Exception as error:
+                if self.runtime_store.get_run(run.id).status is ExecutionStatus.CANCELLED:
+                    return DirectorCoordinatorResult(
+                        run_id=run.id, trace_id=trace_id, project_id=project.project_id,
+                        execution_mode=request.execution_mode, director_spec=None, stages=stages,
+                    )
                 current_skill = str(state.get("active_skill_id", current_skill))
                 failure = public_error(
                     error, trace_id=trace_id, project_id=project.project_id,
@@ -418,6 +444,7 @@ class ComicDirectorCoordinator:
         outputs: dict[str, Any],
         stages: list[DirectorStageRecord],
     ) -> None:
+        self._check_cancelled(run_id)
         node_id = skill_id.removeprefix("comic.")
         event_name = node_id
         trace_id = str(state["trace_id"])
@@ -449,6 +476,7 @@ class ComicDirectorCoordinator:
         with run_trace(run_id, node_id):
             if skill_id == "comic.director_critic":
                 def emit(name: str, payload: dict[str, Any]) -> None:
+                    self._check_cancelled(run_id)
                     state["critic_activity"] = name
                     if "critic_result" in payload:
                         state["critic_result"] = payload["critic_result"]
@@ -489,6 +517,7 @@ class ComicDirectorCoordinator:
                 raw_output = {output_key: request.stage_edits[node_id]}
             else:
                 raw_output = self.stage_executor(skill_id, inputs, stage_context)
+            self._check_cancelled(run_id)
             if not isinstance(raw_output, Mapping):
                 raise ToolError("导演 Skill 未返回结构化对象", detail=skill_id)
             validated = self.registry.execute(
@@ -520,6 +549,10 @@ class ComicDirectorCoordinator:
             visible_stage=node_id if request.execution_mode == "professional"
             else FAST_LABELS[node_id],
         )
+
+    def _check_cancelled(self, run_id: str) -> None:
+        if self.runtime_store.get_run(run_id).status is ExecutionStatus.CANCELLED:
+            raise _DirectorCancelled
 
     def _reused_outputs(
         self, request: DirectorCoordinatorRequest, input_versions: Mapping[str, int],

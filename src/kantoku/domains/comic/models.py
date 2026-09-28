@@ -153,6 +153,10 @@ class DirectorPlan(BaseModel):
     subject_environment_relation: BriefText
     composition_strategy: BriefText
     color_strategy: BriefText
+    style_boundary: BriefText | None = None
+    character_expression: BriefText | None = None
+    character_pose: BriefText | None = None
+    character_presence: BriefText | None = None
     continuity_rules: list[BriefItem] = Field(default_factory=list, max_length=50)
     creative_choices: list[BriefItem] = Field(default_factory=list, max_length=20)
     risk_flags: list[BriefItem] = Field(default_factory=list, max_length=20)

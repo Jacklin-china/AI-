@@ -8,8 +8,8 @@ import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
-import { canConfirmDirector, chronologicalDirectorExecutions, directorFieldLabels, directorIsStale, directorNodeLabels, directorStateLabels, directorSummary, draftConfirmationKey, editableDirectorNode, selectDirectorExecution, stageDraftKey } from '../domains/comic/directorPresentation'
-import { CoreApiError, compileComicPrompt, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorFieldLabels, directorIsStale, directorNodeLabels, directorStateLabels, directorSummary, draftConfirmationKey, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
+import { CoreApiError, cancelRun, compileComicPrompt, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { CoreRun } from '../types'
 
 const props = defineProps<{ initialRunId?: string }>()
@@ -38,6 +38,9 @@ const composer = ref<InstanceType<typeof MessageComposer> | null>(null)
 const timeline = ref<HTMLElement | null>(null)
 const nearBottom = ref(true)
 const busy = ref(false)
+const cancelling = ref(false)
+const queuedInputs = ref<{ id: number; text: string; mode: CreationMode }[]>([])
+let nextInputId = 0
 const loading = ref(true)
 const error = ref('')
 const pendingText = ref('')
@@ -87,12 +90,15 @@ const editable = computed(() => !!node.value && editableDirectorNode(node.value.
 const title = computed(() => section.value === 'director' ? directorNodeLabels[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
 const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
+const projectTitle = computed(() => workspaceProjectTitle(project.value?.project.title, project.value?.creative_brief.original_request))
+const runningExecution = computed(() => executions.value.find(item => ['running', 'pending'].includes(item.status) && !item.recovery_required))
+const canDispatch = computed(() => canDispatchDirectorInput({ busy: busy.value, running: hasRunning.value, loading: loading.value, error: !!error.value, cancelling: cancelling.value }))
 const transcript = computed(() => chronologicalDirectorExecutions(executions.value, runs.value).map(item => {
   const run = runs.value[item.run_id]
   const text = String(run?.state.task ?? '')
   const rerun = String(run?.state.rerun_from ?? '').replace('comic.', '')
   return { execution: item, text: rerun ? `修改 / 重新执行：${directorNodeLabels[rerun] ?? rerun}` : text,
-    answer: directorSummary(item.director_spec), label: item.director_execution_summary.status_label }
+    answer: directorSummary(item.director_spec, mode.value), label: item.director_execution_summary.status_label }
 }))
 
 function failureText(failure: unknown): string {
@@ -107,8 +113,8 @@ function invalidate(): void { confirmedKey.value = ''; rememberConfirmation() }
 function beginEdit(): void {
   if (!editable.value || !node.value) return
   if (!editing.value) drafts.value[draftKey.value] = Object.fromEntries(Object.entries(Object.values(node.value.output)[0] ?? {})
-    .filter(([key, value]) => key !== 'hard_constraints' && key in directorFieldLabels && (typeof value === 'string' || Array.isArray(value)))
-    .map(([key, value]) => [key, Array.isArray(value) ? value.join('\n') : String(value)]))
+    .filter(([key, value]) => key !== 'hard_constraints' && key in directorFieldLabels && (value == null || typeof value === 'string' || Array.isArray(value)))
+    .map(([key, value]) => [key, Array.isArray(value) ? value.join('\n') : String(value ?? '')]))
   invalidate()
 }
 function updateField(key: string, value: string): void { if (editing.value) drafts.value[draftKey.value]![key] = value }
@@ -152,9 +158,8 @@ async function ensureConversation(): Promise<string> {
   localStorage.setItem(`kantoku-comic-conversation:${id}`, conversationId.value)
   return conversationId.value
 }
-async function execute(text: string, options: Record<string, unknown> = {}): Promise<void> {
+async function execute(text: string, options: Record<string, unknown> = {}, selectedMode: CreationMode = mode.value): Promise<void> {
   if (busy.value || hasRunning.value || (!project.value && !text.trim())) { composer.value?.fill(text); return }
-  const selectedMode = mode.value
   const editingKey = draftKey.value
   busy.value = true; pendingText.value = text; previousRunIds.value = executions.value.map(item => item.run_id); error.value = ''; invalidate()
   restoredSpec.value = null
@@ -182,13 +187,36 @@ async function execute(text: string, options: Record<string, unknown> = {}): Pro
     if (failedRun) { selectedRun.value = failedRun.run_id; pendingText.value = '' }
   } finally { busy.value = false }
 }
+function sendInput(text: string): void {
+  if (!text.trim()) return
+  if (busy.value || hasRunning.value || cancelling.value || queuedInputs.value.length) {
+    queuedInputs.value.push({ id: ++nextInputId, text, mode: mode.value })
+    void dispatchQueued()
+    return
+  }
+  void execute(text)
+}
+async function dispatchQueued(explicit = false): Promise<void> {
+  if (explicit) error.value = ''
+  if (!canDispatch.value || disposed) return
+  const next = queuedInputs.value.shift()
+  if (next) await execute(next.text, {}, next.mode)
+}
+async function cancelExecution(): Promise<void> {
+  const task = runningExecution.value
+  if (!task || cancelling.value) return
+  cancelling.value = true
+  try { await cancelRun(task.run_id); await refresh() }
+  catch (failure) { error.value = failureText(failure) }
+  finally { cancelling.value = false }
+}
 async function rerun(save = false): Promise<void> {
   if (!active.value || !node.value || !summary.value) return
   mode.value = summary.value.mode
   const options: Record<string, unknown> = { previous_run_id: active.value.run_id, rerun_from: node.value.stage }
   if (save) {
     const patch = { ...Object.values(node.value.output)[0] }
-    Object.entries(fields.value).forEach(([key, text]) => { patch[key] = Array.isArray(patch[key]) ? text.split('\n').map(item => item.trim()).filter(Boolean) : text })
+    Object.entries(fields.value).forEach(([key, text]) => { patch[key] = Array.isArray(patch[key]) ? text.split('\n').map(item => item.trim()).filter(Boolean) : patch[key] == null && !text.trim() ? null : text })
     options.stage_edits = { [node.value.stage]: patch }
   }
   await execute('', options)
@@ -261,7 +289,8 @@ async function restore(version: number): Promise<void> {
   finally { busy.value = false; restoreChoice.value = null }
 }
 function newProject(): void {
-  if (busy.value || hasRunning.value || (Object.keys(drafts.value).length && !window.confirm('放弃未保存的节点修改并新建作品？'))) return
+  if (busy.value || hasRunning.value || ((Object.keys(drafts.value).length || queuedInputs.value.length) && !window.confirm('放弃未保存的修改和待发送补充并新建作品？'))) return
+  queuedInputs.value = []
   pageRequest++; project.value = null; executions.value = []; runs.value = {}; assets.value = []; boards.value = []; shots.value = []; versions.value = []; prompts.value = []
   selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; conversationId.value = ''; confirmedKey.value = ''; error.value = ''; pendingText.value = ''
   section.value = 'director'; selectedStage.value = 'director_assemble'; inspectorOpen.value = false; restoreChoice.value = null
@@ -281,13 +310,14 @@ function openSection(id: string): void {
 function scrollState(): void { const el = timeline.value; if (el) nearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }
 function previewReference(media: { url: string }): void { window.open(media.url, '_blank', 'noopener') }
 watch(section, () => { void loadPage() })
+watch([canDispatch, () => queuedInputs.value.length], () => { void dispatchQueued() })
 watch(() => `${section.value}:${selectedStage.value}:${selectedRun.value}`, async (key, old) => {
   if (stageScroll.value) scrollPositions.set(old, stageScroll.value.scrollTop)
   await nextTick()
   if (stageScroll.value) stageScroll.value.scrollTop = scrollPositions.get(key) ?? 0
 })
 watch(inspectorOpen, async open => { if (open && active.value) { try { events.value = await getEvents(active.value.run_id) } catch (failure) { error.value = failureText(failure) } } })
-watch(() => transcript.value.map(item => `${item.execution.run_id}:${item.execution.status}`).join('|') + pendingText.value, async () => { if (!nearBottom.value) return; await nextTick(); timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: 'auto' }) })
+watch(() => transcript.value.map(item => `${item.execution.run_id}:${item.execution.status}`).join('|') + pendingText.value + queuedInputs.value.length, async () => { if (!nearBottom.value) return; await nextTick(); timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: 'auto' }) })
 onMounted(async () => {
   try {
     const legacy = props.initialRunId ? await getRun(props.initialRunId) : null
@@ -311,7 +341,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
 <template>
   <section class="director-workspace" aria-label="AI 导演工作台">
     <header class="workspace-toolbar">
-      <strong>{{ project?.project.title ?? (legacyOnly ? '历史制作记录' : '漫剧创作') }}</strong>
+      <strong>{{ project ? projectTitle : (legacyOnly ? '历史制作记录' : '漫剧创作') }}</strong>
       <label>创作模式 <select v-model="mode" :disabled="busy || hasRunning || loading"><option value="fast">普通模式</option><option value="professional">专业导演模式</option></select></label>
       <span class="workspace-execution" role="status">{{ loading ? '载入中' : busy && !active ? '提交创意' : restoredSpec ? '已载入历史方案' : summary?.status_label ?? '等待创意' }}</span>
       <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="newProject">新作品</button>
@@ -329,7 +359,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <nav v-if="mode === 'professional' && section === 'director'" class="stage-navigation" aria-label="导演节点">
                 <button v-for="(label, stage) in directorNodeLabels" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" @click="visitStage(String(stage))">{{ label }}<small>{{ restoredSpec ? '历史方案读取' : summary?.mode === 'fast' ? '普通模式未公开' : directorStateLabels[summary?.stages.find(item => item.stage === stage)?.status ?? 'pending'] ?? '未开始' }}</small></button>
               </nav>
-              <div ref="stageScroll" class="stage-scroll">
+              <div :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll">
                 <template v-if="section === 'director'">
                   <p v-if="restoredSpec" class="pane-note">此方案恢复自历史版本，节点没有重新执行。继续修改可在下方对话中提出新方向；不会沿用其他版本的节点或 Trace。</p>
                   <p v-if="summary?.mode === 'fast' && selectedStage !== 'director_assemble'" class="pane-note">此方案在普通模式执行，后端未公开独立节点结果。切换模式不会伪造节点；可在专业模式发送新需求。</p>
@@ -383,12 +413,18 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               </article>
               <UserMessageBubble v-if="pendingText && !transcript.some(entry => !previousRunIds.includes(entry.execution.run_id) && entry.text === pendingText)" :content="pendingText" :pending="busy ? 'replying' : 'failed'" />
               <p v-if="busy && !active" role="status">正在提交创意，等待真实执行状态…</p>
+              <p v-if="active?.status === 'cancelled'" class="pane-note" role="status">任务已取消。正在进行的模型请求可能仍需结束，但不会继续下一节点或保存导演方案。</p>
+              <article v-for="input in queuedInputs" :key="input.id" class="queued-turn">
+                <UserMessageBubble :content="input.text" />
+                <div class="queued-note"><span>补充已排队 · 当前方案结束后处理 · {{ input.mode === 'professional' ? '专业模式' : '普通模式' }}</span><button class="ui-button quiet sm" @click="queuedInputs = queuedInputs.filter(item => item.id !== input.id)">撤回</button></div>
+              </article>
+              <button v-if="queuedInputs.length && error && !busy && !hasRunning" class="ui-button sm" @click="dispatchQueued(true)">继续处理已发送的补充</button>
               <p v-if="error" class="workspace-error" role="alert">{{ error }}</p>
               <p v-if="dirty" class="pane-note">有未保存的节点修改。切换节点会保留草稿；保存并重新审核后才能确认。</p>
-              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec)" :show-mark="false" /><div class="draft-actions"><span>已恢复方案 v{{ restoredSpec.version }} · {{ confirmed ? '本界面已确认' : '待确认' }}</span><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
+              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>已恢复方案 v{{ restoredSpec.version }} · {{ confirmed ? '本界面已确认' : '待确认' }}</span><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
               <p v-if="confirmed" class="pane-note">方案已在本浏览器确认；此确认不是后端审批。修改或恢复版本后需重新确认。</p>
             </div>
-            <div class="workspace-composer"><p v-if="legacyOnly" class="pane-note">此历史单镜头任务没有作品级 Project。原审批与恢复仍在任务记录中；点击“新作品”进入作品级创作。</p><MessageComposer ref="composer" :disabled="busy || hasRunning || loading || legacyOnly" @send="text => execute(text)" /><small>发送会生成或更新导演方案；不会自动进入生图。对话内容由关联任务的真实输入与公开结果恢复。</small></div>
+            <div class="workspace-composer"><p v-if="legacyOnly" class="pane-note">此历史单镜头任务没有作品级 Project。原审批与恢复仍在任务记录中；点击“新作品”进入作品级创作。</p><div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可以继续输入补充，按顺序处理</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div><MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" /><small>发送会生成或更新导演方案；不会自动进入生图。任务内补充暂存在当前页面，刷新前请保留；已执行对话由真实任务记录恢复。</small></div>
           </section>
         </Pane>
       </Splitpanes>
@@ -420,6 +456,9 @@ select { color:var(--text-primary); background:var(--surface); border:1px solid 
 .stage-navigation button { background:transparent; color:var(--text-secondary); border:0; padding:7px 10px; border-radius:var(--radius-control); font-size:12px; flex-shrink:0; }
 .stage-navigation small { display:block; font-size:11px; margin-top:4px; }
 .stage-scroll { flex:1; overflow:auto; padding:18px max(20px, calc((100% - 800px) / 2)); font-size:14px; line-height:1.65; }
+.stage-scroll { animation:node-enter 140ms ease-out; }
+@keyframes node-enter { from { opacity:0; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
+@media(prefers-reduced-motion:reduce) { .stage-scroll { animation:none; } }
 .stage-scroll h3 { font-size:15px; }
 .stage-scroll details { padding:12px 0; border-bottom:1px solid var(--border); }
 .stage-scroll summary { cursor:pointer; } .stage-scroll dd { margin:4px 0 14px; white-space:pre-wrap; }
@@ -433,6 +472,9 @@ select { color:var(--text-primary); background:var(--surface); border:1px solid 
 .creative-turn { margin-bottom:24px; } .conversation-welcome { color:var(--text-secondary); font-size:14px; line-height:1.8; max-width:650px; }
 .workspace-composer { padding:8px max(20px, calc((100% - 820px) / 2)) 10px; flex-shrink:0; }
 .workspace-composer > small { display:block; margin-top:6px; color:var(--text-muted); font-size:11px; }
+.execution-controls, .queued-note { display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--text-secondary); font-size:12px; }
+.execution-controls { margin-bottom:6px; }
+.queued-note { justify-content:flex-end; margin:6px 0 16px; }
 .draft-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; font-size:12px; }
 .draft-actions span { display:flex; gap:5px; align-items:center; color:var(--text-secondary); }
 .asset-group, .shot-row, .history-row { padding-bottom:14px; margin-bottom:18px; border-bottom:1px solid var(--border); }

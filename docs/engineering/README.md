@@ -185,6 +185,14 @@ HTTP：`POST /api/comic/shots/{id}/prompt/compile`（`expected_project_version`�
 
 Director Critic 接受少量旧字段别名时，必须先标准化为 v2 叶子路径再执行白名单校验：`emotion → creative_decision.emotional_target`、`visual_direction → director_plan.visual_focus`、`camera_language → cinematography.camera_language`。标准化不扩展可写范围；硬约束、Project 身份、资产版本及 StyleBible 引用始终不可 Patch。兼容字段由分层方案投影，不能维护两份互相漂移的导演决策。
 
+### Phase 7.3：字段容错、上下文审计与执行中交互
+
+Critic 模型 findings 只读取 `CRITIC_ALLOWED_FIELD_PATHS` 内的公开 v2 叶子字段。已知别名先规范化（包括 `creative_brief.original_request → creative_decision.intent_summary`）；未知/越界字段写脱敏 `critic_warning`、原路径、`action=ignored` 和 Trace 后忽略，不使整个任务失败。输入上下文仍不是可写输出。模型 Patch 必须关联真实 warning、在可写白名单内、预期值匹配且不重复；无法应用的建议转为待人工审核，不放宽直接 `apply_patches` 的保护。确定性硬约束与资产身份/版本审核不受模型字段容错影响；只允许一次自动局部修订，重新审核未通过则等待用户。
+
+DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character_pose`、`character_presence`；沿用已有实体版本存储，不新增表。未设置的新增字段不参与历史审核指纹，避免旧 v2 审核凭据无故失效。每次导演执行记录脱敏 Director Input Snapshot：Project、Conversation、用户请求摘要、Brief 版本、选中资产/记忆版本、前序 Run 与 Trace。四类创意回归使用隔离文本模型替身，只验证路由、上下文与数据契约，不代表真实模型的导演审美评价。
+
+工作台执行中输入框保持可用：补充需求保留发送时模式，在**当前页面**排队，当前 Run 结束后依次提交，错误或结果未知时停止自动处理；可撤回未执行补充。队列不是后端 Conversation Message，刷新会丢失未提交补充，UI 必须明确说明。取消调用现有 Core Run 接口，Coordinator 在阶段前后和 Critic 事件边界检查取消；不能中断已发出的模型 HTTP 请求，但取消后不进入下一阶段、不保存新方案。复用已有 Run/Event，不增加 Runtime、API 或 Workflow。Fast 对话只展示创作理解与导演摘要；Professional 可查看独立节点，页面切换保留原会话与编辑草稿，尊重减少动画设置。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

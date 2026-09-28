@@ -8,6 +8,7 @@ from http.client import HTTPConnection
 from typing import Any
 
 import pytest
+from loguru import logger
 from test_comic_director_coordinator import SKILLS, _parts, _project
 from test_web_studio import app as app_fixture
 from test_web_studio import server as server_fixture
@@ -15,7 +16,12 @@ from test_web_studio import server as server_fixture
 from kantoku.config import ToolError
 from kantoku.core.runtime.models import ExecutionStatus
 from kantoku.domains.comic.critic import require_approved_director
-from kantoku.domains.comic.models import CreativeBriefUpdate, DirectorSpecDraft, DirectorSpecRequest
+from kantoku.domains.comic.models import (
+    ComicProjectInput,
+    CreativeBriefUpdate,
+    DirectorSpecDraft,
+    DirectorSpecRequest,
+)
 from kantoku.shells import web_studio
 
 # 复用已有离线 fixture，不复制应用初始化逻辑。
@@ -55,6 +61,129 @@ def _execute(application: web_studio.StudioApplication, project_id: str, mode: s
         ).project.current_version,
         "creation_mode": mode, **options,
     })
+
+
+def test_director_input_snapshot_logs_current_request_and_version_trace(
+    app: web_studio.StudioApplication, model: list[str],
+) -> None:
+    project_id = _project(app.comic_projects)
+    conversation = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})
+    messages: list[str] = []
+    sink = logger.add(lambda record: messages.append(record.record["message"]))
+    try:
+        result = _execute(app, project_id, "professional", task="强调人物迎战前的决心",
+                          conversation_id=conversation["id"])
+    finally:
+        logger.remove(sink)
+    snapshot = next(message for message in messages if "Director Input Snapshot" in message)
+    assert f"project_id={project_id}" in snapshot
+    assert f"conversation_id={conversation['id']}" in snapshot
+    assert "user_request=强调人物迎战前的决心" in snapshot
+    assert "brief_version=1" in snapshot
+    assert "memory_used=[]" in snapshot and "asset_used={}" in snapshot
+    assert "previous_run=-" in snapshot
+    trace_id = app.runtime_store.get_run(result["run_id"]).state["trace_id"]
+    assert f"trace_id={trace_id}" in snapshot
+
+
+@pytest.mark.parametrize("cancel_at", ["CreativeDecision", "CinematographyPlan", "critic"])
+def test_cancelled_run_stops_at_stage_boundary_without_saved_director(
+    app: web_studio.StudioApplication, model: list[str], monkeypatch: pytest.MonkeyPatch,
+    cancel_at: str,
+) -> None:
+    project_id = _project(app.comic_projects)
+    original = app._comic_director_model
+
+    def cancelling(messages: list[dict[str, str]]) -> str:
+        instruction = messages[0]["content"]
+        if (cancel_at != "critic" and f'"title": "{cancel_at}"' in instruction) or (
+            cancel_at == "critic" and "findings 每项" in instruction
+        ):
+            run = app.runtime_store.list_runs(domain="comic")[0]
+            cancelled = app.cancel_core_run(run.id)
+            assert cancelled["status"] == "cancelled"
+        return original(messages)
+
+    monkeypatch.setattr(app, "_comic_director_model", cancelling)
+    result = _execute(app, project_id, "professional")
+    assert result["status"] == "cancelled"
+    assert result["director_spec"] is None
+    assert app.comic_projects.get(project_id).project.director_version is None
+    assert len(model) == {"CreativeDecision": 1, "CinematographyPlan": 3, "critic": 4}[cancel_at]
+    events = app.runtime_store.list_events(result["run_id"])
+    assert not any(event.payload.get("director_event") == "director_spec_created"
+                   for event in events)
+
+
+def test_diverse_creative_contracts_use_current_project_context_not_previous_outputs(
+    app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """离线响应验证真实链路隔离，不声称证明线上模型的艺术质量。"""
+    cases = [
+        ("山海经穷奇站在悬崖边看远方村庄", "异兽与村庄的距离表达观察而非攻击"),
+        ("中式修仙少女穿白色古装站在树梢看远方村庄", "树梢人物与村落遥相呼应，保持白衣"),
+        ("少年雨夜坐在屋檐下思念故乡", "屋檐遮蔽与雨中远处灯光形成归属反差"),
+        ("未来城市机器人咖啡师", "机械手与咖啡器具表现未来日常的温度"),
+    ]
+    seen: list[str] = []
+
+    def call(messages: list[dict[str, str]]) -> str:
+        payload = json.loads(messages[1]["content"])
+        if "inputs" not in payload:
+            # 故意返回非法上下文字段，必须忽略而不使人物类任务失败。
+            return json.dumps({
+                "public_summary": "方案符合当前故事。", "confidence": 0.9,
+                "findings": [{"code": "MODEL_PATH", "severity": "warning",
+                              "field_path": "asset.character_id", "evidence": "无",
+                              "expected": "无", "suggested_action": "无"}],
+                "suggested_patches": [],
+            }, ensure_ascii=False)
+        context = payload["context"]
+        request = context["creative_brief"]["original_request"]
+        assert request == cases[len(seen) // 3][0]
+        assert "chat_history" not in context
+        assert context["relevant_assets"] == []
+        seen.append(request)
+        plan_text = next(plan for text, plan in cases if text == request)
+        parts = _parts()
+        parts[SKILLS[0]]["creative_decision"].update({
+            "intent_summary": request, "narrative_context": request,
+            "hard_constraints": [request],
+            "emotional_target": plan_text, "audience_experience": plan_text,
+            "narrative_focus": request,
+        })
+        parts[SKILLS[1]]["director_plan"].update({
+            "visual_strategy": plan_text, "visual_focus": request,
+            "creative_choices": [plan_text], "composition_strategy": plan_text,
+            "color_strategy": "依据当前场景的环境色形成主体关系",
+        })
+        parts[SKILLS[2]]["cinematography"].update({
+            "shot_size": "按当前主体和环境关系取景", "camera_angle": "平视",
+            "camera_distance": "同时容纳主体与环境", "spatial_feel": plan_text,
+            "lighting": "当前场景的环境光", "light_source": "场景内光源",
+            "light_direction": "侧方", "color_relationship": "主体和背景分离",
+            "depth_strategy": plan_text, "material_language": "保留当前主体材质",
+        })
+        for skill_id, name in zip(SKILLS[:3], (
+            "CreativeDecision", "DirectorPlan", "CinematographyPlan",
+        ), strict=True):
+            if f'"title": "{name}"' in messages[0]["content"]:
+                return json.dumps(next(iter(parts[skill_id].values())), ensure_ascii=False)
+        pytest.fail("unexpected model stage")
+
+    monkeypatch.setattr(app, "_comic_director_model", call)
+    plans = []
+    for request, _strategy in cases:
+        project = app.comic_projects.create(ComicProjectInput.model_validate({
+            "title": request,
+            "brief": {"original_request": request, "hard_constraints": [request]},
+        }))
+        result = _execute(app, project.project.project_id, "professional", task=request)
+        assert result["status"] == "completed"
+        assert result["director_spec"]["creative_decision"]["intent_summary"] == request
+        plans.append(result["director_spec"]["director_plan"]["visual_strategy"])
+    assert len(set(plans)) == 4
+    assert len(seen) == 12
 
 
 @pytest.mark.parametrize("mode", ["fast", "professional"])

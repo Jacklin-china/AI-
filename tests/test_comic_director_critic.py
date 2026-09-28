@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 from datetime import UTC, datetime
 from pathlib import Path
@@ -14,6 +15,7 @@ from test_comic_director_coordinator import SKILLS, _parts, _project, _request, 
 from test_comic_prompts import _setup as prompt_setup
 
 from kantoku.config import ToolError
+from kantoku.config.observability import request_trace
 from kantoku.core.runtime.models import ExecutionStatus
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.domains.comic.critic import (
@@ -44,7 +46,7 @@ def _brief() -> CreativeBriefInput:
 
 
 def _semantic(
-    findings: list[dict[str, Any]] | None = None, patches: list[dict[str, str]] | None = None,
+    findings: list[dict[str, Any]] | None = None, patches: list[dict[str, Any]] | None = None,
 ) -> str:
     return json.dumps({
         "public_summary": "公开视觉策略审核结果。", "confidence": 0.9,
@@ -88,6 +90,37 @@ def test_good_plan_passes_with_a_hash_bound_to_the_actual_spec() -> None:
     context = json.loads(seen[0][1]["content"])
     assert context["relevant_assets"] == []
     assert "chat_history" not in context
+
+
+def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> None:
+    spec = _spec()
+    payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
+    for field in ("style_boundary", "character_expression", "character_pose", "character_presence"):
+        payload["director_plan"].pop(field)
+    historical_hash = hashlib.sha256(json.dumps(
+        payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    ).encode("utf-8")).hexdigest()
+    assert director_hash(spec) == historical_hash
+
+
+def test_wrong_expected_value_is_review_needed_not_a_failed_task() -> None:
+    patch = {**_patch(_spec()), "expected_value": "另一份历史方案的内容"}
+    result = DirectorCriticEngine(lambda _messages: _semantic(
+        [_finding(_spec())], [patch],
+    )).review_and_revise(_spec(), _brief())
+    assert result.needs_review
+    assert result.revision_count == 0
+    assert result.critic_result.suggested_patches == []
+
+
+def test_duplicate_model_patch_is_applied_only_once() -> None:
+    patch = _patch(_spec())
+    replies = [_semantic([_finding(_spec())], [patch, patch]), _semantic()]
+    result = DirectorCriticEngine(lambda _messages: replies.pop(0)).review_and_revise(
+        _spec(), _brief(),
+    )
+    assert not result.needs_review
+    assert result.revision_count == 1
 
 
 def test_empty_template_quality_words_are_detected() -> None:
@@ -235,6 +268,113 @@ def test_patch_aliases_are_normalized_before_whitelist_validation() -> None:
     assert outcome.director_spec.emotion == patches[0]["value"]
     assert outcome.director_spec.visual_direction == patches[1]["value"]
     assert outcome.director_spec.camera_language == patches[2]["value"]
+
+
+def test_brief_field_is_mapped_to_director_spec_without_failing_review() -> None:
+    spec = _spec()
+    finding = {
+        "code": "INTENT_ALIGNMENT", "severity": "warning",
+        "field_path": "creative_brief.original_request",
+        "evidence": _brief().original_request,
+        "expected": "创意理解准确概括用户请求",
+        "suggested_action": "在创意理解中明确用户的原始叙事目标",
+    }
+
+    result = DirectorCriticEngine(
+        lambda _messages: _semantic([finding]),
+    ).review(spec, _brief())
+
+    assert result.verdict == "needs_revision"
+    assert result.findings[-1].field_path == "creative_decision.intent_summary"
+    assert result.suggested_patches == []
+
+
+def test_unknown_critic_field_is_warned_and_ignored() -> None:
+    records: list[str] = []
+    sink_id = logger.add(lambda record: records.append(str(record)))
+    try:
+        with request_trace("trace-ignore-field"):
+            result = DirectorCriticEngine(lambda _messages: _semantic([{
+                "code": "OUT_OF_SCOPE", "severity": "warning",
+                "field_path": "asset.character_id", "evidence": "unknown",
+                "expected": "不得审核资产身份", "suggested_action": "忽略该字段",
+            }])).review(_spec(), _brief())
+    finally:
+        logger.remove(sink_id)
+
+    assert result.verdict == "pass"
+    assert result.findings == []
+    log = "".join(records)
+    assert "critic_warning" in log
+    assert "received_field=asset.character_id" in log
+    assert "action=ignored" in log
+    assert "trace_id=trace-ignore-field" in log
+
+
+def test_patch_adapter_maps_phase_73_director_fields() -> None:
+    spec = _spec()
+    assert spec.creative_decision is not None
+    assert spec.director_plan is not None
+    assert spec.cinematography is not None
+    evidence = spec.director_plan.visual_focus
+    findings = [
+        {
+            "code": "EMOTIONAL_TARGET", "severity": "warning",
+            "field_path": "emotional_target", "evidence": spec.creative_decision.emotional_target,
+            "expected": "情绪目标服务故事", "suggested_action": "调整情绪目标",
+        },
+        {
+            "code": "COLOR_DIRECTION", "severity": "warning",
+            "field_path": "color_direction", "evidence": spec.director_plan.color_strategy,
+            "expected": "色彩形成叙事关系", "suggested_action": "调整色彩方向",
+        },
+        {
+            "code": "CAMERA_ANGLE", "severity": "warning",
+            "field_path": "camera_angle", "evidence": spec.cinematography.camera_angle,
+            "expected": "机位服务人物处境", "suggested_action": "调整机位",
+        },
+        {
+            "code": "CHARACTER_PRESENCE", "severity": "warning",
+            "field_path": "character_presence", "evidence": evidence,
+            "expected": "明确人物在画面中的存在方式", "suggested_action": "补充人物表现",
+        },
+    ]
+    patches = [
+        {"field": "emotional_target", "expected_value": spec.creative_decision.emotional_target,
+         "value": "克制的决心来自独自迎战", "reason": "连接情境"},
+        {"field": "color_direction", "expected_value": spec.director_plan.color_strategy,
+         "value": "冷雨压低环境，剑光只强调人物选择", "reason": "连接叙事"},
+        {"field": "camera_angle", "expected_value": spec.cinematography.camera_angle,
+         "value": "平视跟随人物，避免固定英雄低机位", "reason": "避免公式化"},
+        {"field": "character_presence", "expected_value": None,
+         "value": "人物不以体量取胜，以静止姿态对抗环境运动", "reason": "明确人物表现"},
+    ]
+    replies = [_semantic(findings, patches), _semantic()]
+
+    outcome = DirectorCriticEngine(
+        lambda _messages: replies.pop(0),
+    ).review_and_revise(spec, _brief())
+
+    assert outcome.revision_count == 1
+    assert not outcome.needs_review
+    assert outcome.director_spec.creative_decision.emotional_target == patches[0]["value"]
+    assert outcome.director_spec.director_plan.color_strategy == patches[1]["value"]
+    assert outcome.director_spec.cinematography.camera_angle == patches[2]["value"]
+    assert outcome.director_spec.director_plan.character_presence == patches[3]["value"]
+    assert outcome.director_spec.character_focus == patches[3]["value"]
+
+
+def test_model_patch_outside_whitelist_is_ignored_not_a_task_failure() -> None:
+    spec = _spec()
+    result = DirectorCriticEngine(lambda _messages: _semantic(
+        [_finding(spec)],
+        [{"field": "project.id", "expected_value": "current", "value": "other",
+          "reason": "模型错误地尝试修改身份"}],
+    )).review(spec, _brief())
+
+    assert result.verdict == "needs_revision"
+    assert result.allowed_patches == ["director_plan.composition_strategy"]
+    assert result.suggested_patches == []
 
 
 @pytest.mark.parametrize("field", [

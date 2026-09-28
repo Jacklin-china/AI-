@@ -5,7 +5,7 @@ import ts from 'typescript'
 
 const source = readFileSync(new URL('../src/domains/comic/directorPresentation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
-const { canConfirmDirector, chronologicalDirectorExecutions, directorIsStale, directorSummary, draftConfirmationKey, stageDraftKey, publicDirectorSections } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+const { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, draftConfirmationKey, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 const spec = {
   schema_version: 2, spec_id: 'director', version: 2, creative_brief_version: 3,
   creative_decision: { intent_summary: '异兽观察文明', emotional_target: '孤独', private_thought: 'must not show' },
@@ -88,4 +88,30 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /restoreChoice === Number\(version\.version\)/)
   assert.match(view, /!\['failed', 'waiting'\]\.includes\(active\.value\?\.status/)
   assert.match(view, /if \(failedRun\) \{ selectedRun\.value = failedRun\.run_id/)
+})
+test('Fast keeps only creative and director summary; v2 optional fields and narrative context are public', () => {
+  const current = { ...spec, creative_decision: { narrative_context: '远古异兽观察文明' },
+    director_plan: { character_presence: '克制而孤独', style_boundary: null },
+    cinematography: { camera_language: '平视长焦观察' } }
+  const fields = publicDirectorSections(current)
+  assert.equal(fields[0].fields.narrative_context, '远古异兽观察文明')
+  assert.equal(fields[1].fields.character_presence, '克制而孤独')
+  assert.equal('style_boundary' in fields[1].fields, false)
+  assert.match(directorSummary(current, 'professional'), /摄影方案|平视长焦/)
+  assert.doesNotMatch(directorSummary(current, 'fast'), /摄影方案|平视长焦/)
+})
+test('toolbar does not repeat an auto-generated raw request title', () => {
+  assert.equal(workspaceProjectTitle('我想制作一张穷奇', '我想制作一张穷奇站在悬崖'), '漫剧作品')
+  assert.equal(workspaceProjectTitle('暮色的守望者', '我想制作一张穷奇'), '暮色的守望者')
+})
+test('queued supplements never start while a Run is busy or outcome is unknown', () => {
+  const ready = { busy: false, running: false, loading: false, error: false, cancelling: false }
+  assert.equal(canDispatchDirectorInput(ready), true)
+  for (const key of Object.keys(ready)) assert.equal(canDispatchDirectorInput({ ...ready, [key]: true }), false)
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  assert.match(view, /:disabled="loading \|\| legacyOnly" @send="sendInput"/)
+  assert.match(view, /queuedInputs\.value\.push\(\{ id: \+\+nextInputId, text, mode: mode\.value \}\)/)
+  assert.match(view, /await execute\(next.text, \{\}, next.mode\)/)
+  assert.match(view, /await cancelRun\(task.run_id\)/)
+  assert.match(view, /prefers-reduced-motion:reduce/)
 })
