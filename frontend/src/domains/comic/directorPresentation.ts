@@ -27,3 +27,58 @@ export const directorFieldLabels: Record<string, string> = {
   movement: '运镜', lighting: '光影', light_source: '光源', light_direction: '光源方向',
   color_relationship: '色彩关系', depth_strategy: '景深', material_language: '材质',
 }
+
+export const directorStateLabels: Record<string, string> = {
+  pending: '未开始', running: '执行中', completed: '已完成', waiting: '需要审核',
+  needs_review: '需要审核', failed: '失败', stale: '已过期', cancelled: '已取消',
+}
+export function publicDirectorSections(spec: Record<string, unknown> | null): { title: string; fields: Record<string, unknown> }[] {
+  if (!spec) return []
+  // Strict public v2 projection: never render legacy fields or arbitrary model metadata.
+  return [['creative_decision', '创作理解'], ['director_plan', '导演方案'], ['cinematography', '摄影方案']]
+    .flatMap(([key, title]) => {
+      const body = spec[key!]
+      if (!body || typeof body !== 'object' || Array.isArray(body)) return []
+      return [{ title: title!, fields: Object.fromEntries(Object.entries(body).filter(([field]) => field in directorFieldLabels)) }]
+    })
+}
+export function directorSummary(spec: Record<string, unknown> | null): string {
+  return publicDirectorSections(spec).map(section => {
+    const values = Object.values(section.fields).filter(value => typeof value === 'string' && value)
+    return `**${section.title}**\n\n${values.slice(0, 2).join('；')}`
+  }).join('\n\n')
+}
+export function directorIsStale(
+  spec: Record<string, unknown> | null, briefVersion?: number, directorVersion?: number | null,
+  assets: { asset_id: string; version: number; pinned_version: number | null; state: string }[] = [],
+): boolean {
+  if (!spec) return false
+  if (briefVersion && spec.creative_brief_version !== briefVersion) return true
+  if (directorVersion && spec.version !== directorVersion) return true
+  const refs = spec.asset_versions as Record<string, number> | undefined
+  return Object.entries(refs ?? {}).some(([id, version]) => {
+    const asset = assets.find(item => item.asset_id === id.replace(/^asset:/, ''))
+    return !asset || asset.state === 'deleted' || (asset.pinned_version ?? asset.version) !== version
+  })
+}
+export function draftConfirmationKey(projectId: string, spec: Record<string, unknown> | null): string {
+  if (!spec || spec.schema_version !== 2) return ''
+  return JSON.stringify([projectId, spec.spec_id, spec.version, spec.creative_brief_version,
+    spec.asset_versions, spec.storyboard_version, spec.shot_version,
+    publicDirectorSections(spec), spec.critic_result])
+}
+export function canConfirmDirector(status: string | undefined, spec: Record<string, unknown> | null, stale: boolean, dirty: boolean): boolean {
+  return status === 'completed' && spec?.schema_version === 2 && !stale && !dirty &&
+    publicDirectorSections(spec).length === 3 && (spec.critic_result as { verdict?: string } | null)?.verdict === 'pass'
+}
+export function stageDraftKey(projectId: string, runId: string, stage: string): string {
+  return JSON.stringify([projectId, runId, stage])
+}
+export function chronologicalDirectorExecutions<T extends { run_id: string }>(
+  executions: T[], records: Record<string, { started_at: string }>,
+): T[] {
+  // A task summary may arrive before its persisted input. Never insert an orphan
+  // assistant turn at the top; the pending user bubble remains until Run hydration.
+  return executions.filter(item => !!records[item.run_id]).sort((a, b) =>
+    records[a.run_id]!.started_at.localeCompare(records[b.run_id]!.started_at))
+}

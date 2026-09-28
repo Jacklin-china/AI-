@@ -171,6 +171,16 @@ HTTP：`POST/GET /api/comic/projects/{id}/storyboards`；`GET/PUT /api/comic/sto
 
 HTTP：`POST /api/comic/shots/{id}/prompt/compile`（`expected_project_version`、`expected_shot_version`）；`GET /api/comic/shots/{id}/prompt[?version=n]`；`GET /api/comic/shots/{id}/prompt/versions`；`PUT /api/comic/shots/{id}/prompt`（人工编辑，含预期作品/Prompt 版本）；`POST /api/comic/shots/{id}/prompt/restore`（从兼容的旧版本追加新修订）。下一图片生产阶段才把已选定的 Prompt Artifact 作为不可变输入，调用共享 Image Capability，并沿用预算预占、幂等、Artifact、Provider Job 恢复和 QC 的既有基础设施。
 
+## Phase 7.2.6：同一创作 Workspace 的前端投影
+
+漫剧工作台只维护一份 `DirectorWorkspace`，复用现有 Splitpanes、MessageComposer、用户气泡、Markdown 与图片附件。普通/专业模式控制下一次导演接口的 `creation_mode` 以及节点可见深度，不创建第二套 Conversation、Coordinator 或工作流。左侧资产入口切换中央资产页面，不再使用覆盖对话的制作资产 Drawer；Inspector 默认关闭，只占上方节点区，不改变下方聊天宽度。节点编辑草稿按 Project/Run/Stage 隔离，切换页面不丢草稿；实际保存、重跑、恢复与 Prompt 编译调用已有 API，使用已有预期版本检查。
+
+导演 Draft 的“待确认/本界面已确认”是**前端用户确认状态**，不是 Runtime 成功状态或服务端 Approval。确认绑定不可变 DirectorSpec v2、Brief/资产/分镜/镜头版本；真实失败、Critic 未通过、来源过期或未保存的当前任务修改均禁止确认。本浏览器保存确认指纹，修改/恢复新版本后必须重新确认。Prompt 编译和下一步制作入口检查该确认；后端没有对应确认契约，因此其他客户端与直接 API 调用的强制门禁仍需后续后端接入，不能宣称已经完成。
+
+当前导演 API 接收 `conversation_id` 并保存在 Core Run，但不追加 Conversation Message。前端为 Project 复用一个既有 Conversation ID，并由真实关联 Run 的用户任务、公开导演摘要与修改记录恢复连续对话展示；不调用旧 Guided 聊天路由去偷偷创建单镜头生产。**数据库 Conversation.messages 同步、跨设备确认仍未接入**。已有单镜头 Run/Artifact/审批/供应商查询保留兼容入口；新作品没有接入图片生产时必须明确说明，不伪装出图。UI 只呈现 v2 白名单公开字段、真实节点摘要和 trace/error ID，不输出旧字段或私有思考。
+
+布局参考 [Figma 导航](https://help.figma.com/hc/en-us/articles/360039831974-Explore-the-navigation-bar-and-left-sidebar)、[Runway 对话式创作](https://help.runwayml.com/hc/en-us/articles/51601639579667-Creating-with-Runway-Agent)、[InvokeAI](https://github.com/invoke-ai/InvokeAI)、[Langflow](https://github.com/langflow-ai/langflow) 与 [ComfyUI Frontend](https://github.com/Comfy-Org/ComfyUI_frontend)。只提炼可收起导航、节点工作区、上下文详情与结果历史，不复制节点 Runtime 或引入另一套组件体系。离线 UI 验收可运行 `frontend/tests/workspace-preview.mjs`，使用隔离端口与内存测试数据；测试数据不写入业务数据库，不冒充真实模型验收。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

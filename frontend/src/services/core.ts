@@ -12,8 +12,8 @@ export interface RuntimeEvent {
 
 export type CreationMode = 'fast' | 'professional'
 export interface ComicProjectContext {
-  project: { project_id: string; title: string; current_version: number }
-  creative_brief: { original_request: string }
+  project: { project_id: string; title: string; current_version: number; director_version?: number | null }
+  creative_brief: { original_request: string; version?: number; hard_constraints?: string[]; soft_preferences?: string[]; creative_freedom?: string[] }
 }
 export interface DirectorNodeSummary {
   stage: string
@@ -58,6 +58,46 @@ export async function createDirectorExecution(
   projectId: string, body: Record<string, unknown>,
 ): Promise<DirectorExecution> {
   return corePost(`/api/comic/projects/${encodeURIComponent(projectId)}/director-spec`, body)
+}
+
+// Workspace projections of existing Comic APIs; no parallel domain store.
+export interface ComicAssetView {
+  asset_id: string; name: string; version: number; pinned_version: number | null; state: string
+  details: Record<string, unknown>; fixed_constraints: string[]; reference_artifact_ids: string[]
+}
+export interface ComicStoryboardView {
+  storyboard_id: string; title: string; description: string; version: number; director_spec_version: number; status: string
+}
+export interface ComicShotView {
+  shot_id: string; sequence_number: number; purpose: string; subject: string; action: string
+  environment: string; version: number; status: string; character_asset_versions: { asset_id: string; version: number }[]
+  scene_asset_versions: { asset_id: string; version: number }[]; style_version: { asset_id: string; version: number } | null
+}
+export async function getComicAssets(id: string): Promise<ComicAssetView[]> {
+  return (await coreGet<{ assets: ComicAssetView[] }>(`/api/comic/projects/${encodeURIComponent(id)}/assets`, `comic-assets:${id}`))?.assets ?? []
+}
+export async function getComicStoryboards(id: string): Promise<ComicStoryboardView[]> {
+  return (await coreGet<{ storyboards: ComicStoryboardView[] }>(`/api/comic/projects/${encodeURIComponent(id)}/storyboards`, `comic-boards:${id}`))?.storyboards ?? []
+}
+export async function getComicShots(id: string): Promise<ComicShotView[]> {
+  return (await coreGet<{ shots: ComicShotView[] }>(`/api/comic/storyboards/${encodeURIComponent(id)}/shots`, `comic-shots:${id}`))?.shots ?? []
+}
+export async function getDirectorVersions(id: string): Promise<Record<string, unknown>[]> {
+  return (await coreGet<{ versions: Record<string, unknown>[] }>(`/api/comic/projects/${encodeURIComponent(id)}/director-spec/versions`, `comic-director-versions:${id}`))?.versions ?? []
+}
+export function getCurrentDirector(id: string): Promise<Record<string, unknown> | null> {
+  return coreGet(`/api/comic/projects/${encodeURIComponent(id)}/director-spec`, `comic-director-current:${id}`)
+}
+export function restoreDirectorVersion(id: string, version: number, projectVersion: number): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/projects/${encodeURIComponent(id)}/director-spec/restore`, { version, expected_project_version: projectVersion })
+}
+export async function getComicPromptVersions(id: string): Promise<Record<string, unknown>[]> {
+  return (await coreGet<{ versions: Record<string, unknown>[] }>(`/api/comic/shots/${encodeURIComponent(id)}/prompt/versions`, `comic-prompt-versions:${id}`))?.versions ?? []
+}
+export function compileComicPrompt(id: string, projectVersion: number, shotVersion: number): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/shots/${encodeURIComponent(id)}/prompt/compile`, {
+    expected_project_version: projectVersion, expected_shot_version: shotVersion,
+  })
 }
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '')
