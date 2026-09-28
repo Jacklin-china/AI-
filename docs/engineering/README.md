@@ -119,6 +119,16 @@ Professional Coordinator 先用 Engine 审核，再经现有 SkillRegistry 校�
 
 本轮没有修改 HTTP/UI 入口；Fast 暂时仍保留前阶段的轻量导演路径，未审核 v2 不能直接进入 PromptCompiler。下一阶段将 Fast/Professional 应用入口接到同一 Coordinator，Fast 可精简公开节点但仍保留约束检查与必要审核；Professional 展示公开结论、局部修订和人工决定。没有图片 Provider、Vision QC 或新 Runtime。本轮测试使用文本模型替身，不冒充真实付费模型验收。
 
+### Phase 7.2.5：Creation Mode 应用接入
+
+创建导演方案的原 POST 现在接受可选 `creation_mode=fast/professional`。该字段是客户端交互策略，进入 Coordinator 后映射到原 `execution_mode`，不增加另一份持久化模式或 Runtime。未传此字段的旧请求/人工 v1 编辑和读取接口仍兼容；显式模式任务全部经过同一个 `ComicDirectorCoordinator`、原 SkillRegistry、共享文本调用与实际 Critic（最多一次自动 Patch）。Fast 隐藏内部节点与审核细节，不绕过约束与质量门禁。严重冲突仍等待处理，不能以默认方案假装成功。
+
+模式请求返回 `{run_id,status,director_spec,director_execution_summary,recovery_required}`；summary 含 `mode/current_stage/status_label/available_actions/stages`。Fast 只公开自然状态、结果摘要和必要错误；Professional 返回五个节点的真实状态、输入版本、结构化公开结果、摘要与审核结论。最终 DirectorSpec 保持同一 v2 契约并绑定审核指纹，可进入现有 Shot Prompt 编译入口；不自动创造 Storyboard/Shot，不提交图片或视频。已有 `/projects/{id}/tasks` 查询同一 Run Store，模式任务按上述用户可见投影返回，不把 Fast 的内部日志当专业节点呈现，也不出现在旧生产任务中心。
+
+Professional 支持 `previous_run_id + rerun_from`，可用 `stage_edits={节点名:完整公开节点对象}` 修改创意/视觉/摄影节点；由原 Skill 契约验证，后续阶段重新执行并重新 Critic，追加新导演版本。审核结论不能由客户端编辑，修改用户硬约束会被拦截；真正修改原始需求应调用已有 Brief 编辑 API。`resume_run_id` 显式恢复失败/等待/旧实例中断的任务，校验作品、模式、任务、Brief、资产、分镜与镜头版本，复用已完成阶段，创建后继 Core Run 并保留来源 Run。仍在本实例执行的任务禁止重复启动；已经完成的任务直接返回原版本结果，不调用模型。服务重启仅显示可恢复，不自动重发未知文本调用；用户显式恢复时未完成阶段可能产生新的文本费用。
+
+新增公开事件 `director_mode_selected/director_stage_visible/director_stage_completed` 使用已有 Runtime Event payload；原 Skill/审核事件仍保留用于后端追踪。创作域的「导演方案」工作区复用当前品牌、样式 Token 和 API 客户端，普通模式仅输入需求与查看摘要；专业模式按需展开节点/版本/编辑。旧制作对话、资产栏与 Inspector 保留可收起，不复制聊天或生产 Workflow。刷新后从现有作品与任务 API 恢复，浏览器只缓存上次作品 ID，不缓存真实任务结果。当前只有导演与 Prompt 基础能力，没有新图片、Vision QC 或视频链路。
+
 HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
 
 ### 漫剧任务追踪补充（Storyboard 前）

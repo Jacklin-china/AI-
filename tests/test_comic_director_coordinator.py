@@ -149,7 +149,7 @@ def _event_names(runtime_store: RuntimeStore, run_id: str) -> list[str]:
     return [event.payload["director_event"] for event in runtime_store.list_events(run_id)]
 
 
-def test_fast_uses_one_core_run_and_saves_v2_without_critic(tmp_path: Path) -> None:
+def test_fast_uses_one_core_run_and_saves_reviewed_v2(tmp_path: Path) -> None:
     coordinator, store, runtime, calls = _setup(tmp_path)
     project_id = _project(store)
 
@@ -157,17 +157,15 @@ def test_fast_uses_one_core_run_and_saves_v2_without_critic(tmp_path: Path) -> N
 
     assert calls == SKILLS[:3]
     assert result.director_spec.schema_version == 2
-    assert result.director_spec.critic_result is None
+    assert result.director_spec.critic_result.verdict == "pass"
     assert store.get_director(project_id) == result.director_spec
     assert runtime.get_run(result.run_id).status == ExecutionStatus.COMPLETED
     assert len(runtime.list_runs(domain="comic", interaction_mode=InteractionMode.AUTONOMOUS)) == 1
-    assert _event_names(runtime, result.run_id) == [
-        "director_run_started", "creative_understanding_started",
-        "creative_understanding_completed", "visual_direction_started",
-        "visual_direction_completed", "cinematography_started",
-        "cinematography_completed", "director_assemble_started",
-        "director_assemble_completed", "director_spec_created", "director_run_completed",
-    ]
+    names = _event_names(runtime, result.run_id)
+    assert names[0] == "director_run_started" and names[-1] == "director_run_completed"
+    assert "director_mode_selected" in names
+    assert names.count("director_stage_completed") == 5
+    assert "director_critic_completed" in names
 
 
 def test_professional_records_each_stage_and_public_critic(tmp_path: Path) -> None:

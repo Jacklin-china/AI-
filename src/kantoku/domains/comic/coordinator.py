@@ -10,9 +10,11 @@ from collections.abc import Callable, Mapping
 from typing import Any, Literal
 from uuid import uuid4
 
+from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from kantoku.config import ToolError
+from kantoku.config.logging_setup import redact_secrets
 from kantoku.config.observability import (
     current_trace_id,
     public_error,
@@ -26,12 +28,15 @@ from kantoku.core.skills import SkillRegistry
 
 from .critic import DirectorCriticEngine, require_approved_director
 from .models import (
+    CinematographyPlan,
     ComicAsset,
     ComicContext,
     ComicProjectSnapshot,
     ComicShot,
     ComicStoryboard,
+    CreativeDecision,
     DirectorCriticResult,
+    DirectorPlan,
     DirectorSpec,
     DirectorSpecDraft,
 )
@@ -40,6 +45,70 @@ from .projects import ComicContextBuilder, ComicProjectStore
 StageExecutor = Callable[
     [str, Mapping[str, Any], Mapping[str, Any]], Mapping[str, Any]
 ]
+DIRECTOR_STAGES = (
+    "creative_understanding", "visual_direction", "cinematography",
+    "director_critic", "director_assemble",
+)
+FAST_LABELS = {
+    "creative_understanding": "正在理解创意",
+    "visual_direction": "正在设计视觉方案",
+    "cinematography": "正在设计视觉方案",
+    "director_critic": "正在设计视觉方案",
+    "director_assemble": "正在生成导演方案",
+    "director_spec": "导演方案已完成",
+}
+
+
+def director_execution_summary(run: Any) -> dict[str, Any]:
+    """用户可见投影；Fast 不传内部节点、输出或审核细节。"""
+    mode = run.state["execution_mode"]
+    status = run.status.value
+    current = (run.current_node or "creative_understanding").removeprefix("comic.")
+    label = FAST_LABELS.get(current, "正在设计视觉方案")
+    if status == "waiting":
+        label = "创作方案需要调整"
+    elif status == "failed":
+        label = "导演方案生成失败"
+    actions = ["view"]
+    if status in {"failed", "waiting"}:
+        actions.append("resume")
+    if mode == "professional" and status in {"completed", "failed", "waiting"}:
+        actions.extend(["edit_stage", "rerun_stage"])
+    summary: dict[str, Any] = {
+        "mode": mode, "current_stage": current if mode == "professional" else label,
+        "status_label": label, "available_actions": actions,
+        "stages": [], "error_id": run.state.get("error_id"),
+    }
+    if mode == "professional":
+        for stage in DIRECTOR_STAGES:
+            key = f"comic.{stage}"
+            output = run.state.get("stage_outputs", {}).get(key)
+            node_status = "completed" if output is not None else "pending"
+            if run.state.get("failed_skill_id") == key:
+                node_status = "failed"
+            elif current == stage and status in {"running", "waiting"}:
+                node_status = status
+            public_output = output or {}
+            candidate_key = {
+                "creative_understanding": "creative_decision",
+                "visual_direction": "director_plan", "cinematography": "cinematography",
+            }.get(stage)
+            candidate = run.state.get("director_candidate", {})
+            if candidate_key and candidate_key in candidate:
+                public_output = {candidate_key: candidate[candidate_key]}
+            summary["stages"].append({
+                "stage": stage, "status": node_status,
+                "input_versions": run.state["input_versions"],
+                "output": public_output,
+                "output_summary": next((
+                    value.get("public_summary") or value.get("intent_summary")
+                    or value.get("visual_strategy") or value.get("lighting")
+                    or value.get("visual_direction")
+                    for value in public_output.values() if isinstance(value, dict)
+                ), None),
+            })
+        summary["critic_result"] = run.state.get("critic_result")
+    return summary
 
 
 class DirectorCoordinatorRequest(BaseModel):
@@ -60,6 +129,9 @@ class DirectorCoordinatorRequest(BaseModel):
     ] | None = None
     previous_run_id: str | None = None
     trace_id: str | None = Field(default=None, max_length=100)
+    conversation_id: str | None = Field(default=None, max_length=100)
+    worker_instance_id: str | None = Field(default=None, max_length=100)
+    stage_edits: dict[str, Any] = Field(default_factory=dict, max_length=1)
 
     @model_validator(mode="after")
     def validate_scope(self) -> DirectorCoordinatorRequest:
@@ -78,8 +150,16 @@ class DirectorCoordinatorRequest(BaseModel):
             raise ValueError("导演方案必须属于当前作品")
         if (self.rerun_from is None) != (self.previous_run_id is None):
             raise ValueError("重新执行阶段必须指定来源 Run 和起始阶段")
-        if self.rerun_from is not None and self.execution_mode != "professional":
-            raise ValueError("只有专业模式允许重新执行导演阶段")
+        if self.stage_edits:
+            models = {
+                "creative_understanding": CreativeDecision,
+                "visual_direction": DirectorPlan,
+                "cinematography": CinematographyPlan,
+            }
+            if (self.execution_mode != "professional" or self.rerun_from not in models
+                    or set(self.stage_edits) != {self.rerun_from}):
+                raise ValueError("仅专业模式允许修改选定的公开节点")
+            models[self.rerun_from].model_validate(self.stage_edits[self.rerun_from])
         return self
 
 
@@ -136,6 +216,8 @@ class ComicDirectorCoordinator:
             "task_type": "director",
             "project_id": project.project_id,
             "execution_mode": request.execution_mode,
+            "conversation_id": request.conversation_id,
+            "worker_instance_id": request.worker_instance_id,
             "trace_id": trace_id,
             "task": request.task,
             "input_versions": input_versions,
@@ -144,6 +226,8 @@ class ComicDirectorCoordinator:
             "last_completed_step": None,
             "rerun_from": request.rerun_from,
             "previous_run_id": request.previous_run_id,
+            "storyboard_id": request.storyboard.storyboard_id if request.storyboard else None,
+            "shot_id": request.shot.shot_id if request.shot else None,
         }
         interaction_mode = (
             InteractionMode.AUTONOMOUS
@@ -155,13 +239,24 @@ class ComicDirectorCoordinator:
             interaction_mode=interaction_mode,
         )
         state["run_id"] = run.id
+        state["task_id"] = run.id
         stages: list[DirectorStageRecord] = []
         outputs: dict[str, Any] = {
             key: value for stage in reused_outputs.values() for key, value in stage.items()
         }
         current_skill = "comic.director"
 
-        with request_trace(trace_id):
+        with request_trace(trace_id), logger.contextualize(
+            component="comic.director", project_id=project.project_id,
+            run_id=run.id, task_id=run.id, execution_mode=request.execution_mode,
+            conversation_id=request.conversation_id or "-",
+        ):
+            logger.info(
+                "director task received versions={} user_input={}", input_versions,
+                redact_secrets(
+                    request.task or request.snapshot.creative_brief.original_request,
+                )[:1000],
+            )
             self.runtime_store.update_run(
                 run.id, status=ExecutionStatus.RUNNING, state=state,
                 current_node="creative_understanding",
@@ -170,6 +265,11 @@ class ComicDirectorCoordinator:
                 run.id, RuntimeEventType.RUN_STARTED, "director_run_started",
                 trace_id=trace_id, project_id=project.project_id,
                 execution_mode=request.execution_mode,
+            )
+            self._event(
+                run.id, RuntimeEventType.NODE_PROGRESS, "director_mode_selected",
+                trace_id=trace_id, project_id=project.project_id,
+                mode=request.execution_mode,
             )
             try:
                 if "comic.creative_understanding" not in reused_outputs:
@@ -197,27 +297,24 @@ class ComicDirectorCoordinator:
                             "shot_context": self._shot_context(request),
                         }, context_payload, request, state, outputs, stages,
                     )
-                if request.execution_mode == "professional":
-                    provisional = self._provisional_spec(
-                        outputs, request, critic_result=None,
+                # Fast 隐藏审核细节，不绕过真实审核和受限修订。
+                provisional = self._provisional_spec(outputs, request, critic_result=None)
+                self._run_stage(
+                    run.id, "comic.director_critic", {
+                        "director_spec": provisional.model_dump(mode="json"),
+                    }, context_payload, request, state, outputs, stages,
+                )
+                if state.get("needs_review"):
+                    self.runtime_store.update_run(
+                        run.id, status=ExecutionStatus.WAITING, state=state,
+                        current_node="director_critic",
                     )
-                    self._run_stage(
-                        run.id, "comic.director_critic", {
-                            "director_spec": provisional.model_dump(mode="json"),
-                        }, context_payload, request, state, outputs, stages,
+                    return DirectorCoordinatorResult(
+                        run_id=run.id, trace_id=trace_id, project_id=project.project_id,
+                        execution_mode=request.execution_mode, director_spec=None,
+                        critic_result=DirectorCriticResult.model_validate(outputs["critic_result"]),
+                        needs_review=True, stages=stages,
                     )
-                    if state.get("needs_review"):
-                        self.runtime_store.update_run(
-                            run.id, status=ExecutionStatus.WAITING, state=state,
-                            current_node="director_critic",
-                        )
-                        return DirectorCoordinatorResult(
-                            run_id=run.id, trace_id=trace_id, project_id=project.project_id,
-                            execution_mode=request.execution_mode, director_spec=None,
-                            critic_result=DirectorCriticResult.model_validate(
-                                outputs["critic_result"],
-                            ), needs_review=True, stages=stages,
-                        )
                 assemble_input = {
                     "creative_decision": outputs["creative_decision"],
                     "director_plan": outputs["director_plan"],
@@ -244,8 +341,7 @@ class ComicDirectorCoordinator:
                     "critic_result": outputs.get("critic_result"),
                 })
                 draft = DirectorSpecDraft.model_validate(draft_data)
-                if request.execution_mode == "professional":
-                    require_approved_director(draft)
+                require_approved_director(draft)
                 spec = self.project_store.save_director(
                     project.project_id, draft,
                     expected_project_version=project.current_version,
@@ -258,6 +354,7 @@ class ComicDirectorCoordinator:
                 ).project.current_version
                 state["stale_dependents"] = stale
                 state["last_completed_step"] = "director_spec_created"
+                state["task_status"] = "completed"
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.RUNNING, state=state,
                     current_node="director_spec",
@@ -291,11 +388,13 @@ class ComicDirectorCoordinator:
                     execution_mode=request.execution_mode,
                 )
                 state.update({
+                    "task_status": "failed",
                     "error_id": failure["error_id"],
                     "error_type": type(error).__name__,
                     "failed_skill_id": current_skill,
                     "last_completed_step": state.get("last_completed_step"),
                 })
+                error._kantoku_public_failure = failure
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.FAILED, state=state,
                     current_node=current_skill, error=failure["error_id"],
@@ -325,6 +424,13 @@ class ComicDirectorCoordinator:
         state["active_skill_id"] = skill_id
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
+        )
+        self._event(
+            run_id, RuntimeEventType.NODE_PROGRESS, "director_stage_visible",
+            trace_id=trace_id, project_id=request.snapshot.project.project_id,
+            mode=request.execution_mode,
+            visible_stage=node_id if request.execution_mode == "professional"
+            else FAST_LABELS[node_id],
         )
         if skill_id != "comic.director_critic":
             self._event(
@@ -375,6 +481,12 @@ class ComicDirectorCoordinator:
                 raw_output = {"director_spec": self._provisional_spec(
                     outputs, request, critic_result=outputs.get("critic_result"),
                 ).model_dump()}
+            elif node_id in request.stage_edits:
+                output_key = {
+                    "creative_understanding": "creative_decision",
+                    "visual_direction": "director_plan", "cinematography": "cinematography",
+                }[node_id]
+                raw_output = {output_key: request.stage_edits[node_id]}
             else:
                 raw_output = self.stage_executor(skill_id, inputs, stage_context)
             if not isinstance(raw_output, Mapping):
@@ -387,6 +499,7 @@ class ComicDirectorCoordinator:
         state["stage_outputs"][skill_id] = validated
         state["completed_stages"].append(skill_id)
         state["last_completed_step"] = node_id
+        state["task_status"] = "planning" if not state.get("needs_review") else "needs_review"
         stages.append(DirectorStageRecord(
             skill_id=skill_id, output_keys=sorted(validated),
         ))
@@ -400,6 +513,13 @@ class ComicDirectorCoordinator:
                 execution_mode=request.execution_mode, skill_id=skill_id,
                 output_keys=sorted(validated),
             )
+        self._event(
+            run_id, RuntimeEventType.NODE_PROGRESS, "director_stage_completed",
+            trace_id=trace_id, project_id=request.snapshot.project.project_id,
+            mode=request.execution_mode,
+            visible_stage=node_id if request.execution_mode == "professional"
+            else FAST_LABELS[node_id],
+        )
 
     def _reused_outputs(
         self, request: DirectorCoordinatorRequest, input_versions: Mapping[str, int],
@@ -407,17 +527,29 @@ class ComicDirectorCoordinator:
         if request.previous_run_id is None or request.rerun_from is None:
             return {}
         previous = self.runtime_store.get_run(request.previous_run_id)
+        interrupted = (
+            previous.status is ExecutionStatus.RUNNING and request.worker_instance_id
+            and previous.state.get("worker_instance_id") != request.worker_instance_id
+        )
         if (
             previous.domain != "comic"
             or previous.workflow != "comic.director"
-            or previous.status not in {
+            or (not interrupted and previous.status not in {
                 ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.WAITING,
-            }
+            })
             or previous.state.get("project_id") != request.snapshot.project.project_id
-            or previous.state.get("execution_mode") != "professional"
+            or previous.state.get("execution_mode") != request.execution_mode
+            or previous.state.get("task") != request.task
             or previous.state.get("input_versions") != dict(input_versions)
         ):
             raise ToolError("来源导演 Run 与当前作品或输入版本不一致")
+        if request.execution_mode == "fast":
+            completed = previous.state.get("completed_stages", [])
+            first_missing = next((stage for stage in DIRECTOR_STAGES
+                                  if f"comic.{stage}" not in completed), "director_critic")
+            if (previous.status is ExecutionStatus.COMPLETED
+                    or request.rerun_from != first_missing):
+                raise ToolError("快速模式仅允许恢复未完成步骤")
         order = [
             "comic.creative_understanding", "comic.visual_direction",
             "comic.cinematography", "comic.director_critic",

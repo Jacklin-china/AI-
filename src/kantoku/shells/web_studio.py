@@ -89,7 +89,14 @@ from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
 from kantoku.domains.comic.assets import ComicAssetStore
-from kantoku.domains.comic.director import plan_director_spec
+from kantoku.domains.comic.coordinator import (
+    DIRECTOR_STAGES,
+    ComicDirectorCoordinator,
+    DirectorCoordinatorRequest,
+    director_execution_summary,
+)
+from kantoku.domains.comic.critic import DirectorCriticEngine
+from kantoku.domains.comic.director import execute_director_stage, plan_director_spec
 from kantoku.domains.comic.models import (
     ComicAssetCreateRequest,
     ComicAssetDeleteRequest,
@@ -399,6 +406,13 @@ class StudioApplication:
         self.runtime = GraphRuntime(self.runtime_store)
         self.skills = SkillRegistry()
         SkillLoader(ROOT / "skills", project_root=ROOT).load(self.skills)
+        self.comic_director = ComicDirectorCoordinator(
+            registry=self.skills, runtime_store=self.runtime_store,
+            project_store=self.comic_projects, stage_executor=self._comic_director_stage,
+            critic_engine=DirectorCriticEngine(
+                lambda messages: self._comic_director_model(messages),
+            ),
+        )
         settings = get_settings()
         self.runtime_settings = getattr(settings, "runtime", RuntimeSettings())
         video_settings = getattr(settings, "video", VideoSettings())
@@ -1649,7 +1663,7 @@ class StudioApplication:
             for record in records
             if record.id not in self._legacy_home_run_ids
             and not record.workflow.startswith((
-                "comic.director-spec", "comic.storyboard.", "comic.shot.", "comic.prompt.",
+                "comic.director", "comic.storyboard.", "comic.shot.", "comic.prompt.",
             ))
         ]
 
@@ -1805,6 +1819,8 @@ class StudioApplication:
 
     def create_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = DirectorSpecRequest.model_validate(data)
+        if request.creation_mode is not None:
+            return self._create_comic_director_mode(project_id, request)
         snapshot = self.comic_projects.get(project_id)
         if snapshot.project.current_version != request.expected_project_version:
             raise ToolError("作品已由其他操作更新，请刷新后重试")
@@ -1923,6 +1939,79 @@ class StudioApplication:
                 )
                 raise
 
+    def _comic_director_stage(
+        self, skill_id: str, inputs: Any, context: Any,
+    ) -> dict[str, Any]:
+        return execute_director_stage(
+            skill_id, dict(inputs), dict(context), model_call=self._comic_director_model,
+        )
+
+    def _create_comic_director_mode(
+        self, project_id: str, request: DirectorSpecRequest,
+    ) -> dict[str, Any]:
+        snapshot = self.comic_projects.get(project_id)
+        if snapshot.project.current_version != request.expected_project_version:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        source_id = request.resume_run_id or request.previous_run_id
+        previous = self.runtime_store.get_run(source_id) if source_id else None
+        if previous and (
+            previous.workflow != "comic.director"
+            or previous.state.get("project_id") != project_id
+            or previous.state.get("execution_mode") != request.creation_mode
+        ):
+            raise ToolError("来源导演任务与当前作品或模式不一致")
+        if request.resume_run_id and previous.status is ExecutionStatus.COMPLETED:
+            return self._comic_director_result(previous)
+        task = request.task if request.task is not None else (
+            previous.state.get("task") if previous else None
+        )
+        asset_ids = request.asset_ids or (
+            [key.removeprefix("asset:") for key in previous.state["input_versions"]
+             if key.startswith("asset:")] if previous else []
+        )
+        assets = self.comic_assets.select_relevant(
+            project_id, task=task, refs=[ComicAssetRef(asset_id=item) for item in asset_ids],
+            project_version=snapshot.project.current_version,
+        )
+        storyboard_id = request.storyboard_id or (
+            previous.state.get("storyboard_id") if previous else None
+        )
+        shot_id = request.shot_id or (previous.state.get("shot_id") if previous else None)
+        storyboard = self.comic_storyboards.get(storyboard_id) if storyboard_id else None
+        shot = self.comic_storyboards.get_shot(shot_id) if shot_id else None
+        rerun_from = request.rerun_from
+        if request.resume_run_id:
+            if previous.status is ExecutionStatus.RUNNING and (
+                previous.state.get("worker_instance_id") == self._instance_id
+            ):
+                raise ToolError("原导演任务仍在执行，请等待真实状态")
+            rerun_from = next((stage for stage in DIRECTOR_STAGES
+                               if f"comic.{stage}" not in previous.state["completed_stages"]),
+                              "director_critic")
+        prior_spec = self.comic_projects.get_director(project_id) \
+            if snapshot.project.director_id else None
+        result = self.comic_director.execute(DirectorCoordinatorRequest(
+            snapshot=snapshot, assets=assets, task=task,
+            execution_mode=request.creation_mode, storyboard=storyboard, shot=shot,
+            prior_spec=prior_spec, previous_run_id=source_id, rerun_from=rerun_from,
+            stage_edits=request.stage_edits, conversation_id=request.conversation_id,
+            worker_instance_id=self._instance_id,
+        ))
+        return self._comic_director_result(self.runtime_store.get_run(result.run_id))
+
+    def _comic_director_result(self, run: RunRecord) -> dict[str, Any]:
+        spec = None
+        if run.status is ExecutionStatus.COMPLETED:
+            spec = self.comic_projects.get_director(
+                run.state["project_id"], project_version=run.state["project_version_after"],
+            ).model_dump(mode="json")
+        return {
+            "run_id": run.id, "status": run.status.value, "director_spec": spec,
+            "director_execution_summary": director_execution_summary(run),
+            "recovery_required": run.status is ExecutionStatus.RUNNING
+            and run.state.get("worker_instance_id") != self._instance_id,
+        }
+
     def list_comic_project_tasks(self, project_id: str) -> dict[str, Any]:
         """从共享 Run Store 读取作品任务；重启后不重提模型请求。"""
         self.comic_projects.get(project_id)
@@ -1930,10 +2019,11 @@ class StudioApplication:
         tasks = []
         for run in runs:
             if (not run.workflow.startswith((
-                    "comic.director-spec", "comic.storyboard.", "comic.shot.", "comic.prompt.",
+                    "comic.director", "comic.storyboard.", "comic.shot.", "comic.prompt.",
                 )) or run.state.get("project_id") != project_id):
                 continue
-            payload = self._run_payload(run.id)
+            payload = self._comic_director_result(run) if run.workflow == "comic.director" \
+                else self._run_payload(run.id)
             payload["recovery_required"] = (
                 run.status is ExecutionStatus.RUNNING
                 and run.state.get("worker_instance_id") != self._instance_id

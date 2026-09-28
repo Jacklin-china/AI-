@@ -7,26 +7,24 @@ export interface ComicPhase {
 }
 
 /**
- * Product stages are intentionally broader than the legacy runtime nodes.
- * A stage remains pending until a real event/node can prove that it happened;
- * the workspace must not imply that a Director/Asset/Storyboard step exists
- * merely because the old single-shot workflow has started.
+ * Legacy production runs show their real runtime steps only.
+ * The versioned director workspace uses its own execution-summary projection;
+ * starting legacy production never implies that asset/storyboard planning occurred.
  */
 const phaseDefinitions = [
-  { id: 'brief', label: '创意理解', nodes: [], completedBy: null },
-  { id: 'director', label: '导演分析', nodes: [], completedBy: null },
-  { id: 'assets', label: '资产', nodes: [], completedBy: null },
-  { id: 'storyboard', label: '分镜', nodes: [], completedBy: null },
-  { id: 'prompt', label: 'Prompt', nodes: [], completedBy: null },
-  { id: 'generate', label: '生图', nodes: ['generate'], completedBy: 'generate' },
-  { id: 'qc', label: 'QC', nodes: ['qc'], completedBy: 'qc' },
+  { id: 'prepare', label: '准备', nodes: ['prepare'], completedBy: 'prepare' },
+  { id: 'cost', label: '费用', nodes: ['cost_approval'], completedBy: 'cost_approval' },
+  { id: 'generate', label: '生成', nodes: ['generate'], completedBy: 'generate' },
+  { id: 'qc', label: '检查', nodes: ['qc'], completedBy: 'qc' },
+  { id: 'review', label: '审核', nodes: ['human_review'], completedBy: 'human_review' },
+  { id: 'delivery', label: '交付', nodes: ['archive'], completedBy: 'archive' },
   { id: 'video', label: '视频', nodes: ['video'], completedBy: 'video' },
 ] as const
 
 /** Only executed runtime nodes can advance the strip; no storyboard/asset stages are invented. */
 export function comicPhases(run: CoreRun | null): ComicPhase[] {
-  return phaseDefinitions.map((phase) => {
-    if (!run) return { id: phase.id, label: phase.label, status: 'pending' as const }
+  if (!run) return []
+  return phaseDefinitions.filter(phase => phase.id !== 'video' || run.nodes.some(node => node.node_id === 'video')).map((phase) => {
     const executions = run.nodes.filter((node) => (phase.nodes as readonly string[]).includes(node.node_id))
     const active = (phase.nodes as readonly string[]).includes(run.current_node)
     let status: ComicPhase['status'] = 'pending'

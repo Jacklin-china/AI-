@@ -10,6 +10,56 @@ export interface RuntimeEvent {
   created_at: string
 }
 
+export type CreationMode = 'fast' | 'professional'
+export interface ComicProjectContext {
+  project: { project_id: string; title: string; current_version: number }
+  creative_brief: { original_request: string }
+}
+export interface DirectorNodeSummary {
+  stage: string
+  status: string
+  input_versions: Record<string, number>
+  output_summary: string | null
+  output: Record<string, Record<string, unknown>>
+}
+export interface DirectorExecution {
+  run_id: string
+  status: string
+  recovery_required: boolean
+  director_spec: Record<string, unknown> | null
+  director_execution_summary: {
+    mode: CreationMode
+    current_stage: string
+    status_label: string
+    available_actions: string[]
+    stages: DirectorNodeSummary[]
+    error_id: string | null
+    critic_result?: { verdict: string; public_summary: string; findings: { code: string; evidence: string; suggested_action: string }[] } | null
+  }
+}
+
+export async function createComicProject(request: string): Promise<ComicProjectContext> {
+  return corePost('/api/comic/projects', {
+    title: request.slice(0, 100), brief: { original_request: request },
+  })
+}
+export async function getComicProject(projectId: string): Promise<ComicProjectContext | null> {
+  return coreGet(`/api/comic/projects/${encodeURIComponent(projectId)}`, `comic-project:${projectId}`)
+}
+export async function getDirectorExecutions(projectId: string): Promise<DirectorExecution[]> {
+  const result = await coreGet<{ tasks: unknown[] }>(
+    `/api/comic/projects/${encodeURIComponent(projectId)}/tasks`, `comic-director-tasks:${projectId}`,
+  )
+  return (result?.tasks ?? []).filter((item): item is DirectorExecution =>
+    !!item && typeof item === 'object' && 'director_execution_summary' in item,
+  )
+}
+export async function createDirectorExecution(
+  projectId: string, body: Record<string, unknown>,
+): Promise<DirectorExecution> {
+  return corePost(`/api/comic/projects/${encodeURIComponent(projectId)}/director-spec`, body)
+}
+
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '')
   ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '')
 let token = document.querySelector<HTMLMetaElement>('meta[name="studio-token"]')?.content ?? ''

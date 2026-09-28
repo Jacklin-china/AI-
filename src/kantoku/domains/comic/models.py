@@ -276,6 +276,36 @@ class DirectorSpecRequest(BaseModel):
     draft: DirectorSpecDraft | None = None
     asset_ids: list[str] = Field(default_factory=list, max_length=8)
     conversation_id: str | None = Field(default=None, max_length=100)
+    creation_mode: Literal["fast", "professional"] | None = None
+    storyboard_id: str | None = Field(default=None, max_length=100)
+    shot_id: str | None = Field(default=None, max_length=100)
+    previous_run_id: str | None = Field(default=None, max_length=100)
+    rerun_from: Literal[
+        "creative_understanding", "visual_direction", "cinematography",
+        "director_critic", "director_assemble",
+    ] | None = None
+    stage_edits: dict[str, Any] = Field(default_factory=dict, max_length=1)
+    resume_run_id: str | None = Field(default=None, max_length=100)
+
+    @model_validator(mode="after")
+    def validate_creation_mode(self) -> DirectorSpecRequest:
+        if self.creation_mode is None and (
+            self.previous_run_id or self.rerun_from or self.stage_edits or self.resume_run_id
+        ):
+            raise ValueError("节点操作需要 creation_mode")
+        if self.creation_mode is not None and self.draft is not None:
+            raise ValueError("模式任务不能通过 draft 绕过导演审核，请修改节点后重新审核")
+        if (self.previous_run_id is None) != (self.rerun_from is None):
+            raise ValueError("重跑节点需要来源 Run 和起始节点")
+        if self.resume_run_id and (self.previous_run_id or self.stage_edits):
+            raise ValueError("恢复与节点编辑不能同时提交")
+        if self.stage_edits and (
+            self.creation_mode != "professional" or self.rerun_from not in {
+                "creative_understanding", "visual_direction", "cinematography",
+            } or set(self.stage_edits) != {self.rerun_from}
+        ):
+            raise ValueError("仅专业模式允许修改当前创意、导演或摄影节点")
+        return self
 
 
 class DirectorSpecRestore(BaseModel):

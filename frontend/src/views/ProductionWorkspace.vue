@@ -4,6 +4,7 @@ import { Check, ChevronDown, Film, Image as ImageIcon, Images, MessageSquareText
 import { Pane, Splitpanes } from 'splitpanes'
 import 'splitpanes/dist/splitpanes.css'
 import WorkflowProgress, { type WorkflowStep } from '../components/WorkflowProgress.vue'
+import DirectorWorkspace from '../components/DirectorWorkspace.vue'
 import { comicPhases, resolveComicPreviewUrl } from '../domains/comic/workspacePresentation'
 import { presenterFor } from '../domains/presenters'
 import { navigate } from '../router'
@@ -26,6 +27,7 @@ const assetsOpen = ref(false)
 const inspectorOpen = ref(false)
 const previewOpen = ref(true)
 const compactView = ref<'chat' | 'preview'>('chat')
+const directorWorkspaceOpen = ref(!props.runId)
 let unsubscribe: (() => void) | null = null
 
 const isComic = computed(() => props.domain === 'comic')
@@ -197,6 +199,7 @@ onBeforeUnmount(() => {
         </span>
       </nav>
       <div class="comic-studio-actions">
+        <button type="button" class="comic-header-button" :aria-expanded="directorWorkspaceOpen" @click="directorWorkspaceOpen = !directorWorkspaceOpen">{{ directorWorkspaceOpen ? '制作对话' : '导演方案' }}</button>
         <div v-if="run" class="comic-compact-switch" aria-label="工作区视图">
           <button type="button" :aria-pressed="compactView === 'chat'" @click="setCompactView('chat')"><MessageSquareText :size="14" /> 对话</button>
           <button type="button" :aria-pressed="compactView === 'preview'" @click="setCompactView('preview')"><Film :size="14" /> 预览</button>
@@ -210,7 +213,8 @@ onBeforeUnmount(() => {
         <button type="button" :aria-expanded="assetsOpen" aria-label="制作资产" title="制作资产" @click="assetsOpen = !assetsOpen; inspectorOpen = false"><Images :size="19" /></button>
       </nav>
       <main class="comic-main">
-        <Splitpanes class="comic-main-splitpanes" :class="{ 'has-run': !!run }">
+        <DirectorWorkspace v-if="directorWorkspaceOpen" />
+        <Splitpanes v-else class="comic-main-splitpanes" :class="{ 'has-run': !!run }">
           <Pane :size="run && previewOpen ? 72 : 100" :min-size="run && previewOpen ? 58 : 100">
             <div class="comic-director-chat">
               <HomeView :key="domain" :domain="domain" :embedded="true" :studio-focus="true" :initial-run-id="runId" :runs="run ? [run] : []" :approvals="[]" @refresh="refresh" @run-created="(created) => navigate({ name: 'workspace_run', domain, runId: created.id })" @chatting="(active) => (chatActive = active)" />
