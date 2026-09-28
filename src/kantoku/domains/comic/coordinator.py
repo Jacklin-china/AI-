@@ -24,12 +24,14 @@ from kantoku.core.runtime.models import ExecutionStatus, RuntimeEventType
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillRegistry
 
+from .critic import DirectorCriticEngine, require_approved_director
 from .models import (
     ComicAsset,
     ComicContext,
     ComicProjectSnapshot,
     ComicShot,
     ComicStoryboard,
+    DirectorCriticResult,
     DirectorSpec,
     DirectorSpecDraft,
 )
@@ -96,7 +98,9 @@ class DirectorCoordinatorResult(BaseModel):
     trace_id: str
     project_id: str
     execution_mode: Literal["fast", "professional"]
-    director_spec: DirectorSpec
+    director_spec: DirectorSpec | None
+    critic_result: DirectorCriticResult | None = None
+    needs_review: bool = False
     stages: list[DirectorStageRecord]
     stale_dependents: list[str] = Field(default_factory=list)
 
@@ -111,11 +115,13 @@ class ComicDirectorCoordinator:
         runtime_store: RuntimeStore,
         project_store: ComicProjectStore,
         stage_executor: StageExecutor,
+        critic_engine: DirectorCriticEngine | None = None,
     ) -> None:
         self.registry = registry
         self.runtime_store = runtime_store
         self.project_store = project_store
         self.stage_executor = stage_executor
+        self.critic_engine = critic_engine or DirectorCriticEngine()
 
     def execute(self, request: DirectorCoordinatorRequest) -> DirectorCoordinatorResult:
         trace_id = request.trace_id or current_trace_id() or f"trace-{uuid4().hex}"
@@ -195,11 +201,22 @@ class ComicDirectorCoordinator:
                     provisional = self._provisional_spec(
                         outputs, request, critic_result=None,
                     )
-                    if "comic.director_critic" not in reused_outputs:
-                        self._run_stage(
-                            run.id, "comic.director_critic", {
-                                "director_spec": provisional.model_dump(mode="json"),
-                            }, context_payload, request, state, outputs, stages,
+                    self._run_stage(
+                        run.id, "comic.director_critic", {
+                            "director_spec": provisional.model_dump(mode="json"),
+                        }, context_payload, request, state, outputs, stages,
+                    )
+                    if state.get("needs_review"):
+                        self.runtime_store.update_run(
+                            run.id, status=ExecutionStatus.WAITING, state=state,
+                            current_node="director_critic",
+                        )
+                        return DirectorCoordinatorResult(
+                            run_id=run.id, trace_id=trace_id, project_id=project.project_id,
+                            execution_mode=request.execution_mode, director_spec=None,
+                            critic_result=DirectorCriticResult.model_validate(
+                                outputs["critic_result"],
+                            ), needs_review=True, stages=stages,
                         )
                 assemble_input = {
                     "creative_decision": outputs["creative_decision"],
@@ -212,6 +229,7 @@ class ComicDirectorCoordinator:
                     context_payload, request, state, outputs, stages,
                 )
                 current_skill = "director.persist"
+                state["active_skill_id"] = current_skill
                 draft = DirectorSpecDraft.model_validate(outputs["director_spec"])
                 if draft.schema_version != 2:
                     raise ToolError("导演协调必须输出 DirectorSpec v2")
@@ -226,6 +244,8 @@ class ComicDirectorCoordinator:
                     "critic_result": outputs.get("critic_result"),
                 })
                 draft = DirectorSpecDraft.model_validate(draft_data)
+                if request.execution_mode == "professional":
+                    require_approved_director(draft)
                 spec = self.project_store.save_director(
                     project.project_id, draft,
                     expected_project_version=project.current_version,
@@ -260,6 +280,7 @@ class ComicDirectorCoordinator:
                 return DirectorCoordinatorResult(
                     run_id=run.id, trace_id=trace_id, project_id=project.project_id,
                     execution_mode=request.execution_mode, director_spec=spec,
+                    critic_result=spec.critic_result,
                     stages=stages, stale_dependents=stale,
                 )
             except Exception as error:
@@ -299,17 +320,18 @@ class ComicDirectorCoordinator:
         stages: list[DirectorStageRecord],
     ) -> None:
         node_id = skill_id.removeprefix("comic.")
-        event_name = "critic" if node_id == "director_critic" else node_id
+        event_name = node_id
         trace_id = str(state["trace_id"])
         state["active_skill_id"] = skill_id
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
         )
-        self._event(
-            run_id, RuntimeEventType.NODE_STARTED, f"{event_name}_started",
-            trace_id=trace_id, project_id=request.snapshot.project.project_id,
-            execution_mode=request.execution_mode, skill_id=skill_id,
-        )
+        if skill_id != "comic.director_critic":
+            self._event(
+                run_id, RuntimeEventType.NODE_STARTED, f"{event_name}_started",
+                trace_id=trace_id, project_id=request.snapshot.project.project_id,
+                execution_mode=request.execution_mode, skill_id=skill_id,
+            )
         stage_context = {
             "trace_id": trace_id,
             "run_id": run_id,
@@ -319,7 +341,42 @@ class ComicDirectorCoordinator:
             "context": context_payload,
         }
         with run_trace(run_id, node_id):
-            raw_output = self.stage_executor(skill_id, inputs, stage_context)
+            if skill_id == "comic.director_critic":
+                def emit(name: str, payload: dict[str, Any]) -> None:
+                    state["critic_activity"] = name
+                    if "critic_result" in payload:
+                        state["critic_result"] = payload["critic_result"]
+                    self.runtime_store.update_run(
+                        run_id, status=ExecutionStatus.RUNNING,
+                        state=state, current_node=node_id,
+                    )
+                    self._event(
+                        run_id, RuntimeEventType.NODE_PROGRESS, name,
+                        trace_id=trace_id, project_id=request.snapshot.project.project_id,
+                        execution_mode=request.execution_mode, skill_id=skill_id, **payload,
+                    )
+
+                outcome = self.critic_engine.review_and_revise(
+                    DirectorSpecDraft.model_validate(inputs["director_spec"]),
+                    request.snapshot.creative_brief,
+                    assets=request.assets, storyboard=request.storyboard, shot=request.shot,
+                    emit=emit,
+                )
+                candidate = outcome.director_spec.model_dump()
+                state["director_candidate"] = candidate
+                state["revision_count"] = outcome.revision_count
+                state["needs_review"] = outcome.needs_review
+                state["task_status"] = "needs_review" if outcome.needs_review else "planning"
+                outputs.update({key: candidate[key] for key in (
+                    "creative_decision", "director_plan", "cinematography",
+                )})
+                raw_output = {"critic_result": outcome.critic_result.model_dump()}
+            elif skill_id == "comic.director_assemble":
+                raw_output = {"director_spec": self._provisional_spec(
+                    outputs, request, critic_result=outputs.get("critic_result"),
+                ).model_dump()}
+            else:
+                raw_output = self.stage_executor(skill_id, inputs, stage_context)
             if not isinstance(raw_output, Mapping):
                 raise ToolError("导演 Skill 未返回结构化对象", detail=skill_id)
             validated = self.registry.execute(
@@ -336,12 +393,13 @@ class ComicDirectorCoordinator:
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
         )
-        self._event(
-            run_id, RuntimeEventType.NODE_COMPLETED, f"{event_name}_completed",
-            trace_id=trace_id, project_id=request.snapshot.project.project_id,
-            execution_mode=request.execution_mode, skill_id=skill_id,
-            output_keys=sorted(validated),
-        )
+        if skill_id != "comic.director_critic":
+            self._event(
+                run_id, RuntimeEventType.NODE_COMPLETED, f"{event_name}_completed",
+                trace_id=trace_id, project_id=request.snapshot.project.project_id,
+                execution_mode=request.execution_mode, skill_id=skill_id,
+                output_keys=sorted(validated),
+            )
 
     def _reused_outputs(
         self, request: DirectorCoordinatorRequest, input_versions: Mapping[str, int],
@@ -352,7 +410,9 @@ class ComicDirectorCoordinator:
         if (
             previous.domain != "comic"
             or previous.workflow != "comic.director"
-            or previous.status not in {ExecutionStatus.COMPLETED, ExecutionStatus.FAILED}
+            or previous.status not in {
+                ExecutionStatus.COMPLETED, ExecutionStatus.FAILED, ExecutionStatus.WAITING,
+            }
             or previous.state.get("project_id") != request.snapshot.project.project_id
             or previous.state.get("execution_mode") != "professional"
             or previous.state.get("input_versions") != dict(input_versions)
@@ -368,7 +428,10 @@ class ComicDirectorCoordinator:
         if not isinstance(prior_outputs, dict):
             raise ToolError("来源导演 Run 缺少阶段结果")
         try:
-            reused = {skill_id: prior_outputs[skill_id] for skill_id in order[:start]}
+            reused = {
+                skill_id: prior_outputs[skill_id] for skill_id in order[:start]
+                if skill_id != "comic.director_critic"
+            }
         except KeyError as error:
             raise ToolError("来源导演 Run 缺少阶段结果", detail=str(error)) from error
         if any(not isinstance(value, dict) for value in reused.values()):
@@ -452,6 +515,8 @@ class ComicDirectorCoordinator:
             "asset_versions": {
                 f"asset:{asset.asset_id}": asset.version for asset in request.assets
             },
+            "storyboard_version": request.storyboard.version if request.storyboard else None,
+            "shot_version": request.shot.version if request.shot else None,
         })
 
     @staticmethod

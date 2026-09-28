@@ -2,7 +2,7 @@ id: comic.director_critic
 name: Comic Director Critic
 domain: comic
 description: 审核 DirectorSpec v2 的意图、约束、资产和视觉因果。
-version: 1.0.0
+version: 1.1.0
 required_tools: []
 input_schema:
   type: object
@@ -15,13 +15,16 @@ output_schema:
   properties:
     critic_result:
       type: object
-      required: [verdict, public_summary, findings, suggested_patches, confidence]
+      required: [verdict, public_summary, findings, suggested_patches, allowed_patches, confidence, review_version, reviewed_spec_hash]
 execution_policy:
   allowed_execution_modes: [fast, professional]
   side_effects: []
   provider_binding: false
   coordinator_owned: true
   contract_only: true
+  review_engine: comic.director_critic
+  max_auto_revisions: 1
+  preserves_hard_constraints: true
 knowledge_refs: [director.constraint-priority, director.anti-template]
 test_cases:
   - id: checks_hard_constraints

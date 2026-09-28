@@ -107,7 +107,17 @@ DirectorSpec v2 在同一个领域实体上增加 `schema_version`、`creative_d
 
 `domains/comic/coordinator.py` 使用现有 `SkillRegistry`、Core Run/Runtime Event/Trace 和作品版本存储。调用方须注入共享文本能力的阶段执行函数；Coordinator 本身不导入 Provider，也不会把契约 handler 冒充模型。Fast 顺序执行创意理解、视觉导演、摄影指导、组装；Professional 额外执行 Critic，逐阶段将公开结构化结果写入 Run state 与事件。专业模式可指定先前已完成 Run 和起始阶段，在输入 Brief/资产/分镜/镜头版本一致时复用前段结果并从该阶段重跑；重跑创建新的 Core Run，旧记录不覆盖。
 
-两种模式均追加保存同一 `DirectorSpec v2` 结构；输入资产、Storyboard、Shot 版本写入导演方案。若传入旧方案且依赖版本发生变化，Run state 与 `director_spec_created` 事件标记 `storyboard/shot/prompt_artifact` 为 stale，供后续 UI/API 阻止沿用旧结果；当前不改写这些实体的历史修订。失败写入具体 `skill_id`、`trace_id`、`error_id` 和脱敏 traceback，Run 标为 failed，禁止默认填充导演结果；已完成或失败的专业 Run 可在输入版本一致时从指定阶段重新执行。本阶段未新增 HTTP API，也未接入真实模型、图片或视频；下一阶段实现 Critic 的审核判断与修订策略。
+两种模式均使用同一 `DirectorSpec v2` 结构；输入资产、Storyboard、Shot 版本写入导演方案。若传入旧方案且依赖版本发生变化，Run state 与 `director_spec_created` 事件标记 `storyboard/shot/prompt_artifact` 为 stale，供后续 UI/API 阻止沿用旧结果；当前不改写这些实体的历史修订。失败写入具体 `skill_id`、`trace_id`、`error_id` 和脱敏 traceback，Run 标为 failed，禁止默认填充导演结果；已完成、失败或等待审核的专业 Run 可在输入版本一致时从指定阶段重新执行。本阶段未新增 HTTP API，也未接入图片或视频。
+
+### Phase 7.2.4：Director Critic 与一次修订
+
+`domains/comic/critic.py` 用确定性规则检查用户硬约束、资产版本与上下文范围；使用现有共享 `core.llm.chat`（配置仍来自 settings）检查具体故事的视觉因果、资产语义一致性、模板化表达和公开导演理由。不存在情绪到镜头的固定映射。模型只能返回严格的公开证据 Schema；字段路径和逐字证据必须可核验，私有 reasoning/CoT、整份重写方案和无效结构均拒绝，原始非法响应不会带进 traceback。旧审核 JSON 的 category/message 和 field/reason 保留读取兼容；新结论增加 code、field_path、evidence、expected、suggested_action、allowed_patches、审核版本与方案指纹，无数据库迁移。
+
+Professional Coordinator 先用 Engine 审核，再经现有 SkillRegistry 校验/记录结论。轻微 warning 只允许修改相关白名单字段：构图、色彩、主体环境关系及部分摄影光线字段；Patch 必须带预期原值，不能修改 CreativeDecision、硬约束、资产或来源版本。自动修订最多一次，然后重新审核一次。最终组装由已有协调层投影分层结果，不再另调用模型重写已审核方案。严重 error/blocked、无可用 Patch 或复审未通过时保留候选到原 Run state，标记 `needs_review`，Run 等待；不保存为当前 DirectorSpec，也不继续 Prompt 编译。重新进入 Critic 时重新审核，不能借用旧 pass 结论。
+
+公开事件使用原 Core Runtime Event 的 `director_event` payload：`director_critic_started/completed`、`director_revision_requested`、`director_patch_applied`、`director_review_blocked`，带原 trace/project/Run/Skill 和审核次数。每次审核结论及 Patch 存在原 Run/Event 中，服务重启仍可查询；错误使用原 `public_error`，不新建日志或任务表。Prompt Compiler 与 Prompt Store 拦截没有实际 pass、内容修改后指纹不匹配或资产版本改变的 v2；v1 旧生产链保持兼容。
+
+本轮没有修改 HTTP/UI 入口；Fast 暂时仍保留前阶段的轻量导演路径，未审核 v2 不能直接进入 PromptCompiler。下一阶段将 Fast/Professional 应用入口接到同一 Coordinator，Fast 可精简公开节点但仍保留约束检查与必要审核；Professional 展示公开结论、局部修订和人工决定。没有图片 Provider、Vision QC 或新 Runtime。本轮测试使用文本模型替身，不冒充真实付费模型验收。
 
 HTTP 入口：`POST /api/comic/projects/{id}/director-spec`（仅 `expected_project_version`/可选 `task` 为模型生成；附 `draft` 为人工编辑）、`GET /api/comic/projects/{id}/director-spec`、`GET /api/comic/projects/{id}/director-spec/versions`、`POST /api/comic/projects/{id}/director-spec/restore`（`version` 与 `expected_project_version`）。沿用本机会话、Trace 与异常机制；API 不创建 Storyboard、Prompt Artifact，不调用图片、视频或 QC。共享文本模型可能产生费用，离线测试使用替身，不能声称已完成真实模型付费验收。下一阶段应在现有版本体系中加入项目范围的角色/场景/风格资产及真实相关记忆选择，仍不应把资产与 DirectorSpec 直接拼成供应商 Prompt。
 

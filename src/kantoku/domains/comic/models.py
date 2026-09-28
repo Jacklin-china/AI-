@@ -181,8 +181,14 @@ class DirectorCriticFinding(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     severity: Literal["info", "warning", "error"]
-    category: BriefItem
-    message: BriefText
+    code: BriefItem = "LEGACY_FINDING"
+    field_path: str = Field(default="", max_length=200)
+    evidence: str = Field(default="", max_length=4000)
+    expected: str = Field(default="", max_length=4000)
+    suggested_action: str = Field(default="", max_length=2000)
+    # 保留既有修订的可读性；新审核使用上面的公开证据字段。
+    category: str = Field(default="", max_length=300)
+    message: str = Field(default="", max_length=4000)
 
 
 class DirectorCriticPatch(BaseModel):
@@ -190,6 +196,8 @@ class DirectorCriticPatch(BaseModel):
 
     field: BriefItem
     reason: BriefText
+    value: str | None = Field(default=None, min_length=1, max_length=4000)
+    expected_value: str | None = Field(default=None, max_length=4000)
 
 
 class DirectorCriticResult(BaseModel):
@@ -203,6 +211,9 @@ class DirectorCriticResult(BaseModel):
     suggested_patches: list[DirectorCriticPatch] = Field(default_factory=list, max_length=20)
     confidence: float = Field(ge=0, le=1)
     knowledge_refs: list[BriefItem] = Field(default_factory=list, max_length=50)
+    allowed_patches: list[BriefItem] = Field(default_factory=list, max_length=20)
+    review_version: str | None = Field(default=None, max_length=100)
+    reviewed_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
 
 class DirectorSpecDraft(BaseModel):

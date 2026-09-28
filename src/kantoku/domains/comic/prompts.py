@@ -18,6 +18,7 @@ from kantoku.core.runtime.models import ArtifactRecord, ArtifactType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
 from .assets import ComicAssetStore
+from .critic import require_approved_director
 from .models import (
     ComicAsset,
     ComicProjectSnapshot,
@@ -59,6 +60,12 @@ class StructuredImagePromptCompiler:
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
         model_target: str, model_call: Callable[[list[dict[str, str]]], str],
     ) -> ComicPromptDraft:
+        require_approved_director(director)
+        if director.schema_version == 2 and any(
+            director.asset_versions.get(f"asset:{asset.asset_id}") != asset.version
+            for asset in assets
+        ):
+            raise ToolError("Prompt 资产版本与已审核导演方案不一致")
         # 复用作品 Context Builder；仅把当前分镜/镜头加入有界视图。
         selected = ComicContextBuilder.build(
             snapshot, task=shot.purpose, director=director, assets=assets,
@@ -147,6 +154,7 @@ class ComicPromptStore:
                 or snapshot.project.director_id is None):
             raise ToolError("导演方案已变化，请先创建当前方案的分镜")
         director = self.projects.get_director(shot.project_id)
+        require_approved_director(director)
         refs = [*shot.character_asset_versions, *shot.scene_asset_versions]
         if shot.style_version is not None:
             refs.append(shot.style_version)
@@ -157,6 +165,11 @@ class ComicPromptStore:
             if current.state != "active" or pinned.state != "active":
                 raise ToolError("镜头引用的资产已删除", detail=ref.asset_id)
             assets.append(pinned)
+        if director.schema_version == 2 and any(
+            director.asset_versions.get(f"asset:{asset.asset_id}") != asset.version
+            for asset in assets
+        ):
+            raise ToolError("Prompt 资产版本与已审核导演方案不一致")
         return snapshot, director, storyboard, shot, assets
 
     def _current(self, connection: sqlite3.Connection, shot_id: str) -> ComicPromptArtifact:

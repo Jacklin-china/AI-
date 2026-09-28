@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,7 @@ from kantoku.domains.comic.coordinator import (
     ComicDirectorCoordinator,
     DirectorCoordinatorRequest,
 )
+from kantoku.domains.comic.critic import DirectorCriticEngine
 from kantoku.domains.comic.models import (
     CharacterAsset,
     ComicAsset,
@@ -112,6 +114,10 @@ def _setup(
     coordinator = ComicDirectorCoordinator(
         registry=registry, runtime_store=runtime_store,
         project_store=project_store, stage_executor=stage_executor,
+        critic_engine=DirectorCriticEngine(lambda _messages: json.dumps({
+            "public_summary": "用户约束完整，视觉因果有依据。", "confidence": 0.9,
+            "findings": [], "suggested_patches": [],
+        })),
     )
     return coordinator, project_store, runtime_store, calls
 
@@ -149,7 +155,7 @@ def test_fast_uses_one_core_run_and_saves_v2_without_critic(tmp_path: Path) -> N
 
     result = coordinator.execute(_request(store, project_id, "fast"))
 
-    assert calls == [SKILLS[0], SKILLS[1], SKILLS[2], SKILLS[4]]
+    assert calls == SKILLS[:3]
     assert result.director_spec.schema_version == 2
     assert result.director_spec.critic_result is None
     assert store.get_director(project_id) == result.director_spec
@@ -170,13 +176,13 @@ def test_professional_records_each_stage_and_public_critic(tmp_path: Path) -> No
 
     result = coordinator.execute(_request(store, project_id, "professional"))
 
-    assert calls == SKILLS
+    assert calls == SKILLS[:3]
     assert result.director_spec.critic_result is not None
     assert result.director_spec.critic_result.verdict == "pass"
     run = runtime.get_run(result.run_id)
     assert run.state["completed_stages"] == SKILLS
     assert run.state["project_version_after"] == store.get(project_id).project.current_version
-    assert "critic_completed" in _event_names(runtime, result.run_id)
+    assert "director_critic_completed" in _event_names(runtime, result.run_id)
     assert len(runtime.list_runs(domain="comic", interaction_mode=InteractionMode.GUIDED)) == 1
     for event in runtime.list_events(result.run_id):
         assert event.payload["trace_id"] == result.trace_id
@@ -255,7 +261,7 @@ def test_professional_can_rerun_from_a_stage_using_persisted_outputs(tmp_path: P
         previous_run_id=first.run_id, rerun_from="cinematography",
     ))
 
-    assert calls == SKILLS[2:]
+    assert calls == [SKILLS[2]]
     assert again.director_spec.version == first.director_spec.version + 1
     assert runtime.get_run(again.run_id).state["completed_stages"] == SKILLS
     assert again.run_id != first.run_id
