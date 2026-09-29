@@ -92,6 +92,32 @@ def test_good_plan_passes_with_a_hash_bound_to_the_actual_spec() -> None:
     assert "chat_history" not in context
 
 
+@pytest.mark.parametrize("field", ["director_plan.visual_strategy",
+                                  "director_plan.creative_choices",
+                                  "cinematography.light_direction",
+                                  "cinematography.material_language"])
+def test_valid_v2_review_fields_are_not_mistaken_for_patch_fields(field: str) -> None:
+    spec = _spec()
+    section, name = field.split(".")
+    value = spec.model_dump()[section][name]
+    evidence = value[0] if isinstance(value, list) else value
+    finding = {**_finding(spec), "field_path": field, "evidence": evidence}
+    result = DirectorCriticEngine(lambda _: _semantic([finding])).review(spec, _brief())
+    assert result.verdict == "needs_revision"
+    assert result.findings[0].field_path == field
+
+
+def test_whitespace_only_evidence_difference_is_not_a_failure() -> None:
+    spec = _spec()
+    finding = _finding(spec)
+    finding["evidence"] = " \n".join(finding["evidence"])
+    result = DirectorCriticEngine(lambda _: _semantic([finding], [_patch(spec)])).review(
+        spec, _brief(),
+    )
+    assert result.findings[0].code == "COMPOSITION_CAUSALITY"
+    assert len(result.suggested_patches) == 1
+
+
 def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> None:
     spec = _spec()
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
@@ -432,8 +458,12 @@ def test_semantic_review_rejects_cot_and_fabricated_evidence() -> None:
         })).review(_spec(), _brief())
     fabricated = _finding(_spec())
     fabricated["evidence"] = "不存在于输入的虚构导演方案"
-    with pytest.raises(ToolError, match="公开证据"):
-        DirectorCriticEngine(lambda _messages: _semantic([fabricated])).review(_spec(), _brief())
+    result = DirectorCriticEngine(lambda _messages: _semantic([fabricated])).review(
+        _spec(), _brief(),
+    )
+    assert result.verdict == "needs_revision"
+    assert result.findings[0].code == "UNVERIFIED_REVIEW_EVIDENCE"
+    assert result.suggested_patches == []
 
 
 def test_major_review_waits_in_existing_run_without_saving_a_spec(tmp_path: Path) -> None:

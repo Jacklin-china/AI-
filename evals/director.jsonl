@@ -1,0 +1,4 @@
+{"id":"A","input":"山海经穷奇站在悬崖边看远方村庄","mode":"fast","constraints":["穷奇","悬崖","村庄"],"forbidden":[]}
+{"id":"B","input":"中式修仙少女穿白色古装站在树梢看远方村庄","mode":"professional","constraints":["修仙少女","白色古装","树梢","村庄"],"forbidden":["穷奇"]}
+{"id":"C","input":"少年雨夜坐在屋檐下思念故乡","mode":"fast","constraints":["少年","雨夜","屋檐","思念故乡"],"forbidden":["穷奇","修仙少女"]}
+{"id":"D","input":"未来城市机器人咖啡师","mode":"professional","constraints":["未来城市","机器人","咖啡师"],"forbidden":["穷奇","修仙少女","思念故乡","屋檐"]}

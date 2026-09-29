@@ -20,37 +20,31 @@ from kantoku.config.observability import (
 )
 
 from .models import (
+    CinematographyPlan,
     ComicAsset,
     ComicShot,
     ComicStoryboard,
     CreativeBriefInput,
+    CreativeDecision,
     DirectorCriticFinding,
     DirectorCriticPatch,
     DirectorCriticResult,
+    DirectorPlan,
     DirectorSpecDraft,
 )
 
 REVIEW_VERSION = "director-critic-1"
-CRITIC_ALLOWED_FIELD_PATHS = frozenset({
-    "creative_decision.intent_summary",
-    "creative_decision.emotional_target",
-    "creative_decision.narrative_focus",
-    "creative_decision.audience_experience",
-    "director_plan.visual_focus",
-    "director_plan.composition_strategy",
-    "director_plan.color_strategy",
-    "director_plan.subject_environment_relation",
-    "director_plan.style_boundary",
-    "director_plan.character_expression",
-    "director_plan.character_pose",
-    "director_plan.character_presence",
-    "cinematography.shot_size",
-    "cinematography.camera_angle",
-    "cinematography.camera_distance",
-    "cinematography.camera_language",
-    "cinematography.lighting",
-    "cinematography.depth_strategy",
-})
+# 读范围来自现有公开 Schema；写范围独立且显式，不能把“可审核”误当“可修改”。
+CRITIC_ALLOWED_FIELD_PATHS = frozenset(
+    f"{section}.{name}"
+    for section, model in (
+        ("creative_decision", CreativeDecision),
+        ("director_plan", DirectorPlan),
+        ("cinematography", CinematographyPlan),
+    )
+    for name in model.model_fields
+    if name not in {"hard_constraints", "soft_preferences", "creative_freedom"}
+)
 PATCH_FIELDS = frozenset({
     "creative_decision.emotional_target",
     "creative_decision.narrative_focus",
@@ -66,6 +60,7 @@ PATCH_FIELDS = frozenset({
     "cinematography.shot_size",
     "cinematography.camera_language",
     "cinematography.lighting",
+    "cinematography.light_direction",
     "cinematography.depth_strategy",
 })
 FIELD_PATH_ALIASES = {
@@ -95,6 +90,11 @@ FIELD_PATH_ALIASES = {
     "shot_size": "cinematography.shot_size",
     "lighting": "cinematography.lighting",
     "depth_strategy": "cinematography.depth_strategy",
+    "light_direction": "cinematography.light_direction",
+    "cinematography.light_source_direction": "cinematography.light_direction",
+    "director_plan.color_language": "director_plan.color_strategy",
+    "creative_decision.emotion": "creative_decision.emotional_target",
+    "cinematography.camera": "cinematography.camera_language",
 }
 ReviewModel = Callable[[list[dict[str, str]]], str]
 EventSink = Callable[[str, dict[str, Any]], None]
@@ -184,10 +184,11 @@ def _normalize_field_path(path: str) -> str:
 
 def _critic_warning(received_field: str, *, action: str = "ignored") -> None:
     logger.warning(
-        "critic_warning received_field={} action={} trace_id={}",
+        "critic_warning received_field={} action={} trace_id={} run_id={}",
         redact_secrets(received_field),
         action,
         current_trace_id() or "-",
+        current_run_id() or "-",
     )
 
 
@@ -222,7 +223,9 @@ def _normalize_patch(
 
 def _has_evidence(value: Any, evidence: str) -> bool:
     if isinstance(value, str):
-        return evidence in value
+        # 排版空白不是事实差异；不做语义猜测或模糊匹配。
+        fragment = re.sub(r"\s+", "", evidence)
+        return bool(fragment) and fragment in re.sub(r"\s+", "", value)
     if isinstance(value, dict):
         return any(_has_evidence(item, evidence) for item in value.values())
     if isinstance(value, list):
@@ -379,6 +382,8 @@ class DirectorCriticEngine:
                 "error 表示重要创作冲突需人工；warning 为可局部修订的小问题。"
                 "Patch 只针对 patch_fields，每项含 field、reason、value、expected_value，"
                 "value 只能是替换该字段的文字。没有问题返回空 findings 和空 patches。"
+                "输出须严格符合下述 Schema，字段名和类型不得自行改写："
+                + json.dumps(SemanticReview.model_json_schema(), ensure_ascii=False)
             )},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ])
@@ -395,17 +400,35 @@ class DirectorCriticEngine:
             normalized for item in semantic.findings
             if (normalized := _normalize_finding(item)) is not None
         ]
+        verified: list[PublicFinding] = []
+        unverified: list[DirectorCriticFinding] = []
         for item in semantic_findings:
             _value(data, item.field_path)
             if (
                 item.code == "LEGACY_FINDING" or not item.evidence or not item.expected
                 or not item.suggested_action or not _has_evidence(evidence_context, item.evidence)
             ):
-                raise ToolError("导演审核缺少可核验的公开证据")
+                _critic_warning(item.field_path, action="needs_review_unverified_evidence")
+                # 不让模型引文格式问题炸掉整个 Run，也不能当成审核通过或应用 Patch。
+                unverified.append(DirectorCriticFinding(
+                    code="UNVERIFIED_REVIEW_EVIDENCE", severity="warning",
+                    field_path=item.field_path, evidence=item.evidence,
+                    expected="审核必须引用当前输入中可核验的公开片段",
+                    suggested_action="人工查看该项或重新执行审核，不应用未核验的建议",
+                ))
+                continue
+            verified.append(item)
         findings.extend(DirectorCriticFinding.model_validate(item.model_dump())
-                        for item in semantic_findings)
+                        for item in verified)
+        findings.extend(unverified)
+        logger.info(
+            "Director Critic Debug received_findings={} verified_findings={} "
+            "ignored_findings={} unverified_findings={} spec_hash={}",
+            len(semantic.findings), len(verified),
+            len(semantic.findings) - len(semantic_findings), len(unverified), director_hash(spec),
+        )
         return self._result(
-            spec, findings, semantic.suggested_patches,
+            spec, findings, semantic.suggested_patches if not unverified else [],
             semantic.public_summary, semantic.confidence,
         )
 
@@ -433,7 +456,8 @@ class DirectorCriticEngine:
             normalized_patches.append(normalized)
         allowed = sorted({
             item.field_path for item in findings
-            if item.severity == "warning" and item.field_path in PATCH_FIELDS
+            if (item.severity == "warning" and item.field_path in PATCH_FIELDS
+                and item.code != "UNVERIFIED_REVIEW_EVIDENCE")
         }) if verdict == "needs_revision" and not errors else []
         if normalized_patches and verdict == "pass":
             for patch in normalized_patches:

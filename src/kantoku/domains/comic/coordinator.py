@@ -6,6 +6,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 from collections.abc import Callable, Mapping
 from typing import Any, Literal
 from uuid import uuid4
@@ -57,6 +59,13 @@ FAST_LABELS = {
     "director_assemble": "正在生成导演方案",
     "director_spec": "导演方案已完成",
 }
+
+
+def _fingerprint(payload: Mapping[str, Any]) -> dict[str, Any]:
+    """有界公开输入的指纹；不把完整模型响应或私有推理写入日志。"""
+    encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str)
+    return {"sha256": hashlib.sha256(encoded.encode()).hexdigest(),
+            "chars": len(encoded), "keys": sorted(payload)}
 
 
 class _DirectorCancelled(Exception):
@@ -234,6 +243,16 @@ class ComicDirectorCoordinator:
             "previous_run_id": request.previous_run_id,
             "storyboard_id": request.storyboard.storyboard_id if request.storyboard else None,
             "shot_id": request.shot.shot_id if request.shot else None,
+            "director_debug": {
+                "context": _fingerprint(context_payload),
+                "brief_request": redact_secrets(request.snapshot.creative_brief.original_request),
+                "current_task": redact_secrets(request.task or ""),
+                "source_versions": context.source_versions,
+                "memory_used": [{"asset_id": asset.asset_id, "version": asset.version}
+                                for asset in request.assets],
+                "reused_stages": sorted(reused_outputs),
+                "stages": {},
+            },
         }
         interaction_mode = (
             InteractionMode.AUTONOMOUS
@@ -284,6 +303,18 @@ class ComicDirectorCoordinator:
                 trace_id=trace_id, project_id=project.project_id,
                 mode=request.execution_mode,
             )
+            self._event(
+                run.id, RuntimeEventType.NODE_PROGRESS, "director_input_snapshot",
+                trace_id=trace_id, project_id=project.project_id,
+                conversation_id=request.conversation_id, previous_run=request.previous_run_id,
+                debug=state["director_debug"],
+            )
+            logger.info("Director Debug Context brief_request={} current_task={} "
+                        "context={} source_versions={} reused_stages={}",
+                        state["director_debug"]["brief_request"],
+                        state["director_debug"]["current_task"],
+                        state["director_debug"]["context"], context.source_versions,
+                        sorted(reused_outputs))
             try:
                 if "comic.creative_understanding" not in reused_outputs:
                     self._run_stage(
@@ -449,6 +480,12 @@ class ComicDirectorCoordinator:
         event_name = node_id
         trace_id = str(state["trace_id"])
         state["active_skill_id"] = skill_id
+        debug = {"input": _fingerprint(inputs), "context": _fingerprint(context_payload),
+                 "input_versions": state["input_versions"],
+                 "source": "user_edit" if node_id in request.stage_edits else "execution"}
+        state["director_debug"]["stages"][skill_id] = debug
+        logger.info("Director Debug Stage skill_id={} input={} context={} source={}",
+                    skill_id, debug["input"], debug["context"], debug["source"])
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
         )
@@ -525,6 +562,13 @@ class ComicDirectorCoordinator:
                 store=self.runtime_store, run_id=run_id, node_id=node_id,
             )
         outputs.update(validated)
+        debug["output"] = _fingerprint(validated)
+        self._event(
+            run_id, RuntimeEventType.NODE_PROGRESS, "director_stage_debug",
+            trace_id=trace_id, project_id=request.snapshot.project.project_id,
+            skill_id=skill_id, debug=debug,
+        )
+        logger.info("Director Debug Result skill_id={} output={}", skill_id, debug["output"])
         state["stage_outputs"][skill_id] = validated
         state["completed_stages"].append(skill_id)
         state["last_completed_step"] = node_id
@@ -574,6 +618,10 @@ class ComicDirectorCoordinator:
             or previous.state.get("execution_mode") != request.execution_mode
             or previous.state.get("task") != request.task
             or previous.state.get("input_versions") != dict(input_versions)
+            or previous.state.get("storyboard_id") != (
+                request.storyboard.storyboard_id if request.storyboard else None
+            )
+            or previous.state.get("shot_id") != (request.shot.shot_id if request.shot else None)
         ):
             raise ToolError("来源导演 Run 与当前作品或输入版本不一致")
         if request.execution_mode == "fast":
@@ -618,7 +666,9 @@ class ComicDirectorCoordinator:
         request: DirectorCoordinatorRequest, context: ComicContext,
     ) -> dict[str, Any]:
         payload = context.model_dump(mode="json")
-        payload["project"] = payload["stable_context"].pop("project")
+        project = payload["stable_context"].pop("project")
+        # 项目标题是可保留的导航元数据，不是当前创意。Brief 更新后旧标题不能污染导演。
+        payload["project"] = {"project_id": project["project_id"]}
         payload["creative_brief"] = payload["stable_context"].pop("creative_brief")
         payload["relevant_assets"] = payload.pop("relevant_memory")
         payload.pop("stable_context", None)
@@ -697,7 +747,8 @@ class ComicDirectorCoordinator:
             key: value for key, value in input_versions.items() if key.startswith("asset:")
         }
         changed = (
-            prior_versions != current_assets
+            prior.creative_brief_version != request.snapshot.creative_brief.version
+            or prior_versions != current_assets
             or prior.storyboard_version != input_versions.get("storyboard")
             or prior.shot_version != input_versions.get("shot")
         )

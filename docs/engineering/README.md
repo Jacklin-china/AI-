@@ -193,6 +193,35 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
 
 工作台执行中输入框保持可用：补充需求保留发送时模式，在**当前页面**排队，当前 Run 结束后依次提交，错误或结果未知时停止自动处理；可撤回未执行补充。队列不是后端 Conversation Message，刷新会丢失未提交补充，UI 必须明确说明。取消调用现有 Core Run 接口，Coordinator 在阶段前后和 Critic 事件边界检查取消；不能中断已发出的模型 HTTP 请求，但取消后不进入下一阶段、不保存新方案。复用已有 Run/Event，不增加 Runtime、API 或 Workflow。Fast 对话只展示创作理解与导演摘要；Professional 可查看独立节点，页面切换保留原会话与编辑草稿，尊重减少动画设置。
 
+## Director Pipeline 稳定性与真实验收（2026-09-29）
+
+前端 Workspace 改造暂缓。本轮收口既有 Director Coordinator / Critic / Context，
+不创建 Runtime、Skill、Asset、Prompt 或 Provider 副本。
+
+- **输入隔离**：导演调用只读取当前 Brief、当前任务与选中资产。项目标题/描述属于导航元数据，
+  可能保留旧创意，不再送入导演模型充当故事事实；Context API 的完整作品元数据仍兼容。
+  同作品的 `task` 是补充任务，不能静默废弃用户硬约束；彻底替换创意须通过现有 Brief 追加版本
+  或创建新 Project。既有 DirectorSpec、聊天历史、其他作品不会自动送入生成上下文。
+- **恢复校验**：已经完成的 Run 也先校验任务、Brief/资产版本、Storyboard/Shot 身份，
+  再返回原结果。新输入不能用 `resume_run_id` 借回旧方案；显式空资产列表不会偷用旧引用。
+  阶段恢复核验实体 ID，而不只比较恰好相同的版本号。
+- **审核与写权限分离**：Critic 可以审核 v2 公开决策字段，但 Patch 只允许小范围白名单。
+  别名先规范化；未知路径记录 warning 后忽略。硬约束、Project/资产身份与风格引用始终只读。
+  逐字证据仅忽略排版空白，不做模糊语义匹配。不可核验的合法字段结论转为 `needs_revision`，
+  保留候选并停止下游，不能使 Run 因引文格式直接崩溃，也不能伪装 pass 或应用未核验 Patch。
+- **Director Debug Trace**：在原 Run state / Runtime Event 中保存输入快照与每个阶段的
+  输入/Context/输出 SHA-256、长度、键名、来源版本、复用阶段与编辑来源。控制台和现有结构化
+  日志能按 trace/run/project/skill 关联共享 LLM 请求 ID、provider、model、真实 token、耗时、
+  retry、审核规范化 warning 与安全 error_id/traceback；不记录原始无效模型响应或 CoT。
+- **真实与离线验收分开**：`evals/director.jsonl` 定义异兽、人物、情绪、科幻四个独立案例。
+  `uv run python scripts/verify_director_pipeline.py --allow-paid --max-cny 2` 经现有应用 API、
+  Coordinator 和共享 LLM 执行；项目/会话/Run 位于独立 `data/qa/director-live-*/runtime.db`，
+  不写生产业务库。输出公开方案、Trace、真实 token、保守费用估算和审核结果到同目录 report。
+  配置缺少对应文本价格时拒绝执行；逐调用检查剩余额度，错误/未知用量停止，
+  不自动重试、不自动切备用供应商。总额是按配置的保守单价估算，不冒充供应商最终账单。
+  四组均完成、实际 pass、主体无串案、视觉策略不完全相同，才能标记通过；
+  四个样本不代表所有创意的审美质量已获证明。离线替身只验证工程契约，不替代真实验收。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

@@ -17,6 +17,10 @@ llm:
   model_chat: deepseek-chat
   api_key_env: DEEPSEEK_API_KEY
   chat_extra_body: {}
+  # 付费验收的保守单价（元/百万 token）；没有对应模型价格时禁止未知费用实测。
+  # 来源：https://api-docs.deepseek.com/zh-cn/quick_start/pricing/，高峰、缓存未命中。
+  pricing_cny_per_million_by_model:
+    deepseek-flash: {input_cny: 2, output_cny: 8}
 
   # 视觉理解：火山方舟豆包多模态；即梦 AK/SK 只用于下方 Visual API 生图。
   vision_base_url: https://ark.cn-beijing.volces.com/api/v3

@@ -28,6 +28,13 @@ class AppSettings(BaseModel):
     log_level: str
 
 
+class TextTokenPricing(BaseModel):
+    """文本验收按未命中/高峰的保守单价估算；不冒充供应商实际账单。"""
+
+    input_cny: Decimal = Field(gt=0, allow_inf_nan=False)
+    output_cny: Decimal = Field(gt=0, allow_inf_nan=False)
+
+
 class LlmSettings(BaseModel):
     """LLM 配置；字段名与 YAML 中的 ``llm`` 段保持一致。"""
 
@@ -62,6 +69,7 @@ class LlmSettings(BaseModel):
     vision_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
     fallback_use_temperature: bool = True
     fallback_max_tokens_parameter: Literal["max_tokens", "max_completion_tokens"] = "max_tokens"
+    pricing_cny_per_million_by_model: dict[str, TextTokenPricing] = Field(default_factory=dict)
 
     def chat_api_key(self) -> str:
         """读取主聊天模型的密钥。"""

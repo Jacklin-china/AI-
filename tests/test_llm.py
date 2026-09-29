@@ -126,6 +126,33 @@ def test_chat_builds_client_and_returns_complete_message(
     client.close.assert_called_once_with()
 
 
+def test_single_attempt_never_retries_or_falls_back(monkeypatch: pytest.MonkeyPatch) -> None:
+    client = MagicMock()
+    client.chat.completions.create.side_effect = APIConnectionError(request=MagicMock())
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr(llm_module, "OpenAI", factory)
+    sleep = MagicMock()
+    monkeypatch.setattr(llm_module, "sleep", sleep)
+    with pytest.raises(LLMError):
+        llm_module.chat([{"role": "user", "content": "验收"}], single_attempt=True)
+    assert client.chat.completions.create.call_count == 1
+    assert factory.call_count == 1
+    sleep.assert_not_called()
+
+
+def test_single_attempt_reports_real_usage_without_changing_default_contract(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = MagicMock()
+    client.chat.completions.create.return_value = _response()
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+    usage = MagicMock()
+    message = llm_module.chat([{"role": "user", "content": "验收"}],
+                              single_attempt=True, on_usage=usage)
+    assert message.content == "你好"
+    usage.assert_called_once_with(12, 7, True)
+
+
 def test_vision_chat_uses_isolated_model_endpoint_and_output_limit(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

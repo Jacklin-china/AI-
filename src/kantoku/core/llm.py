@@ -262,6 +262,7 @@ def _call_provider(
     response_format: ResponseFormat | None,
     tools: Sequence[ChatCompletionToolUnionParam] | None,
     extra_body: Mapping[str, Any] | None,
+    on_usage: Callable[[int, int, bool], None] | None = None,
 ) -> ChatCompletionMessage:
     """创建一个供应商客户端，完成请求后释放连接资源。"""
     client: OpenAI | None = None
@@ -281,6 +282,8 @@ def _call_provider(
             tools=tools,
             extra_body=extra_body,
         )
+        if on_usage is not None:
+            on_usage(*_reported_usage(response))
         return response.choices[0].message
     finally:
         if client is not None:
@@ -299,6 +302,8 @@ def chat(
     response_format: ResponseFormat | None = None,
     tools: Sequence[ChatCompletionToolUnionParam] | None = None,
     timeout_s: float | None = None,
+    single_attempt: bool = False,
+    on_usage: Callable[[int, int, bool], None] | None = None,
 ) -> ChatCompletionMessage:
     """调用主聊天模型；可恢复失败时自动重试并尝试备用模型。"""
     settings = get_settings()
@@ -312,7 +317,7 @@ def chat(
             base_url=settings.llm.base_url,
             api_key=settings.llm.chat_api_key(),
             timeout_s=selected_timeout,
-            retry=settings.llm.retry,
+            retry=0 if single_attempt else settings.llm.retry,
             messages=messages,
             model=selected_model,
             temperature=(selected_temperature if settings.llm.chat_use_temperature else None),
@@ -321,11 +326,12 @@ def chat(
             response_format=response_format,
             tools=tools,
             extra_body=settings.llm.chat_extra_body,
+            on_usage=on_usage,
         )
     except ConfigError:
         raise
     except Exception as primary_error:
-        if not _should_fallback(primary_error):
+        if single_attempt or not _should_fallback(primary_error):
             raise LLMError(
                 "主模型调用失败",
                 detail=_error_summary(primary_error),

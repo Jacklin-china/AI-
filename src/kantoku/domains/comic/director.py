@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from collections.abc import Callable
 
+from loguru import logger
 from pydantic import ValidationError
 
 from kantoku.config import ToolError
@@ -49,6 +50,9 @@ def execute_director_stage(
     raw = model_call([
         {"role": "system", "content": (
             instruction + " 只返回符合下述 Schema 的公开决策 JSON 对象，"
+            "当前任务是对当前作品的补充；原始 Brief 和固定资产仍是约束。"
+            "只依据此次提供的上下文，不沿用其他作品或历史示例的主体。"
+            "未知细节只作为可编辑的创作选择，不得冒充用户硬约束。"
             "不输出私有思维链、reasoning 或 CoT："
             + json.dumps(model.model_json_schema(), ensure_ascii=False)
         )},
@@ -58,7 +62,13 @@ def execute_director_stage(
     ])
     try:
         output = model.model_validate_json(raw)
-    except (ValueError, ValidationError):
+    except ValidationError as error:
+        issues = [{"path": ".".join(map(str, item["loc"])), "type": item["type"]}
+                  for item in error.errors(include_input=False, include_context=False,
+                                           include_url=False)]
+        logger.warning("Director Debug Schema skill_id={} issues={}", skill_id, issues)
+        raise ToolError("导演阶段未返回有效的公开决策", detail=skill_id) from None
+    except ValueError:
         raise ToolError("导演阶段未返回有效的公开决策", detail=skill_id) from None
     return {key: output.model_dump()}
 

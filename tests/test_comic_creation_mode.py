@@ -143,6 +143,7 @@ def test_diverse_creative_contracts_use_current_project_context_not_previous_out
         assert request == cases[len(seen) // 3][0]
         assert "chat_history" not in context
         assert context["relevant_assets"] == []
+        assert set(context["project"]) == {"project_id"}
         seen.append(request)
         plan_text = next(plan for text, plan in cases if text == request)
         parts = _parts()
@@ -385,6 +386,67 @@ def test_completed_resume_returns_original_result_without_model(
     assert recovered == first
     assert model == []
     assert len(app.runtime_store.list_runs()) == 1
+
+
+@pytest.mark.parametrize("change", ["task", "brief"])
+def test_completed_resume_rejects_new_creative_input_before_reusing_result(
+    app: web_studio.StudioApplication, model: list[str], change: str,
+) -> None:
+    project_id = _project(app.comic_projects)
+    first = _execute(app, project_id, "fast")
+    options = {}
+    if change == "task":
+        options["task"] = "未来城市机器人咖啡师"
+    else:
+        app.comic_projects.replace_brief(project_id, CreativeBriefUpdate(
+            expected_version=2, original_request="未来城市机器人咖啡师",
+            hard_constraints=["机器人"],
+        ))
+    model.clear()
+    with pytest.raises(ToolError, match="输入版本"):
+        _execute(app, project_id, "fast", resume_run_id=first["run_id"], **options)
+    assert model == []
+    assert len(app.runtime_store.list_runs()) == 1
+
+
+def test_new_brief_in_same_project_does_not_send_old_director_to_model(
+    app: web_studio.StudioApplication, model: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project_id = _project(app.comic_projects)
+    first = _execute(app, project_id, "professional")
+    app.comic_projects.replace_brief(project_id, CreativeBriefUpdate(
+        expected_version=2, original_request="未来城市机器人咖啡师",
+        hard_constraints=["机器人", "咖啡师"],
+    ))
+    seen = []
+
+    def isolated(messages: list[dict[str, str]]) -> str:
+        payload = json.loads(messages[1]["content"])
+        if "inputs" not in payload:
+            return json.dumps({"public_summary": "符合机器人咖啡师的日常情境",
+                               "confidence": 0.9, "findings": [], "suggested_patches": []})
+        context = payload["context"]
+        assert context["creative_brief"]["original_request"] == "未来城市机器人咖啡师"
+        assert context["project"] == {"project_id": project_id}
+        assert "director_spec" not in context and "chat_history" not in context
+        assert context["relevant_assets"] == []
+        parts = _parts()
+        parts[SKILLS[0]]["creative_decision"]["hard_constraints"] = ["机器人", "咖啡师"]
+        for skill, schema in zip(SKILLS[:3], ("CreativeDecision", "DirectorPlan",
+                                             "CinematographyPlan"), strict=True):
+            if f'"title": "{schema}"' in messages[0]["content"]:
+                seen.append(context)
+                return json.dumps(next(iter(parts[skill].values())), ensure_ascii=False)
+        pytest.fail("unexpected stage")
+
+    monkeypatch.setattr(app, "_comic_director_model", isolated)
+    second = _execute(app, project_id, "professional")
+    run = app.runtime_store.get_run(second["run_id"])
+    assert len(seen) == 3 and second["run_id"] != first["run_id"]
+    assert run.state["director_debug"]["reused_stages"] == []
+    assert run.state["director_debug"]["source_versions"]["creative_brief"] == 2
+    assert len(run.state["director_debug"]["stages"]) == 5
+    assert all("output" in stage for stage in run.state["director_debug"]["stages"].values())
 
 
 def test_resume_rejects_changed_brief_before_any_model_call(

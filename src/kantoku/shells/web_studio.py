@@ -1960,12 +1960,10 @@ class StudioApplication:
             or previous.state.get("execution_mode") != request.creation_mode
         ):
             raise ToolError("来源导演任务与当前作品或模式不一致")
-        if request.resume_run_id and previous.status is ExecutionStatus.COMPLETED:
-            return self._comic_director_result(previous)
         task = request.task if request.task is not None else (
             previous.state.get("task") if previous else None
         )
-        asset_ids = request.asset_ids or (
+        asset_ids = request.asset_ids if "asset_ids" in request.model_fields_set else (
             [key.removeprefix("asset:") for key in previous.state["input_versions"]
              if key.startswith("asset:")] if previous else []
         )
@@ -1973,12 +1971,28 @@ class StudioApplication:
             project_id, task=task, refs=[ComicAssetRef(asset_id=item) for item in asset_ids],
             project_version=snapshot.project.current_version,
         )
-        storyboard_id = request.storyboard_id or (
+        storyboard_id = request.storyboard_id if "storyboard_id" in request.model_fields_set else (
             previous.state.get("storyboard_id") if previous else None
         )
-        shot_id = request.shot_id or (previous.state.get("shot_id") if previous else None)
+        shot_id = request.shot_id if "shot_id" in request.model_fields_set else (
+            previous.state.get("shot_id") if previous else None
+        )
         storyboard = self.comic_storyboards.get(storyboard_id) if storyboard_id else None
         shot = self.comic_storyboards.get_shot(shot_id) if shot_id else None
+        if request.resume_run_id and previous.status is ExecutionStatus.COMPLETED:
+            versions = {"creative_brief": snapshot.creative_brief.version,
+                        **{f"asset:{asset.asset_id}": asset.version for asset in assets}}
+            if storyboard:
+                versions["storyboard"] = storyboard.version
+            if shot:
+                versions["shot"] = shot.version
+            if (previous.state.get("task") != task
+                    or previous.state.get("input_versions") != versions
+                    or previous.state.get("storyboard_id") != storyboard_id
+                    or previous.state.get("shot_id") != shot_id
+                    or request.stage_edits):
+                raise ToolError("恢复任务与当前任务或输入版本不一致，请为新创意创建新任务")
+            return self._comic_director_result(previous)
         rerun_from = request.rerun_from
         if request.resume_run_id:
             if previous.status is ExecutionStatus.RUNNING and (
