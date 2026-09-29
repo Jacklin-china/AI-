@@ -84,6 +84,30 @@ class CreativeBriefUpdate(CreativeBriefInput):
     expected_version: int = Field(ge=1)
 
 
+class CreativeBriefFork(CreativeBriefUpdate):
+    """新创意的追加修订；父版本只作溯源，不能进入新创意的模型上下文。"""
+
+    parent_brief_id: str = Field(min_length=1, max_length=100)
+    parent_brief_version: int = Field(ge=1)
+    reason: BriefText
+
+
+class CreativeIntentBoundary(BaseModel):
+    """公开创意边界判断，不是导演方案、Prompt 或模型思维链。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    new_creative_direction: bool
+    reason: BriefText
+    new_brief: CreativeBriefInput | None = None
+
+    @model_validator(mode="after")
+    def require_new_brief(self) -> CreativeIntentBoundary:
+        if self.new_creative_direction != (self.new_brief is not None):
+            raise ValueError("新创意必须提供独立 Brief，同方向不得替换 Brief")
+        return self
+
+
 class CreativeProject(BaseModel):
     """作品根对象；current_version 在每次作品内容变更时递增。"""
 
@@ -107,6 +131,10 @@ class CreativeBrief(CreativeBriefInput):
     project_id: str
     version: int = Field(ge=1)
     created_at: datetime
+    status: Literal["active", "archived"] = "active"
+    parent_brief_id: str | None = None
+    parent_brief_version: int | None = Field(default=None, ge=1)
+    fork_reason: BriefText | None = None
 
 
 class ComicProjectSnapshot(BaseModel):

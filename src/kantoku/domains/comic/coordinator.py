@@ -147,6 +147,7 @@ class DirectorCoordinatorRequest(BaseModel):
     conversation_id: str | None = Field(default=None, max_length=100)
     worker_instance_id: str | None = Field(default=None, max_length=100)
     stage_edits: dict[str, Any] = Field(default_factory=dict, max_length=1)
+    creative_context: dict[str, Any] = Field(default_factory=dict)
 
     @model_validator(mode="after")
     def validate_scope(self) -> DirectorCoordinatorRequest:
@@ -236,6 +237,14 @@ class ComicDirectorCoordinator:
             "trace_id": trace_id,
             "task": request.task,
             "input_versions": input_versions,
+            "input_brief_id": request.snapshot.creative_brief.brief_id,
+            "input_brief_version": request.snapshot.creative_brief.version,
+            "creative_context": request.creative_context or {
+                "brief_used": f"{request.snapshot.creative_brief.brief_id}"
+                f"@v{request.snapshot.creative_brief.version}",
+                "previous_brief_detected": False, "fork_created": False,
+                "reason": "explicit snapshot",
+            },
             "completed_stages": list(reused_outputs),
             "stage_outputs": reused_outputs,
             "last_completed_step": None,
@@ -248,6 +257,8 @@ class ComicDirectorCoordinator:
                 "brief_request": redact_secrets(request.snapshot.creative_brief.original_request),
                 "current_task": redact_secrets(request.task or ""),
                 "source_versions": context.source_versions,
+                "input_brief_id": request.snapshot.creative_brief.brief_id,
+                "input_brief_version": request.snapshot.creative_brief.version,
                 "memory_used": [{"asset_id": asset.asset_id, "version": asset.version}
                                 for asset in request.assets],
                 "reused_stages": sorted(reused_outputs),
@@ -308,13 +319,14 @@ class ComicDirectorCoordinator:
                 trace_id=trace_id, project_id=project.project_id,
                 conversation_id=request.conversation_id, previous_run=request.previous_run_id,
                 debug=state["director_debug"],
+                creative_context=state["creative_context"],
             )
             logger.info("Director Debug Context brief_request={} current_task={} "
-                        "context={} source_versions={} reused_stages={}",
+                        "context={} source_versions={} reused_stages={} creative_context={}",
                         state["director_debug"]["brief_request"],
                         state["director_debug"]["current_task"],
                         state["director_debug"]["context"], context.source_versions,
-                        sorted(reused_outputs))
+                        sorted(reused_outputs), redact_secrets(str(state["creative_context"])))
             try:
                 if "comic.creative_understanding" not in reused_outputs:
                     self._run_stage(
@@ -394,6 +406,7 @@ class ComicDirectorCoordinator:
                 )
                 stale = self._stale_dependents(request, input_versions)
                 state["director_spec_version"] = spec.version
+                state["director_spec_id"] = spec.spec_id
                 state["project_version_after"] = self.project_store.get(
                     project.project_id,
                 ).project.current_version
@@ -409,6 +422,9 @@ class ComicDirectorCoordinator:
                     trace_id=trace_id, project_id=project.project_id,
                     execution_mode=request.execution_mode,
                     director_spec_version=spec.version, stale_dependents=stale,
+                    director_spec_id=spec.spec_id,
+                    input_brief_id=request.snapshot.creative_brief.brief_id,
+                    input_brief_version=request.snapshot.creative_brief.version,
                 )
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.COMPLETED, state=state,
@@ -618,6 +634,10 @@ class ComicDirectorCoordinator:
             or previous.state.get("execution_mode") != request.execution_mode
             or previous.state.get("task") != request.task
             or previous.state.get("input_versions") != dict(input_versions)
+            or previous.state.get("input_brief_id", request.snapshot.creative_brief.brief_id)
+            != request.snapshot.creative_brief.brief_id
+            or previous.state.get("input_brief_version", input_versions["creative_brief"])
+            != input_versions["creative_brief"]
             or previous.state.get("storyboard_id") != (
                 request.storyboard.storyboard_id if request.storyboard else None
             )

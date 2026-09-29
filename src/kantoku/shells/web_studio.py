@@ -98,6 +98,7 @@ from kantoku.domains.comic.coordinator import (
 from kantoku.domains.comic.critic import DirectorCriticEngine
 from kantoku.domains.comic.director import execute_director_stage, plan_director_spec
 from kantoku.domains.comic.models import (
+    ComicAsset,
     ComicAssetCreateRequest,
     ComicAssetDeleteRequest,
     ComicAssetEditRequest,
@@ -105,6 +106,7 @@ from kantoku.domains.comic.models import (
     ComicAssetRef,
     ComicAssetVersionRequest,
     ComicProjectInput,
+    ComicProjectSnapshot,
     ComicPromptCompileRequest,
     ComicPromptDraft,
     ComicPromptEditRequest,
@@ -115,6 +117,7 @@ from kantoku.domains.comic.models import (
     ComicStoryboardDraft,
     ComicStoryboardEditRequest,
     ComicVersionRestoreRequest,
+    CreativeBriefFork,
     CreativeBriefUpdate,
     DirectorSpecDraft,
     DirectorSpecRequest,
@@ -1817,6 +1820,82 @@ class StudioApplication:
         """共享文本模型入口；Comic Domain 不持有 Provider 客户端。"""
         return chat(messages, response_format={"type": "json_object"}).content or ""
 
+    def _comic_intent_model(self, messages: list[dict[str, str]]) -> str:
+        """边界检查复用同一文本出口，不绑定模型或新增 Skill。"""
+        return self._comic_director_model(messages)
+
+    def _resolve_comic_creative_context(
+        self, snapshot: ComicProjectSnapshot, request: DirectorSpecRequest, trace_id: str,
+    ) -> tuple[ComicProjectSnapshot, dict[str, Any]]:
+        brief = snapshot.creative_brief
+        reason = "same request"
+        fork_created = False
+        if request.task is not None and not (request.resume_run_id or request.previous_run_id):
+            with request_trace(trace_id), logger.contextualize(
+                component="comic.context_boundary", project_id=snapshot.project.project_id,
+                conversation_id=request.conversation_id or "-",
+            ):
+                try:
+                    boundary = ComicContextBuilder.check_intent_boundary(
+                        request.task, brief, model_call=self._comic_intent_model,
+                    )
+                except Exception as error:
+                    failure = public_error(
+                        error, component="comic.context_boundary",
+                        project_id=snapshot.project.project_id,
+                        input_brief_id=brief.brief_id, input_brief_version=brief.version,
+                    )
+                    error._kantoku_public_failure = failure
+                    raise
+                reason = boundary.reason
+                if boundary.new_creative_direction:
+                    if request.storyboard_id or request.shot_id:
+                        raise ToolError("新创意不能继承旧分镜或镜头，请创建独立导演任务")
+                    snapshot = self.comic_projects.fork_brief(
+                        snapshot.project.project_id, CreativeBriefFork(
+                            **boundary.new_brief.model_dump(),
+                            expected_version=snapshot.project.current_version,
+                            parent_brief_id=brief.brief_id, parent_brief_version=brief.version,
+                            reason=reason,
+                        ),
+                    )
+                    fork_created = True
+        selected = snapshot.creative_brief
+        return snapshot, {
+            "brief_used": f"{selected.brief_id}@v{selected.version}",
+            "input_brief_id": selected.brief_id, "input_brief_version": selected.version,
+            "previous_brief_detected": bool(
+                request.task and request.task != brief.original_request
+            ),
+            "fork_created": fork_created, "reason": reason,
+        }
+
+    def _select_comic_director_assets(
+        self, snapshot: ComicProjectSnapshot, task: str | None, asset_ids: list[str],
+    ) -> list[ComicAsset]:
+        """沿用资产召回，只隔离分叉前的隐式资产；显式引用仍可复用。"""
+        selected = self.comic_assets.select_relevant(
+            snapshot.project.project_id, task=task,
+            refs=[ComicAssetRef(asset_id=item) for item in asset_ids],
+            project_version=snapshot.project.current_version,
+        )
+        brief = snapshot.creative_brief
+        if brief.parent_brief_version is not None:
+            branch = next(item for item in self.comic_projects.brief_versions(
+                snapshot.project.project_id,
+            ) if item.version == brief.parent_brief_version + 1)
+            selected = [asset for asset in selected if (
+                asset.asset_id in asset_ids or self.comic_assets.get(
+                    snapshot.project.project_id, asset.asset_id, version=1,
+                ).created_at >= branch.created_at
+            )]
+            logger.bind(component="comic.context_boundary").info(
+                "creative direction assets scoped project_id={} brief_version={} asset_ids={}",
+                snapshot.project.project_id, brief.version,
+                [asset.asset_id for asset in selected],
+            )
+        return selected
+
     def create_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = DirectorSpecRequest.model_validate(data)
         if request.creation_mode is not None:
@@ -1827,6 +1906,9 @@ class StudioApplication:
         configured_model = get_settings().llm.model_chat
         task_id = f"task-{uuid4().hex}"
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
+        snapshot, creative_context = self._resolve_comic_creative_context(
+            snapshot, request, trace_id,
+        ) if request.draft is None else (snapshot, {})
         state: dict[str, Any] = {
             "project_id": project_id, "task_id": task_id, "trace_id": trace_id,
             "conversation_id": request.conversation_id,
@@ -1837,6 +1919,9 @@ class StudioApplication:
             "requested_asset_ids": request.asset_ids,
             "configured_model": configured_model,
             "worker_instance_id": self._instance_id,
+            "input_brief_id": snapshot.creative_brief.brief_id,
+            "input_brief_version": snapshot.creative_brief.version,
+            "creative_context": creative_context,
         }
         run = self.runtime_store.create_run(
             "comic", "comic.director-spec", state, "director_spec",
@@ -1844,7 +1929,8 @@ class StudioApplication:
         )
         self.runtime_store.append_event(
             run.id, RuntimeEventType.RUN_STARTED, node_id="director_spec",
-            payload={"project_id": project_id, "task_id": task_id},
+            payload={"project_id": project_id, "task_id": task_id,
+                     "creative_context": creative_context},
         )
 
         def step(status: str, completed_step: str | None) -> None:
@@ -1872,10 +1958,8 @@ class StudioApplication:
             try:
                 step("planning", "brief_loaded")
                 if request.draft is None:
-                    assets = self.comic_assets.select_relevant(
-                        project_id, task=request.task,
-                        refs=[ComicAssetRef(asset_id=item) for item in request.asset_ids],
-                        project_version=snapshot.project.current_version,
+                    assets = self._select_comic_director_assets(
+                        snapshot, request.task, request.asset_ids,
                     )
                     state["selected_assets"] = [
                         {"asset_id": asset.asset_id, "version": asset.version}
@@ -1899,7 +1983,7 @@ class StudioApplication:
                     source = "manual"
                 step("checking", "director_draft_ready")
                 spec = self.comic_projects.save_director(
-                    project_id, draft, expected_project_version=request.expected_project_version,
+                    project_id, draft, expected_project_version=snapshot.project.current_version,
                     source=source,
                 )
                 state.update(
@@ -1960,6 +2044,12 @@ class StudioApplication:
             or previous.state.get("execution_mode") != request.creation_mode
         ):
             raise ToolError("来源导演任务与当前作品或模式不一致")
+        if previous and request.task is not None and request.task != previous.state.get("task"):
+            raise ToolError("恢复任务与当前任务或输入版本不一致，新输入不能恢复旧 Run")
+        trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
+        snapshot, creative_context = self._resolve_comic_creative_context(
+            snapshot, request, trace_id,
+        )
         task = request.task if request.task is not None else (
             previous.state.get("task") if previous else None
         )
@@ -1967,10 +2057,7 @@ class StudioApplication:
             [key.removeprefix("asset:") for key in previous.state["input_versions"]
              if key.startswith("asset:")] if previous else []
         )
-        assets = self.comic_assets.select_relevant(
-            project_id, task=task, refs=[ComicAssetRef(asset_id=item) for item in asset_ids],
-            project_version=snapshot.project.current_version,
-        )
+        assets = self._select_comic_director_assets(snapshot, task, asset_ids)
         storyboard_id = request.storyboard_id if "storyboard_id" in request.model_fields_set else (
             previous.state.get("storyboard_id") if previous else None
         )
@@ -1988,6 +2075,10 @@ class StudioApplication:
                 versions["shot"] = shot.version
             if (previous.state.get("task") != task
                     or previous.state.get("input_versions") != versions
+                    or previous.state.get("input_brief_id", snapshot.creative_brief.brief_id)
+                    != snapshot.creative_brief.brief_id
+                    or previous.state.get("input_brief_version", snapshot.creative_brief.version)
+                    != snapshot.creative_brief.version
                     or previous.state.get("storyboard_id") != storyboard_id
                     or previous.state.get("shot_id") != shot_id
                     or request.stage_edits):
@@ -2010,6 +2101,7 @@ class StudioApplication:
             prior_spec=prior_spec, previous_run_id=source_id, rerun_from=rerun_from,
             stage_edits=request.stage_edits, conversation_id=request.conversation_id,
             worker_instance_id=self._instance_id,
+            trace_id=trace_id, creative_context=creative_context,
         ))
         return self._comic_director_result(self.runtime_store.get_run(result.run_id))
 

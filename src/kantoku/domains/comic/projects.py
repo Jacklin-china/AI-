@@ -2,8 +2,9 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,10 @@ from .models import (
     ComicProjectInput,
     ComicProjectSnapshot,
     CreativeBrief,
+    CreativeBriefFork,
     CreativeBriefInput,
     CreativeBriefUpdate,
+    CreativeIntentBoundary,
     CreativeProject,
     DirectorSpec,
     DirectorSpecDraft,
@@ -282,7 +285,8 @@ class ComicProjectStore:
             return self._snapshot(connection, project_id, requested_version)
 
     def replace_brief(
-        self, project_id: str, data: CreativeBriefUpdate,
+        self, project_id: str, data: CreativeBriefUpdate, *,
+        fork: CreativeBriefFork | None = None,
     ) -> ComicProjectSnapshot:
         """完整替换 Brief，使用作品版本做 CAS；重复相同 PUT 不新增修订。"""
         with self._connect() as connection:
@@ -294,10 +298,10 @@ class ComicProjectStore:
                 raise ToolError("找不到指定漫剧作品")
             current_version = int(row["current_version"])
             current = self._snapshot(connection, project_id, current_version)
-            content = data.model_dump(exclude={"expected_version"})
-            previous_content = current.creative_brief.model_dump(exclude={
-                "brief_id", "project_id", "version", "created_at",
-            })
+            content = data.model_dump(include=set(CreativeBriefInput.model_fields))
+            previous_content = current.creative_brief.model_dump(
+                include=set(CreativeBriefInput.model_fields),
+            )
             if content == previous_content:
                 return current
             if data.expected_version != current_version:
@@ -305,10 +309,33 @@ class ComicProjectStore:
                     "作品已由其他操作更新，请刷新后重试",
                     detail=f"expected={data.expected_version}; current={current_version}",
                 )
+            if fork is not None and (
+                fork.parent_brief_id != current.creative_brief.brief_id
+                or fork.parent_brief_version != current.creative_brief.version
+            ):
+                raise ToolError("创意分叉的父 Brief 与当前版本不一致")
             now = utc_now()
+            lineage = {key: getattr(current.creative_brief, key) for key in (
+                "parent_brief_id", "parent_brief_version", "fork_reason",
+            )}
+            if fork is not None:
+                lineage = {"parent_brief_id": fork.parent_brief_id,
+                           "parent_brief_version": fork.parent_brief_version,
+                           "fork_reason": fork.reason}
+                # 归档是追加生命周期事件，绝不 UPDATE 旧 Brief JSON。
+                self._insert_version(
+                    connection, project_id=project_id, entity_type="creative_brief_lifecycle",
+                    entity_id=current.creative_brief.brief_id,
+                    version=current.creative_brief.version,
+                    payload_json=json.dumps({
+                        "status": "archived", "reason": fork.reason,
+                        "successor_version": current.creative_brief.version + 1,
+                    }),
+                    created_at=now,
+                )
             brief = CreativeBrief(
                 **content, brief_id=current.project.brief_id, project_id=project_id,
-                version=current.creative_brief.version + 1, created_at=now,
+                version=current.creative_brief.version + 1, created_at=now, **lineage,
             )
             project = current.project.model_copy(update={
                 "updated_at": now, "current_version": current_version + 1,
@@ -333,6 +360,31 @@ class ComicProjectStore:
                 payload_json=project.model_dump_json(), created_at=now,
             )
         return ComicProjectSnapshot(project=project, creative_brief=brief)
+
+    def fork_brief(self, project_id: str, data: CreativeBriefFork) -> ComicProjectSnapshot:
+        """复用同一事务/版本表/CAS，不创建另一套 Brief 存储。"""
+        return self.replace_brief(project_id, data, fork=data)
+
+    def brief_versions(self, project_id: str) -> list[CreativeBrief]:
+        current = self.get(project_id)
+        with self._connect() as connection:
+            rows = connection.execute(
+                "SELECT payload_json FROM comic_entity_versions WHERE project_id=? "
+                "AND entity_type='creative_brief' ORDER BY version DESC", (project_id,),
+            ).fetchall()
+            archived = {int(row["version"]) for row in connection.execute(
+                "SELECT version FROM comic_entity_versions WHERE project_id=? "
+                "AND entity_type='creative_brief_lifecycle'", (project_id,),
+            )}
+        result = []
+        for row in rows:
+            brief = CreativeBrief.model_validate_json(row["payload_json"])
+            if brief.brief_id != current.creative_brief.brief_id:
+                continue
+            if brief.version <= max(archived, default=0):
+                brief = brief.model_copy(update={"status": "archived"})
+            result.append(brief)
+        return result
 
     def get_director(
         self, project_id: str, *, project_version: int | None = None,
@@ -445,6 +497,46 @@ class ComicContextBuilder:
     """只组合调用方确实选中的导演方案与资产；不读聊天全文。"""
 
     @staticmethod
+    def check_intent_boundary(
+        current_user_request: str, brief: CreativeBrief, *,
+        model_call: Callable[[list[dict[str, str]]], str],
+    ) -> CreativeIntentBoundary:
+        """用现有文本能力判断语义边界；无关键词模板，无默认继承失败兜底。"""
+        request = current_user_request.strip()
+        if not request or len(request) > 1000:
+            raise ToolError("创意请求不能为空或超过长度限制")
+        if request == brief.original_request:
+            return CreativeIntentBoundary(new_creative_direction=False, reason="same request")
+        raw = model_call([
+            {"role": "system", "content": (
+                "判断当前用户输入是在修改现有创意，还是创建独立的新创作方向。"
+                "综合主题、角色、世界观、叙事目标和视觉方向，不使用关键词固定映射。"
+                "调整颜色/构图、补充细节或语义一致的重述沿用现有 Brief；"
+                "角色、题材或世界观根本改变且不是对当前作品的明确修改时创建新 Brief。"
+                "历史失败不能成为继承理由。新 Brief 只根据当前用户输入，"
+                "不得复制旧角色、旧场景、旧风格、旧偏好或约束。"
+                "新 Brief original_request 保留当前用户原文；hard_constraints 仅提取"
+                "用户明示的逐字短片段，不添加推断要求。只返回符合 Schema 的 JSON，"
+                "reason 是简短公开边界说明，不输出思维链、Prompt 或导演方案："
+                + json.dumps(CreativeIntentBoundary.model_json_schema(), ensure_ascii=False)
+            )},
+            {"role": "user", "content": json.dumps({
+                "current_user_request": request,
+                "current_brief": brief.model_dump(include=set(CreativeBriefInput.model_fields)),
+            }, ensure_ascii=False)},
+        ])
+        try:
+            boundary = CreativeIntentBoundary.model_validate_json(raw)
+        except (ValueError, ValidationError):
+            raise ToolError("创意边界判断未返回有效公开结构，未继承旧 Context") from None
+        if boundary.new_brief is not None:
+            if any(value.casefold() not in request.casefold()
+                   for value in boundary.new_brief.hard_constraints):
+                raise ToolError("新 Brief 硬约束不是当前用户原文，未继承旧 Context")
+            boundary.new_brief.original_request = request
+        return boundary
+
+    @staticmethod
     def build(
         snapshot: ComicProjectSnapshot, *, task: str | None = None,
         director: DirectorSpec | None = None,
@@ -455,12 +547,12 @@ class ComicContextBuilder:
             raise ToolError("当前任务描述过长")
         project = snapshot.project
         brief = snapshot.creative_brief
+        project_context = {"project_id": project.project_id}
+        if brief.parent_brief_version is None:
+            project_context.update(title=project.title, description=project.description)
+        # 分叉后旧作品标题仅是导航元数据，不能重新成为新创意的故事事实。
         stable_context = {
-            "project": {
-                "project_id": project.project_id,
-                "title": project.title,
-                "description": project.description,
-            },
+            "project": project_context,
             "creative_brief": {
                 "original_request": brief.original_request,
                 "hard_constraints": brief.hard_constraints,

@@ -61,7 +61,12 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
         web_studio, "_image_result_summary",
         lambda requirement, _prompt, _trace: f"已按你的要求生成一张{requirement}。",
     )
-    return web_studio.StudioApplication()
+    application = web_studio.StudioApplication()
+    # 离线测试显式替身；涉及创意隔离的测试单独提供语义边界结果。
+    monkeypatch.setattr(application, "_comic_intent_model", lambda _messages: json.dumps({
+        "new_creative_direction": False, "reason": "offline continuation fixture",
+    }))
+    return application
 
 
 @pytest.fixture

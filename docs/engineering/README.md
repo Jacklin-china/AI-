@@ -199,12 +199,23 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
 不创建 Runtime、Skill、Asset、Prompt 或 Provider 副本。
 
 - **输入隔离**：导演调用只读取当前 Brief、当前任务与选中资产。项目标题/描述属于导航元数据，
-  可能保留旧创意，不再送入导演模型充当故事事实；Context API 的完整作品元数据仍兼容。
-  同作品的 `task` 是补充任务，不能静默废弃用户硬约束；彻底替换创意须通过现有 Brief 追加版本
-  或创建新 Project。既有 DirectorSpec、聊天历史、其他作品不会自动送入生成上下文。
+  可能保留旧创意，不再送入导演模型充当故事事实；Project API 仍保留导航元数据，
+  分叉后的 Context 只传 project_id，兼容的旧导演入口也不能从标题恢复旧创意。
+  新的导演 `task` 先经 Context Builder 的语义边界检查（复用共享文本出口，无关键词映射）；
+  同方向修改保留 Brief。新方向以当前请求创建独立 Brief 修订，不携带旧偏好或硬约束；
+  `CreativeBriefFork` 通过现有 `comic_entity_versions` 和 CAS 追加父版本、原因及归档生命周期，
+  不覆写旧 JSON，不新增表。历史快照保留当时状态，`brief_versions()` 投影当前归档状态。
+  判断失败直接返回可追踪错误，不能默认继承或伪造新 Brief。GET Context 仍为只读，不调用模型。
+  分叉后的隐式资产召回排除该创意边界前创建的资产（改版不改变资产所属方向）；只有明确
+  指定 Asset ID 才可跨方向复用。新资产仍复用原资产召回，旧 DirectorSpec/分镜/镜头不自动继承。
+  既有聊天历史、其他作品不会自动送入生成上下文。
 - **恢复校验**：已经完成的 Run 也先校验任务、Brief/资产版本、Storyboard/Shot 身份，
   再返回原结果。新输入不能用 `resume_run_id` 借回旧方案；显式空资产列表不会偷用旧引用。
   阶段恢复核验实体 ID，而不只比较恰好相同的版本号。
+  源 Run 的请求不同时在边界判定和模型调用前拒绝恢复；普通新请求不查找或恢复失败 Run。
+  每个 Run 明确保存 `input_brief_id` / `input_brief_version`，生成事件关联输出 DirectorSpec ID
+  和版本。输入快照事件的 `creative_context` 公开 brief_used、previous_brief_detected、
+  fork_created 和 reason，便于区分沿用、分叉与显式恢复，不保存思维链。
 - **审核与写权限分离**：Critic 可以审核 v2 公开决策字段，但 Patch 只允许小范围白名单。
   别名先规范化；未知路径记录 warning 后忽略。硬约束、Project/资产身份与风格引用始终只读。
   逐字证据仅忽略排版空白，不做模糊语义匹配。不可核验的合法字段结论转为 `needs_revision`，
