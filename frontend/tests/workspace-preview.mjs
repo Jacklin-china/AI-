@@ -5,17 +5,17 @@ import { readFile } from 'node:fs/promises'
 import { fileURLToPath } from 'node:url'
 import { resolve, extname, sep } from 'node:path'
 const root = resolve(fileURLToPath(new URL('../../src/kantoku/shells/web/', import.meta.url)))
-const project = { project_id: 'qa-project', title: '山海经穷奇观察人类文明', current_version: 1, director_version: null }
-const brief = { version: 1, original_request: project.title, hard_constraints: ['穷奇', '悬崖'], soft_preferences: ['孤独感'], creative_freedom: ['构图'] }
-const assets = [{ asset_id: 'qa-character', name: '穷奇', version: 1, pinned_version: 1, state: 'active', details: { kind: 'character', appearance: '远古异兽，保留翼与角', clothing: '无' }, fixed_constraints: ['保持异兽身份'], reference_artifact_ids: [] }]
+const project = { project_id: 'qa-project', title: '树梢上的守望', current_version: 1, director_version: null }
+const brief = { version: 1, original_request: '一个少女站在树梢看村庄', hard_constraints: ['少女', '树梢', '村庄'], soft_preferences: ['安静'], creative_freedom: ['构图'] }
+const assets = [{ asset_id: 'qa-character', name: '少女', version: 1, pinned_version: 1, state: 'active', details: { kind: 'character', appearance: '东方少女，保持角色身份', clothing: '白色古装' }, fixed_constraints: ['保持角色身份'], reference_artifact_ids: [] }]
 const stages = ['creative_understanding', 'visual_direction', 'cinematography', 'director_critic', 'director_assemble']
 const runs = []; const tasks = []; const versions = []
 const port = Number(process.env.KANTOKU_QA_PORT ?? 8765)
 function newSpec() {
   return { schema_version: 2, spec_id: 'qa-director', project_id: project.project_id, version: versions.length + 1, creative_brief_version: 1, asset_versions: { 'asset:qa-character': 1 }, created_at: new Date().toISOString(),
-    creative_decision: { intent_summary: '表现异兽观察人类文明的孤独感，而非战斗威力。', narrative_context: '悬崖与远方城市形成时间和尺度的对比。', emotional_target: '孤独而克制', audience_experience: '远古生命的距离感', hard_constraints: brief.hard_constraints, narrative_focus: '观察而非攻击' },
-    director_plan: { visual_strategy: '让环境与主体共同表达隔阂。', visual_focus: '穷奇安静的姿态', composition_strategy: '悬崖占近景，城市退到远处。', color_strategy: '自然岩色与城市暖光对比', creative_choices: ['不依赖低机位夸张力量。'], continuity_rules: ['保持翼与角'] },
-    cinematography: { shot_size: '远景', camera_angle: '平视', spatial_feel: '远近空间分层', lighting: '侧逆光强调翼的轮廓', light_direction: '城市方向', depth_strategy: '城市保持可识别', material_language: '岩石与毛发形成触感对照' },
+    creative_decision: { intent_summary: '少女从树梢眺望村庄，表达安静的守望与归属感。', narrative_context: '近处枝叶与远方村落建立人物和家园的联系。', emotional_target: '宁静中带有期待', audience_experience: '跟随少女的视线寻找远方的生活', hard_constraints: brief.hard_constraints, narrative_focus: '人物视线与村庄的关系' },
+    director_plan: { visual_strategy: '以人物视线串联树梢和远方村庄。', visual_focus: '少女的姿态与眺望方向', composition_strategy: '树枝形成前景，村庄位于视线延伸处。', color_strategy: '柔和林间绿色与村庄暖色协调', creative_choices: ['让环境说明人物的期待，而非夸张力量。'], continuity_rules: ['保持白色古装与角色身份'] },
+    cinematography: { shot_size: '远景', camera_angle: '与树梢平齐', spatial_feel: '枝叶、人物、村庄形成三个层次', lighting: '柔和侧光保留人物和村庄细节', light_direction: '树冠侧面', depth_strategy: '远方村庄保持可识别', material_language: '衣料与枝叶的柔韧质感' },
     critic_result: { verdict: 'pass', public_summary: '意图与视觉表达一致，硬约束保留。', findings: [] } }
 }
 function execute(body, pending = false, existing = null) {
@@ -53,8 +53,8 @@ createServer(async (request, response) => {
     if (path === '/api/comic/projects/qa-project') return json(response, { project, creative_brief: brief })
     if (path.endsWith('/assets')) return json(response, { assets })
     if (path.endsWith('/tasks')) return json(response, { tasks })
-    if (path.endsWith('/storyboards')) return json(response, { storyboards: [{ storyboard_id: 'qa-board', title: '悬崖观察', version: 1, director_spec_version: 1, status: 'draft' }] })
-    if (path.endsWith('/shots')) return json(response, { shots: [{ shot_id: 'qa-shot', sequence_number: 1, subject: '穷奇', purpose: '表现隔阂', action: '静静观察', version: 1, status: 'planned', character_asset_versions: [{ asset_id: 'qa-character', version: 1 }], scene_asset_versions: [] }] })
+    if (path.endsWith('/storyboards')) return json(response, { storyboards: [{ storyboard_id: 'qa-board', title: '树梢守望', version: 1, director_spec_version: 1, status: 'draft' }] })
+    if (path.endsWith('/shots')) return json(response, { shots: [{ shot_id: 'qa-shot', sequence_number: 1, subject: '少女', purpose: '表现守望', action: '眺望村庄', version: 1, status: 'planned', character_asset_versions: [{ asset_id: 'qa-character', version: 1 }], scene_asset_versions: [] }] })
     if (path.endsWith('/prompt/versions')) return json(response, { versions: [] })
     if (path.endsWith('/director-spec/versions')) return json(response, { versions })
     if (path.endsWith('/director-spec/confirm') && request.method === 'POST') {

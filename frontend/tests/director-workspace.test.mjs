@@ -6,7 +6,7 @@ import { reactive } from 'vue'
 
 const source = readFileSync(new URL('../src/domains/comic/directorPresentation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
-const { directorDraftFields, editableDirectorDraft, canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+const { discardDirectorNodeDraft, directorPageFields, directorPageFieldLabel, fastDirectorNodeLabels, directorDraftFields, editableDirectorDraft, canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 const spec = {
   schema_version: 2, spec_id: 'director', version: 2, creative_brief_version: 3,
   creative_decision: { intent_summary: '异兽观察文明', emotional_target: '孤独', private_thought: 'must not show' },
@@ -133,4 +133,43 @@ test('queued supplements never start while a Run is busy or outcome is unknown',
   assert.match(view, /await execute\(next.text, \{\}, next.mode\)/)
   assert.match(view, /await cancelRun\(task.run_id\)/)
   assert.match(view, /prefers-reduced-motion:reduce/)
+})
+
+test('Fast pages expose only approachable fields; Professional keeps all public decisions', () => {
+  const body = { intent_summary: '少女眺望村庄', audience_experience: '遥远的乡愁', emotional_target: '安静', private_thought: 'hidden', hard_constraints: ['少女'] }
+  assert.deepEqual(directorPageFields('creative_decision', body, 'fast'), { intent_summary: body.intent_summary, emotional_target: '安静', hard_constraints: ['少女'] })
+  assert.equal(directorPageFields('creative_decision', body, 'professional').audience_experience, '遥远的乡愁')
+  assert.equal(directorPageFields('creative_decision', body, 'professional').private_thought, undefined)
+  assert.equal(directorPageFieldLabel('cinematography', 'shot_size', 'fast'), '画面范围')
+  assert.equal(directorPageFieldLabel('cinematography', 'shot_size', 'professional'), '景别')
+  assert.equal(fastDirectorNodeLabels.director_critic, undefined)
+  assert.equal(fastDirectorNodeLabels.cinematography, '镜头感觉')
+})
+
+test('independent node pages share one version-bound editor and one persistent conversation', () => {
+  const workspace = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const page = readFileSync(new URL('../src/components/DirectorNodeView.vue', import.meta.url), 'utf8')
+  const app = readFileSync(new URL('../src/App.vue', import.meta.url), 'utf8')
+  assert.match(workspace, /navigate\(\{ \.\.\.route.value, workspacePage, directorStage \}\)/)
+  assert.doesNotMatch(workspace, /scrollIntoView|location.hash/)
+  assert.match(workspace, /spec.value\?\.schema_version === 2 \? 'director_assemble' : selectedStage.value/)
+  assert.match(workspace, /scrollPositions.set\(old, stageScroll.value.scrollTop\)/)
+  assert.match(workspace, /scrollPositions.get\(key\)/)
+  assert.equal((workspace.match(/<MessageComposer /g) ?? []).length, 1)
+  assert.match(app, /:key="`\$\{route.domain\}:\$\{route.runId \?\? 'new'\}`"/)
+  assert.match(page, /Saved v2 is the current editable version/)
+  assert.match(page, /stage === 'director_assemble'/)
+  assert.match(page, /section === sectionKey.value/)
+  assert.match(page, /mode !== 'fast'/)
+})
+test('discarding one node preserves other edits; saving uses the same immutable draft version', () => {
+  const edits = { 'creative_decision.emotional_target': '希望', 'director_plan.composition_strategy': '环境留白', 'cinematography.camera_angle': '侧面平视' }
+  const remaining = discardDirectorNodeDraft(edits, 'visual_direction')
+  assert.deepEqual(remaining, { 'creative_decision.emotional_target': '希望', 'cinematography.camera_angle': '侧面平视' })
+  const next = editableDirectorDraft(spec, remaining)
+  assert.equal(next.creative_decision.emotional_target, '希望')
+  assert.equal(next.cinematography.camera_angle, '侧面平视')
+  assert.equal(next.director_plan.composition_strategy, spec.director_plan.composition_strategy)
+  assert.equal(spec.cinematography.camera_angle, '平视')
+  assert.equal(next.critic_result, null)
 })

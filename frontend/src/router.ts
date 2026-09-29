@@ -16,6 +16,18 @@ export interface Route {
   runId?: string
   batchId?: string
   tab?: string
+  workspacePage?: string
+  directorStage?: string
+}
+
+export const directorStagePaths: Record<string, string> = {
+  creative_understanding: 'understanding', visual_direction: 'visual-direction',
+  cinematography: 'cinematography', director_critic: 'critic', director_assemble: 'plan',
+}
+const workspacePages = ['conversation', 'director', 'storyboard', 'assets', 'prompt', 'history']
+function workspaceSuffix(next: Route): string {
+  if (!next.workspacePage || !workspacePages.includes(next.workspacePage)) return ''
+  return `/${next.workspacePage}${next.workspacePage === 'director' ? `/${directorStagePaths[next.directorStage ?? 'director_assemble'] ?? 'plan'}` : ''}`
 }
 
 export const route = ref<Route>(parse(window.location.pathname))
@@ -43,10 +55,17 @@ export function parse(path: string): Route {
 
   if (parts[0] === 'workspace') {
     const domain = parts[1] ?? 'studio'
+    const offset = parts[2] === 'run' && parts[3] ? 4 : 2
+    const page = parts[offset]
+    const node = parts[offset + 1]
+    const workspace = page && workspacePages.includes(page) ? {
+      workspacePage: page,
+      ...(page === 'director' ? { directorStage: Object.keys(directorStagePaths).find(stage => directorStagePaths[stage] === node) ?? 'director_assemble' } : {}),
+    } : {}
     if (parts[2] === 'run' && parts[3]) {
-      return { name: 'workspace_run', domain, runId: decodeURIComponent(parts[3]) }
+      return { name: 'workspace_run', domain, runId: decodeURIComponent(parts[3]), ...workspace }
     }
-    return { name: 'workspace', domain }
+    return { name: 'workspace', domain, ...workspace }
   }
   if (parts[0] === 'tasks') {
     if (parts[1] === 'run' && parts[2]) {
@@ -67,9 +86,9 @@ export function href(next: Route): string {
     case 'home':
       return '/'
     case 'workspace':
-      return `/workspace/${next.domain ?? 'studio'}`
+      return `/workspace/${next.domain ?? 'studio'}${workspaceSuffix(next)}`
     case 'workspace_run':
-      return `/workspace/${next.domain ?? 'studio'}/run/${encodeURIComponent(next.runId ?? '')}`
+      return `/workspace/${next.domain ?? 'studio'}/run/${encodeURIComponent(next.runId ?? '')}${workspaceSuffix(next)}`
     case 'task_run':
       return `/tasks/run/${encodeURIComponent(next.runId ?? '')}`
     case 'task_batch':
@@ -83,9 +102,12 @@ export function href(next: Route): string {
   }
 }
 
-export function navigate(next: Route): void {
+export function navigate(next: Route, replace = false): void {
   const path = href(next)
-  if (window.location.pathname !== path) window.history.pushState({}, '', path)
+  if (window.location.pathname !== path) {
+    if (replace) window.history.replaceState({}, '', path)
+    else window.history.pushState({}, '', path)
+  }
   route.value = { ...next }
   window.scrollTo({ top: 0 })
 }

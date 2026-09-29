@@ -8,7 +8,8 @@ import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
-import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorDraftFields, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
+import { navigate, route } from '../router'
+import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
 import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { CoreRun } from '../types'
 
@@ -28,12 +29,13 @@ const prompts = ref<Record<string, unknown>[]>([])
 const selectedBoard = ref('')
 const selectedShot = ref('')
 const selectedRun = ref('')
-const selectedStage = ref('director_assemble')
-const section = ref('director')
+const selectedStage = ref(route.value.directorStage ?? 'director_assemble')
+const section = ref(route.value.workspacePage === 'conversation' ? 'director' : route.value.workspacePage ?? 'director')
 const navOpen = ref(false)
 const inspectorOpen = ref(false)
-const chatExpanded = ref(false)
+const chatExpanded = ref(!route.value.workspacePage || route.value.workspacePage === 'conversation')
 const chatSize = ref(58)
+const modeChatSizes: Record<CreationMode, number> = { fast: 58, professional: 42 }
 const composer = ref<InstanceType<typeof MessageComposer> | null>(null)
 const timeline = ref<HTMLElement | null>(null)
 const nearBottom = ref(true)
@@ -59,13 +61,14 @@ const referenceLoading = new Set<string>()
 let timer: ReturnType<typeof setInterval> | null = null
 let disposed = false
 let refreshing = false
+let applyingRoute = false
 let pageRequest = 0
 const navigation = [
   { id: 'conversation', label: '对话', icon: MessageSquareText },
   { id: 'director', label: '导演', icon: Clapperboard },
   { id: 'storyboard', label: '分镜', icon: Film },
-  { id: 'prompt', label: 'Prompt', icon: FileText },
   { id: 'assets', label: '资产', icon: Layers },
+  { id: 'prompt', label: 'Prompt', icon: FileText },
   { id: 'history', label: '历史', icon: History },
 ]
 const assetFieldLabels: Record<string, string> = {
@@ -78,15 +81,18 @@ const summary = computed(() => restoredSpec.value ? undefined : active.value?.di
 const spec = computed(() => restoredSpec.value ?? active.value?.director_spec ?? null)
 const node = computed(() => summary.value?.stages.find(item => item.stage === selectedStage.value))
 const hasRunning = computed(() => executions.value.some(item => ['running', 'pending'].includes(item.status) && !item.recovery_required))
-const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', selectedStage.value === 'director_assemble' ? `version:${spec.value?.version}` : active.value?.run_id ?? '', selectedStage.value))
+// All pages edit one version-bound draft, not independent copies of DirectorSpec.
+const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', spec.value?.schema_version === 2 ? `version:${spec.value.version}` : active.value?.run_id ?? '', spec.value?.schema_version === 2 ? 'director_assemble' : selectedStage.value))
 const fields = computed(() => drafts.value[draftKey.value] ?? {})
-const editing = computed(() => draftKey.value in drafts.value)
+const editing = computed(() => selectedStage.value !== 'director_assemble' && (spec.value?.schema_version === 2
+  ? Object.keys(fields.value).some(key => key.startsWith(`${directorStageSections[selectedStage.value]}.`)) : draftKey.value in drafts.value))
 const dirty = computed(() => Object.keys(drafts.value).length > 0)
 const stale = computed(() => directorIsStale(spec.value, project.value?.creative_brief.version, project.value?.project.director_version, assets.value))
 const confirmable = computed(() => canConfirmDirector(restoredSpec.value ? 'completed' : active.value?.status, spec.value, stale.value, dirty.value) && !busy.value && !hasRunning.value)
 const confirmed = computed(() => confirmable.value && spec.value?.user_confirmed === true)
-const editable = computed(() => selectedStage.value === 'director_assemble' ? spec.value?.schema_version === 2 && !stale.value : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
-const title = computed(() => section.value === 'director' ? directorNodeLabels[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
+const editable = computed(() => spec.value?.schema_version === 2 ? !stale.value && editableDirectorNode(selectedStage.value) : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
+const visibleNodes = computed(() => mode.value === 'fast' ? fastDirectorNodeLabels : directorNodeLabels)
+const title = computed(() => section.value === 'director' ? visibleNodes.value[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
 const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
 const projectTitle = computed(() => workspaceProjectTitle(project.value?.project.title, project.value?.creative_brief.original_request))
@@ -113,9 +119,11 @@ async function confirm(): Promise<void> {
 }
 function invalidate(): void { revisionVersion.value = null }
 function beginEdit(): void {
-  if (!editable.value) return
-  if (selectedStage.value === 'director_assemble') {
-    drafts.value[draftKey.value] ??= directorDraftFields(spec.value)
+  if (!editable.value || busy.value || hasRunning.value) return
+  if (spec.value?.schema_version === 2) {
+    const prefix = `${directorStageSections[selectedStage.value]}.`
+    const selected = Object.fromEntries(Object.entries(directorDraftFields(spec.value)).filter(([key]) => key.startsWith(prefix)))
+    drafts.value[draftKey.value] = { ...selected, ...fields.value }
     return
   }
   if (!node.value) return
@@ -124,10 +132,11 @@ function beginEdit(): void {
     .map(([key, value]) => [key, Array.isArray(value) ? value.join('\n') : String(value ?? '')]))
   invalidate()
 }
-function editFinal(): void { selectedStage.value = 'director_assemble'; section.value = 'director'; beginEdit() }
+function editFinal(stage = 'creative_understanding'): void { visitStage(stage); beginEdit() }
 function reviseByInstruction(): void {
   if (!spec.value?.version || stale.value || busy.value || hasRunning.value) return
   revisionVersion.value = Number(spec.value.version)
+  chatExpanded.value = true
   composer.value?.fill('')
 }
 async function saveFinal(instruction?: string): Promise<void> {
@@ -151,6 +160,12 @@ async function reviewFinal(): Promise<void> {
   await execute('', { review_current: true, expected_director_version: spec.value.version })
 }
 function updateField(key: string, value: string): void { if (editing.value) drafts.value[draftKey.value]![key] = value }
+function discardNode(): void {
+  if (spec.value?.schema_version !== 2) { delete drafts.value[draftKey.value]; return }
+  const remaining = discardDirectorNodeDraft(fields.value, selectedStage.value)
+  if (Object.keys(remaining).length) drafts.value[draftKey.value] = remaining
+  else delete drafts.value[draftKey.value]
+}
 async function openReference(id: string): Promise<void> {
   if (referenceUrls.value[id] || referenceLoading.has(id)) return
   referenceLoading.add(id)
@@ -328,11 +343,11 @@ function newProject(): void {
   queuedInputs.value = []
   pageRequest++; project.value = null; executions.value = []; runs.value = {}; assets.value = []; boards.value = []; shots.value = []; versions.value = []; prompts.value = []
   selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; conversationId.value = ''; revisionVersion.value = null; error.value = ''; pendingText.value = ''
-  section.value = 'director'; selectedStage.value = 'director_assemble'; inspectorOpen.value = false; restoreChoice.value = null
+  section.value = 'director'; selectedStage.value = 'director_assemble'; chatExpanded.value = true; inspectorOpen.value = false; restoreChoice.value = null
   localStorage.removeItem('kantoku-comic-project')
   if (props.initialRunId) emit('newProject')
 }
-function visitStage(stage: string): void { section.value = 'director'; selectedStage.value = stage }
+function visitStage(stage: string): void { section.value = 'director'; selectedStage.value = stage; chatExpanded.value = false }
 function openSection(id: string): void {
   if (id === 'conversation') {
     chatExpanded.value = true
@@ -345,8 +360,35 @@ function openSection(id: string): void {
 function scrollState(): void { const el = timeline.value; if (el) nearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }
 function previewReference(media: { url: string }): void { window.open(media.url, '_blank', 'noopener') }
 watch(section, () => { void loadPage() })
+// Node navigation changes the URL only. The Workspace and its single Chat remain mounted.
+watch(() => [route.value.workspacePage, route.value.directorStage], async ([page, stage]) => {
+  applyingRoute = true
+  chatExpanded.value = !page || page === 'conversation'
+  section.value = !page || page === 'conversation' ? 'director' : page
+  selectedStage.value = stage ?? 'director_assemble'
+  if (!loading.value && mode.value === 'fast' && selectedStage.value === 'director_critic') {
+    navigate({ ...route.value, directorStage: 'director_assemble' }, true)
+  }
+  // Browser back/forward is read-only navigation, not another pushed history entry.
+  await nextTick()
+  applyingRoute = false
+}, { flush: 'sync' })
+watch([section, selectedStage, chatExpanded], () => {
+  if (applyingRoute || !['workspace', 'workspace_run'].includes(route.value.name)) return
+  const workspacePage = chatExpanded.value ? 'conversation' : section.value
+  const directorStage = workspacePage === 'director' ? selectedStage.value : undefined
+  if (route.value.workspacePage !== workspacePage || route.value.directorStage !== directorStage) {
+    navigate({ ...route.value, workspacePage, directorStage })
+  }
+})
+watch(mode, (value, previous) => {
+  modeChatSizes[previous] = chatSize.value
+  chatSize.value = modeChatSizes[value]
+  if (value === 'fast' && selectedStage.value === 'director_critic') selectedStage.value = 'director_assemble'
+  if (project.value) sessionStorage.setItem(`kantoku-comic-view-mode:${project.value.project.project_id}`, value)
+})
 watch([canDispatch, () => queuedInputs.value.length], () => { void dispatchQueued() })
-watch(() => `${section.value}:${selectedStage.value}:${selectedRun.value}`, async (key, old) => {
+watch(() => `${project.value?.project.project_id}:${mode.value}:${section.value}:${selectedStage.value}:${selectedRun.value}:${spec.value?.version}:${chatExpanded.value}`, async (key, old) => {
   if (stageScroll.value) scrollPositions.set(old, stageScroll.value.scrollTop)
   await nextTick()
   if (stageScroll.value) stageScroll.value.scrollTop = scrollPositions.get(key) ?? 0
@@ -364,9 +406,12 @@ onMounted(async () => {
       // 作品级 Workspace 恢复当前版本；入口 URL 可能仍指向第一轮 Run。
       selectedRun.value = executions.value.find(item => item.director_spec?.version === project.value?.project.director_version)?.run_id
         ?? (legacy?.workflow === 'comic.director' ? legacy.id : '')
-      mode.value = active.value?.director_execution_summary.mode ?? 'fast'
+      const viewMode = sessionStorage.getItem(`kantoku-comic-view-mode:${id}`)
+      mode.value = viewMode === 'professional' || viewMode === 'fast' ? viewMode : active.value?.director_execution_summary.mode ?? 'fast'
+      if (mode.value === 'fast' && selectedStage.value === 'director_critic') navigate({ ...route.value, directorStage: 'director_assemble' }, true)
     }
-    if (legacy && legacy.workflow !== 'comic.director') section.value = 'assets'
+    if (legacy && legacy.workflow !== 'comic.director') { section.value = 'assets'; chatExpanded.value = false }
+    await loadPage()
   } catch (failure) { error.value = failureText(failure) }
   finally { loading.value = false }
   timer = setInterval(() => { void refresh().catch(failure => { error.value = failureText(failure) }) }, 2000)
@@ -379,7 +424,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
     <header class="workspace-toolbar">
       <strong>{{ project ? projectTitle : (legacyOnly ? '历史制作记录' : '漫剧创作') }}</strong>
       <label>创作模式 <select v-model="mode" :disabled="busy || hasRunning || loading"><option value="fast">普通模式</option><option value="professional">专业导演模式</option></select></label>
-      <span class="workspace-execution" role="status">{{ loading ? '载入中' : busy && !active ? '提交创意' : restoredSpec ? '已载入历史方案' : summary?.status_label ?? '等待创意' }}</span>
+      <span class="workspace-execution" role="status">{{ loading ? '载入中' : busy && !active ? '提交创意' : restoredSpec ? '已载入保存的方案' : summary?.status_label ?? '等待创意' }}</span>
       <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="newProject">新作品</button>
     </header>
     <div class="workspace-body">
@@ -388,19 +433,22 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
         <button v-for="item in navigation" :key="item.id" :title="item.id === 'prompt' && !confirmed ? '请先确认导演方案' : item.label" :aria-label="item.label" :disabled="item.id === 'prompt' && !confirmed" :aria-current="activeNavigation === item.id ? 'page' : undefined" @click="openSection(item.id)"><component :is="item.icon" :size="18" /><span v-if="navOpen">{{ item.label }}</span></button>
       </nav>
       <Splitpanes horizontal class="workspace-split" @resized="payload => { if (payload.event) chatSize = payload.panes.at(-1)?.size ?? chatSize }">
-        <Pane v-if="!chatExpanded && (mode === 'professional' || section !== 'director')" :size="100 - chatSize" :min-size="20">
+        <Pane v-if="!chatExpanded" :size="100 - chatSize" :min-size="25">
           <div class="workspace-upper">
             <main class="workspace-stage">
               <header class="stage-heading"><h2>{{ title }}</h2><button class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button></header>
-              <nav v-if="mode === 'professional' && section === 'director'" class="stage-navigation" aria-label="导演节点">
-                <button v-for="(label, stage) in directorNodeLabels" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" @click="visitStage(String(stage))">{{ label }}<small>{{ restoredSpec ? '历史方案读取' : summary?.mode === 'fast' ? '普通模式未公开' : directorStateLabels[summary?.stages.find(item => item.stage === stage)?.status ?? 'pending'] ?? '未开始' }}</small></button>
+              <nav v-if="section === 'director'" class="stage-navigation" aria-label="导演节点">
+                <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" @click="visitStage(String(stage))">{{ label }}<small v-if="mode === 'professional'">{{ restoredSpec ? '保存的版本' : summary?.mode === 'fast' ? '查看方案内容' : directorStateLabels[summary?.stages.find(item => item.stage === stage)?.status ?? 'pending'] ?? '未开始' }}</small></button>
               </nav>
               <div :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll">
                 <template v-if="section === 'director'">
-                  <p v-if="restoredSpec" class="pane-note">此方案恢复自历史版本，节点没有重新执行。继续修改可在下方对话中提出新方向；不会沿用其他版本的节点或 Trace。</p>
-                  <p v-if="summary?.mode === 'fast' && selectedStage !== 'director_assemble'" class="pane-note">此方案在普通模式执行，后端未公开独立节点结果。切换模式不会伪造节点；可在专业模式发送新需求。</p>
-                  <DirectorNodeView :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="!!node && !!summary?.available_actions.includes('rerun_stage')" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="delete drafts[draftKey]" @save="selectedStage === 'director_assemble' ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal" />
-                  <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '方案已确认' : '导演草案 · 待确认' }}</strong><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">重新审核草稿</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">进入 Prompt</button></div>
+                  <p v-if="spec && mode === 'professional'" class="version-line">导演稿 v{{ spec.version }} · 创意 v{{ spec.creative_brief_version }} <span v-if="dirty">· 有未保存修改</span></p>
+                  <p v-if="restoredSpec && mode === 'professional'" class="pane-note">查看当前保存的版本；节点没有重新执行，不沿用其他版本的执行状态。</p>
+                  <p v-if="summary?.mode === 'fast' && mode === 'professional' && selectedStage !== 'director_assemble'" class="pane-note">显示已保存方案的对应内容；此任务未公开逐节点执行记录。</p>
+                  <p v-if="selectedStage === 'cinematography' && (spec?.cinematography as { status?: string })?.status && (spec?.cinematography as { status?: string })?.status !== 'complete'" class="review-notice">摄影方案待补充或调整。已保留真实草稿，不会自动进入制作。</p>
+                  <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="editFinal" />
+                  <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '方案已确认' : '最终导演稿 · 待确认' }}</strong><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">确认后进入下一步</button></div>
+                  <button v-if="spec && selectedStage !== 'director_assemble' && !editing && selectedStage !== 'director_critic'" class="ui-button quiet sm" @click="visitStage('director_assemble')">{{ mode === 'fast' ? '查看整体方案并确认' : '返回最终导演稿' }}</button>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
                 <template v-else-if="section === 'assets'">
@@ -433,7 +481,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
             </aside>
           </div>
         </Pane>
-        <Pane key="conversation" :size="chatExpanded || mode === 'fast' && section === 'director' ? 100 : chatSize" :min-size="30">
+        <Pane key="conversation" :size="chatExpanded ? 100 : chatSize" :min-size="35">
           <section class="workspace-conversation" aria-label="连续创作对话">
             <header class="conversation-toolbar"><strong>AI 导演助手</strong><small v-if="conversationId">当前项目会话</small><span /><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ChevronDown v-if="chatExpanded" :size="15" /><ChevronUp v-else :size="15" />{{ chatExpanded ? '返回工作区' : '展开对话' }}</button></header>
             <div ref="timeline" class="workspace-messages" @scroll="scrollState">
@@ -443,7 +491,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 <AssistantMessageBlock :content="entry.answer || entry.label" :show-mark="false" />
                 <p v-if="entry.execution.status === 'failed'" role="alert">任务失败 · {{ entry.execution.director_execution_summary.error_id ?? '打开详情查看错误' }}</p>
                 <template v-if="!restoredSpec && entry.execution.run_id === active?.run_id">
-                  <div v-if="entry.execution.director_spec" class="draft-actions"><span><Check v-if="confirmed" :size="14" />{{ stale ? '来源已变化' : confirmed ? '方案已确认' : '待确认的导演草案' }}</span><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale" @click="editFinal">直接编辑</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button quiet sm" :disabled="!confirmed" @click="section = 'prompt'; chatExpanded = false">进入 Prompt</button></div>
+                  <div v-if="entry.execution.director_spec" class="draft-actions"><span><Check v-if="confirmed" :size="14" />{{ stale ? '来源已变化' : confirmed ? '方案已确认' : '待确认的导演草案' }}</span><button class="ui-button quiet sm" @click="visitStage('director_assemble')">查看方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale" @click="editFinal()">直接编辑</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button quiet sm" :disabled="!confirmed" @click="openSection('prompt')">进入 Prompt</button></div>
                   <button v-if="entry.execution.recovery_required || summary?.available_actions.includes('resume')" class="ui-button sm" :disabled="busy || hasRunning" @click="resume">恢复原导演任务</button>
                 </template>
               </article>
@@ -457,8 +505,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <button v-if="queuedInputs.length && error && !busy && !hasRunning" class="ui-button sm" @click="dispatchQueued(true)">继续处理已发送的补充</button>
               <p v-if="error" class="workspace-error" role="alert">{{ error }}</p>
               <p v-if="dirty" class="pane-note">有未保存的节点修改。切换节点会保留草稿；保存并重新审核后才能确认。</p>
-              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>方案 v{{ restoredSpec.version }} · {{ confirmed ? '已确认' : '草稿' }}</span><button class="ui-button sm" :disabled="busy || hasRunning || stale" @click="editFinal">直接编辑</button><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
-              <DirectorNodeView v-if="editing && selectedStage === 'director_assemble' && (mode === 'fast' || chatExpanded)" stage="director_assemble" :spec="spec" :fields="fields" :editing="true" :editable="true" :rerunnable="false" :busy="busy || hasRunning" @field="updateField" @cancel="delete drafts[draftKey]" @save="saveFinal()" />
+              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>方案 v{{ restoredSpec.version }} · {{ confirmed ? '已确认' : '草稿' }}</span><button class="ui-button sm" @click="visitStage('director_assemble')">查看方案</button><button class="ui-button sm" :disabled="busy || hasRunning || stale" @click="editFinal()">直接编辑</button><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
               <button v-if="spec && !confirmable && !stale && !dirty" class="ui-button sm" :disabled="busy || hasRunning" @click="reviewFinal">审核当前草稿</button>
               <p v-if="confirmed" class="pane-note">当前版本已确认并保存到后端。编辑或恢复为新版本后，需要重新审核与确认。</p>
               <p v-if="revisionVersion !== null" class="review-notice">正在修改当前方案 v{{ revisionVersion }}。下方输入将作为修改指令，不创建新创意。<button class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button></p>
@@ -499,6 +546,7 @@ select { color:var(--text-primary); background:var(--surface); border:1px solid 
 @keyframes node-enter { from { opacity:0; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
 @media(prefers-reduced-motion:reduce) { .stage-scroll { animation:none; } }
 .stage-scroll h3 { font-size:15px; }
+.version-line { margin:0 0 12px; color:var(--text-muted); font-size:12px; }
 .stage-scroll details { padding:12px 0; border-bottom:1px solid var(--border); }
 .stage-scroll summary { cursor:pointer; } .stage-scroll dd { margin:4px 0 14px; white-space:pre-wrap; }
 .workspace-inspector { width:240px; box-sizing:border-box; padding:14px; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--canvas); }
