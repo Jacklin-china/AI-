@@ -280,6 +280,16 @@ def test_failure_resume_keeps_completed_outputs(
     assert failed["status"] == "failed"
     assert failed["director_spec"] is None
     assert failed["director_execution_summary"]["error_id"]
+    summary = failed["director_execution_summary"]
+    assert [stage["status"] for stage in summary["stage_statuses"]] == [
+        "completed", "failed", "waiting", "waiting", "waiting",
+    ]
+    failure = summary["failure"]
+    assert failure["stage_name"] == "visual_direction"
+    assert failure["trace_id"] == summary["trace_id"]
+    assert failure["error_id"] == summary["error_id"]
+    assert set(failure["output_before_failure"]) == {SKILLS[0]}
+    assert "模拟视觉导演失败" in failure["exception"]["message"]
     model.clear()
     monkeypatch.setattr(app, "_comic_director_model", real)
     recovered = _execute(app, project_id, mode, resume_run_id=failed["run_id"])
@@ -287,6 +297,75 @@ def test_failure_resume_keeps_completed_outputs(
     assert model == SKILLS[1:4]
     recovered_run = app.runtime_store.get_run(recovered["run_id"])
     assert recovered_run.state["previous_run_id"] == failed["run_id"]
+
+
+@pytest.mark.parametrize("mode", ["fast", "professional"])
+@pytest.mark.parametrize("reply", ["unavailable", "malformed", "revision"])
+def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restart(
+    app: web_studio.StudioApplication, model: list[str], monkeypatch: pytest.MonkeyPatch,
+    mode: str, reply: str,
+) -> None:
+    project_id = _project(app.comic_projects)
+    original = app._comic_director_model
+
+    def critic_problem(messages: list[dict[str, str]]) -> str:
+        if "findings 每项" not in messages[0]["content"]:
+            return original(messages)
+        if reply == "unavailable":
+            raise ToolError("真实审核请求失败的离线替身")
+        if reply == "malformed":
+            return '{"reasoning":"private"}'
+        candidate = app.runtime_store.list_runs(domain="comic")[0].state["director_candidate"]
+        return json.dumps({
+            "public_summary": "构图需要修订，未提供安全自动修订建议。", "confidence": 0.8,
+            "findings": [{
+                "code": "COMPOSITION_CAUSALITY", "severity": "warning",
+                "field_path": "director_plan.composition_strategy",
+                "evidence": candidate["director_plan"]["composition_strategy"],
+                "expected": "明确人物和环境关系", "suggested_action": "补充构图理由",
+            }], "suggested_patches": [],
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", critic_problem)
+    result = _execute(app, project_id, mode)
+    assert result["status"] == "waiting"
+    assert result["director_spec_status"] == "draft" and not result["ready_for_prompt"]
+    draft = result["director_spec"]
+    assert draft["schema_version"] == 2 and draft["draft"]
+    assert "spec_id" not in draft and "version" not in draft
+    expected = DirectorSpecDraft.model_validate(_parts()[SKILLS[4]]["director_spec"])
+    assert draft["creative_decision"] == expected.creative_decision.model_dump()
+    assert draft["director_plan"] == expected.director_plan.model_dump()
+    assert all(draft["cinematography"][key] == value for key, value in
+               _parts()[SKILLS[2]]["cinematography"].items())
+    assert draft["cinematography"]["camera_language"] == draft["camera_language"]
+    summary = result["director_execution_summary"]
+    assert "草案已生成" in summary["status_label"]
+    statuses = [stage["status"] for stage in summary["stage_statuses"]]
+    assert statuses[:3] == ["completed"] * 3 and statuses[-1] == "waiting"
+    if reply == "revision":
+        assert statuses[3] == "needs_revision"
+        assert "补充构图理由" in summary["status_label"]
+    else:
+        assert statuses[3] == "failed"
+        assert summary["error_id"].startswith("ERR-")
+        assert summary["failure"]["output_before_failure"]
+    assert bool(summary["stages"]) == (mode == "professional")
+    assert app.comic_projects.get(project_id).project.director_version is None
+    with pytest.raises(ToolError):
+        require_approved_director(DirectorSpecDraft.model_validate({
+            key: value for key, value in draft.items() if key in DirectorSpecDraft.model_fields
+        }))
+    restarted = web_studio.StudioApplication()
+    persisted = restarted.list_comic_project_tasks(project_id)["tasks"][0]
+    assert persisted == result
+    assert "private" not in json.dumps(persisted, ensure_ascii=False)
+    # 显式重新审核只调用 Critic，不重做前三阶段，也不偷偷重新付费生成草案。
+    monkeypatch.setattr(app, "_comic_director_model", original)
+    model.clear()
+    recovered = _execute(app, project_id, mode, resume_run_id=result["run_id"])
+    assert recovered["status"] == "completed" and recovered["ready_for_prompt"]
+    assert model == [SKILLS[3]]
 
 
 def test_restart_recovers_persisted_run_not_new_runtime(
@@ -332,7 +411,11 @@ def test_rejects_mode_change_constraint_edit_and_critic_forgery(
                        rerun_from="creative_understanding",
                        stage_edits={"creative_understanding": decision})
     assert blocked["status"] == "waiting"
-    assert blocked["director_spec"] is None
+    assert blocked["director_spec"]["draft"] is True
+    assert blocked["director_spec_status"] == "draft"
+    assert not blocked["ready_for_prompt"]
+    assert "spec_id" not in blocked["director_spec"]
+    assert blocked["director_spec"]["critic_result"]["verdict"] == "blocked"
     assert app.comic_projects.get_director(project_id).version == 1
 
 

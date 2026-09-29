@@ -17,6 +17,7 @@ from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic.coordinator import (
     ComicDirectorCoordinator,
     DirectorCoordinatorRequest,
+    director_execution_summary,
 )
 from kantoku.domains.comic.critic import DirectorCriticEngine
 from kantoku.domains.comic.models import (
@@ -147,6 +148,43 @@ def _request(
 
 def _event_names(runtime_store: RuntimeStore, run_id: str) -> list[str]:
     return [event.payload["director_event"] for event in runtime_store.list_events(run_id)]
+
+
+@pytest.mark.parametrize("failed_stage", SKILLS[:3])
+def test_each_generation_failure_retains_real_completed_output_and_trace(
+    tmp_path: Path, failed_stage: str,
+) -> None:
+    coordinator, store, runtime, _calls = _setup(tmp_path)
+    project_id = _project(store)
+    original = coordinator.stage_executor
+
+    def execute(skill_id: str, inputs: Any, context: Any) -> dict[str, Any]:
+        if skill_id == failed_stage:
+            raise ToolError("阶段失败的离线回归替身")
+        return original(skill_id, inputs, context)
+
+    coordinator.stage_executor = execute
+    with pytest.raises(ToolError, match="阶段失败的离线回归替身"):
+        coordinator.execute(_request(store, project_id, "professional"))
+    run = runtime.list_runs()[0]
+    completed = SKILLS[:SKILLS.index(failed_stage)]
+    assert run.status is ExecutionStatus.FAILED
+    assert run.state["completed_stages"] == completed
+    assert set(run.state["stage_outputs"]) == set(completed)
+    assert "director_candidate" not in run.state
+    summary = director_execution_summary(run)
+    expected = ["completed"] * len(completed) + ["failed"]
+    expected += ["waiting"] * (5 - len(expected))
+    assert [item["status"] for item in summary["stage_statuses"]] == expected
+    failure = summary["failure"]
+    assert failure["stage_name"] == failed_stage.removeprefix("comic.")
+    assert failure["trace_id"] == "trace-director-contract"
+    assert failure["error_id"] == run.state["error_id"]
+    assert failure["input_version"]["creative_brief"] == 1
+    assert set(failure["output_before_failure"]) == set(completed)
+    restarted = RuntimeStore(runtime.path)
+    assert director_execution_summary(restarted.get_run(run.id)) == summary
+    assert store.get(project_id).project.director_version is None
 
 
 def test_fast_uses_one_core_run_and_saves_reviewed_v2(tmp_path: Path) -> None:

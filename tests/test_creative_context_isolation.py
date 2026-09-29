@@ -101,6 +101,43 @@ def test_case1_modify_color_keeps_same_brief(
 
 
 @pytest.mark.parametrize("mode", ["fast", "professional"])
+def test_three_requested_ideas_generate_independently_with_trace_and_same_runtime(
+    app: StudioApplication, monkeypatch: pytest.MonkeyPatch, observed: list[Any], mode: str,
+) -> None:
+    # 同一作品中的连续创意，使用明确离线语义替身，不冒充在线导演质量验收。
+    project_id = _project(app)
+    _boundary(app, monkeypatch, fork=True)
+    ideas = [OLD, "中式修仙少女站在竹林", "JOJO儿童风电话场景"]
+    previous_requests: list[str] = []
+    results: list[dict[str, Any]] = []
+    for version, idea in enumerate(ideas, 1):
+        observed.clear()
+        result = _execute(app, project_id, task=idea, creation_mode=mode)
+        assert result["status"] == "completed" and result["ready_for_prompt"]
+        draft = result["director_spec"]
+        assert draft["schema_version"] == 2
+        assert idea in draft["creative_decision"]["intent_summary"]
+        assert idea in draft["director_plan"]["visual_strategy"]
+        assert draft["creative_brief_version"] == version
+        run = app.runtime_store.get_run(result["run_id"])
+        assert run.state["input_brief_version"] == version
+        assert run.state["director_debug"]["brief_request"] == idea
+        assert run.state["director_debug"]["memory_used"] == []
+        assert run.state["previous_run_id"] is None
+        assert all(item["creative_brief"]["original_request"] == idea for item in observed)
+        serialized = json.dumps(observed, ensure_ascii=False)
+        assert not any(old in serialized for old in previous_requests)
+        assert [item["status"] for item in
+                result["director_execution_summary"]["stage_statuses"]] == ["completed"] * 5
+        results.append(result)
+        previous_requests.append(idea)
+    assert len({item["run_id"] for item in results}) == 3
+    assert len({item["director_spec"]["creative_decision"]["intent_summary"]
+                for item in results}) == 3
+    assert len(app.runtime_store.list_runs(domain="comic")) == 3
+
+
+@pytest.mark.parametrize("mode", ["fast", "professional"])
 def test_case2_new_direction_forks_and_case4_debug_uses_current_brief(
     app: StudioApplication, monkeypatch: pytest.MonkeyPatch, observed: list[Any], mode: str,
 ) -> None:

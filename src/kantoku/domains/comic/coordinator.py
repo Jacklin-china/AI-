@@ -73,15 +73,26 @@ class _DirectorCancelled(Exception):
 
 
 def director_execution_summary(run: Any) -> dict[str, Any]:
-    """用户可见投影；Fast 不传内部节点、输出或审核细节。"""
+    """公开状态投影；Fast 隐藏内部输出，但保留真实阶段状态和故障定位。"""
     mode = run.state["execution_mode"]
     status = run.status.value
     current = (run.current_node or "creative_understanding").removeprefix("comic.")
     label = FAST_LABELS.get(current, "正在设计视觉方案")
+    failure = run.state.get("stage_failures", {}).get(f"comic.{current}")
+    review = run.state.get("critic_result") or {}
     if status == "waiting":
-        label = "创作方案需要调整"
+        findings = review.get("findings", [])
+        issue = next((item for item in findings if item["severity"] in {"warning", "error"}), {})
+        reason = (
+            (failure or {}).get("safe_message")
+            or issue.get("suggested_action")
+            or review.get("public_summary")
+            or "请查看审核结果"
+        )
+        label = f"导演草案已生成，待审核或修订：{reason[:150]}"
     elif status == "failed":
-        label = "导演方案生成失败"
+        reason = (failure or {}).get("safe_message", "请按错误 ID 查看详情")
+        label = f"导演阶段 {current} 失败：{reason}"
     elif status == "cancelled":
         label = "导演任务已取消"
     actions = ["view"]
@@ -90,38 +101,70 @@ def director_execution_summary(run: Any) -> dict[str, Any]:
     if mode == "professional" and status in {"completed", "failed", "waiting"}:
         actions.extend(["edit_stage", "rerun_stage"])
     summary: dict[str, Any] = {
-        "mode": mode, "current_stage": current if mode == "professional" else label,
-        "status_label": label, "available_actions": actions,
-        "stages": [], "error_id": run.state.get("error_id"),
+        "mode": mode,
+        "current_stage": current if mode == "professional" else label,
+        "status_label": label,
+        "available_actions": actions,
+        "stages": [],
+        "error_id": run.state.get("error_id"),
+        "trace_id": run.state.get("trace_id"),
+        "failure": failure,
+        "stage_statuses": [],
     }
+    for stage in DIRECTOR_STAGES:
+        key = f"comic.{stage}"
+        output = run.state.get("stage_outputs", {}).get(key)
+        node_status = "completed" if output is not None else "pending"
+        if run.state.get("failed_skill_id") == key:
+            node_status = "failed"
+        elif current == stage and status in {"running", "waiting"}:
+            node_status = status
+        node_status = run.state.get("stage_statuses", {}).get(key, node_status)
+        if stage == "director_critic" and status == "waiting" and node_status != "failed":
+            node_status = "needs_revision"
+        if node_status == "pending" and status in {"waiting", "failed"}:
+            node_status = "waiting"
+        summary["stage_statuses"].append(
+            {
+                "stage_name": stage,
+                "status": node_status,
+                "trace_id": run.state.get("trace_id"),
+                "input_version": run.state.get("input_versions", {}),
+                "failure": run.state.get("stage_failures", {}).get(key),
+            }
+        )
+        public_output = output or {}
+        candidate_key = {
+            "creative_understanding": "creative_decision",
+            "visual_direction": "director_plan",
+            "cinematography": "cinematography",
+        }.get(stage)
+        candidate = run.state.get("director_candidate", {})
+        if candidate_key and candidate_key in candidate:
+            public_output = {candidate_key: candidate[candidate_key]}
+        if mode == "professional":
+            summary["stages"].append(
+                {
+                    "stage": stage,
+                    "status": node_status,
+                    "input_versions": run.state["input_versions"],
+                    "output": public_output,
+                    "output_summary": next(
+                        (
+                            value.get("public_summary")
+                            or value.get("intent_summary")
+                            or value.get("visual_strategy")
+                            or value.get("lighting")
+                            or value.get("visual_direction")
+                            for value in public_output.values()
+                            if isinstance(value, dict)
+                        ),
+                        None,
+                    ),
+                    "failure": run.state.get("stage_failures", {}).get(key),
+                }
+            )
     if mode == "professional":
-        for stage in DIRECTOR_STAGES:
-            key = f"comic.{stage}"
-            output = run.state.get("stage_outputs", {}).get(key)
-            node_status = "completed" if output is not None else "pending"
-            if run.state.get("failed_skill_id") == key:
-                node_status = "failed"
-            elif current == stage and status in {"running", "waiting"}:
-                node_status = status
-            public_output = output or {}
-            candidate_key = {
-                "creative_understanding": "creative_decision",
-                "visual_direction": "director_plan", "cinematography": "cinematography",
-            }.get(stage)
-            candidate = run.state.get("director_candidate", {})
-            if candidate_key and candidate_key in candidate:
-                public_output = {candidate_key: candidate[candidate_key]}
-            summary["stages"].append({
-                "stage": stage, "status": node_status,
-                "input_versions": run.state["input_versions"],
-                "output": public_output,
-                "output_summary": next((
-                    value.get("public_summary") or value.get("intent_summary")
-                    or value.get("visual_strategy") or value.get("lighting")
-                    or value.get("visual_direction")
-                    for value in public_output.values() if isinstance(value, dict)
-                ), None),
-            })
         summary["critic_result"] = run.state.get("critic_result")
     return summary
 
@@ -183,7 +226,7 @@ class DirectorStageRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     skill_id: str
-    status: Literal["completed"] = "completed"
+    status: Literal["completed", "failed", "needs_revision"] = "completed"
     output_keys: list[str] = Field(default_factory=list)
 
 
@@ -195,6 +238,7 @@ class DirectorCoordinatorResult(BaseModel):
     project_id: str
     execution_mode: Literal["fast", "professional"]
     director_spec: DirectorSpec | None
+    director_draft: DirectorSpecDraft | None = None
     critic_result: DirectorCriticResult | None = None
     needs_review: bool = False
     stages: list[DirectorStageRecord]
@@ -239,15 +283,23 @@ class ComicDirectorCoordinator:
             "input_versions": input_versions,
             "input_brief_id": request.snapshot.creative_brief.brief_id,
             "input_brief_version": request.snapshot.creative_brief.version,
-            "creative_context": request.creative_context or {
+            "creative_context": request.creative_context
+            or {
                 "brief_used": f"{request.snapshot.creative_brief.brief_id}"
                 f"@v{request.snapshot.creative_brief.version}",
-                "previous_brief_detected": False, "fork_created": False,
+                "previous_brief_detected": False,
+                "fork_created": False,
                 "reason": "explicit snapshot",
             },
             "completed_stages": list(reused_outputs),
             "stage_outputs": reused_outputs,
-            "last_completed_step": None,
+            "stage_statuses": {
+                f"comic.{stage}": "completed" if f"comic.{stage}" in reused_outputs else "pending"
+                for stage in DIRECTOR_STAGES
+            },
+            "stage_failures": {},
+            "last_completed_step": list(reused_outputs)[-1].removeprefix("comic.")
+            if reused_outputs else None,
             "rerun_from": request.rerun_from,
             "previous_run_id": request.previous_run_id,
             "storyboard_id": request.storyboard.storyboard_id if request.storyboard else None,
@@ -259,8 +311,10 @@ class ComicDirectorCoordinator:
                 "source_versions": context.source_versions,
                 "input_brief_id": request.snapshot.creative_brief.brief_id,
                 "input_brief_version": request.snapshot.creative_brief.version,
-                "memory_used": [{"asset_id": asset.asset_id, "version": asset.version}
-                                for asset in request.assets],
+                "memory_used": [
+                    {"asset_id": asset.asset_id, "version": asset.version}
+                    for asset in request.assets
+                ],
                 "reused_stages": sorted(reused_outputs),
                 "stages": {},
             },
@@ -282,10 +336,16 @@ class ComicDirectorCoordinator:
         }
         current_skill = "comic.director"
 
-        with request_trace(trace_id), logger.contextualize(
-            component="comic.director", project_id=project.project_id,
-            run_id=run.id, task_id=run.id, execution_mode=request.execution_mode,
-            conversation_id=request.conversation_id or "-",
+        with (
+            request_trace(trace_id),
+            logger.contextualize(
+                component="comic.director",
+                project_id=project.project_id,
+                run_id=run.id,
+                task_id=run.id,
+                execution_mode=request.execution_mode,
+                conversation_id=request.conversation_id or "-",
+            ),
         ):
             logger.info(
                 "Director Input Snapshot project_id={} conversation_id={} user_request={} "
@@ -355,6 +415,23 @@ class ComicDirectorCoordinator:
                     )
                 # Fast 隐藏审核细节，不绕过真实审核和受限修订。
                 provisional = self._provisional_spec(outputs, request, critic_result=None)
+                state["director_candidate"] = provisional.model_dump(mode="json")
+                state["draft_status"] = "generated"
+                self.runtime_store.update_run(
+                    run.id,
+                    status=ExecutionStatus.RUNNING,
+                    state=state,
+                    current_node="cinematography",
+                )
+                self._event(
+                    run.id,
+                    RuntimeEventType.NODE_PROGRESS,
+                    "director_draft_created",
+                    trace_id=trace_id,
+                    project_id=project.project_id,
+                    input_versions=input_versions,
+                    draft_status="generated",
+                )
                 self._run_stage(
                     run.id, "comic.director_critic", {
                         "director_spec": provisional.model_dump(mode="json"),
@@ -366,10 +443,17 @@ class ComicDirectorCoordinator:
                         current_node="director_critic",
                     )
                     return DirectorCoordinatorResult(
-                        run_id=run.id, trace_id=trace_id, project_id=project.project_id,
-                        execution_mode=request.execution_mode, director_spec=None,
+                        run_id=run.id,
+                        trace_id=trace_id,
+                        project_id=project.project_id,
+                        execution_mode=request.execution_mode,
+                        director_spec=None,
                         critic_result=DirectorCriticResult.model_validate(outputs["critic_result"]),
-                        needs_review=True, stages=stages,
+                        director_draft=DirectorSpecDraft.model_validate(
+                            state["director_candidate"]
+                        ),
+                        needs_review=True,
+                        stages=stages,
                     )
                 assemble_input = {
                     "creative_decision": outputs["creative_decision"],
@@ -467,16 +551,35 @@ class ComicDirectorCoordinator:
                     "failed_skill_id": current_skill,
                     "last_completed_step": state.get("last_completed_step"),
                 })
+                stage_failure = {
+                    **failure,
+                    "stage_name": current_skill.removeprefix("comic."),
+                    "input_version": input_versions,
+                    "output_before_failure": dict(state["stage_outputs"]),
+                    "exception": {
+                        "type": type(error).__name__,
+                        "module": type(error).__module__,
+                        "message": failure["safe_message"],
+                    },
+                }
+                state["stage_failures"][current_skill] = stage_failure
+                state["stage_statuses"][current_skill] = "failed"
                 error._kantoku_public_failure = failure
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.FAILED, state=state,
                     current_node=current_skill, error=failure["error_id"],
                 )
                 self._event(
-                    run.id, RuntimeEventType.NODE_FAILED, "director_failed",
-                    trace_id=trace_id, project_id=project.project_id,
-                    execution_mode=request.execution_mode, skill_id=current_skill,
-                    error_id=failure["error_id"], error_type=type(error).__name__,
+                    run.id,
+                    RuntimeEventType.NODE_FAILED,
+                    "director_failed",
+                    trace_id=trace_id,
+                    project_id=project.project_id,
+                    execution_mode=request.execution_mode,
+                    skill_id=current_skill,
+                    error_id=failure["error_id"],
+                    error_type=type(error).__name__,
+                    failure=stage_failure,
                 )
                 raise
 
@@ -496,6 +599,7 @@ class ComicDirectorCoordinator:
         event_name = node_id
         trace_id = str(state["trace_id"])
         state["active_skill_id"] = skill_id
+        state["stage_statuses"][skill_id] = "running"
         debug = {"input": _fingerprint(inputs), "context": _fingerprint(context_payload),
                  "input_versions": state["input_versions"],
                  "source": "user_edit" if node_id in request.stage_edits else "execution"}
@@ -528,19 +632,44 @@ class ComicDirectorCoordinator:
         }
         with run_trace(run_id, node_id):
             if skill_id == "comic.director_critic":
+
                 def emit(name: str, payload: dict[str, Any]) -> None:
                     self._check_cancelled(run_id)
                     state["critic_activity"] = name
                     if "critic_result" in payload:
                         state["critic_result"] = payload["critic_result"]
+                    if "director_candidate" in payload:
+                        state["director_candidate"] = payload["director_candidate"]
+                        state["revision_count"] = payload["revision_count"]
+                    if name in {"director_critic_failed", "director_patch_invalid"}:
+                        state["error_id"] = payload["error_id"]
+                        state["failed_skill_id"] = skill_id
+                        state["stage_failures"][skill_id] = {
+                            **payload,
+                            "stage_name": node_id,
+                            "input_version": state["input_versions"],
+                            "output_before_failure": dict(state["stage_outputs"]),
+                            "exception": {
+                                "type": payload["error_type"],
+                                "module": payload["exception_module"],
+                                "message": payload["safe_message"],
+                            },
+                        }
                     self.runtime_store.update_run(
                         run_id, status=ExecutionStatus.RUNNING,
                         state=state, current_node=node_id,
                     )
                     self._event(
-                        run_id, RuntimeEventType.NODE_PROGRESS, name,
-                        trace_id=trace_id, project_id=request.snapshot.project.project_id,
-                        execution_mode=request.execution_mode, skill_id=skill_id, **payload,
+                        run_id,
+                        RuntimeEventType.NODE_PROGRESS,
+                        name,
+                        **{
+                            "trace_id": trace_id,
+                            "project_id": request.snapshot.project.project_id,
+                            "execution_mode": request.execution_mode,
+                            "skill_id": skill_id,
+                            **payload,
+                        },
                     )
 
                 outcome = self.critic_engine.review_and_revise(
@@ -554,6 +683,7 @@ class ComicDirectorCoordinator:
                 state["revision_count"] = outcome.revision_count
                 state["needs_review"] = outcome.needs_review
                 state["task_status"] = "needs_review" if outcome.needs_review else "planning"
+                state["draft_status"] = "needs_revision" if outcome.needs_review else "reviewed"
                 outputs.update({key: candidate[key] for key in (
                     "creative_decision", "director_plan", "cinematography",
                 )})
@@ -586,12 +716,27 @@ class ComicDirectorCoordinator:
         )
         logger.info("Director Debug Result skill_id={} output={}", skill_id, debug["output"])
         state["stage_outputs"][skill_id] = validated
-        state["completed_stages"].append(skill_id)
-        state["last_completed_step"] = node_id
+        review_failed = skill_id in state["stage_failures"]
+        state["stage_statuses"][skill_id] = (
+            "failed"
+            if review_failed
+            else (
+                "needs_revision"
+                if skill_id == "comic.director_critic" and state.get("needs_review")
+                else "completed"
+            )
+        )
+        if not review_failed:
+            state["completed_stages"].append(skill_id)
+            state["last_completed_step"] = node_id
         state["task_status"] = "planning" if not state.get("needs_review") else "needs_review"
-        stages.append(DirectorStageRecord(
-            skill_id=skill_id, output_keys=sorted(validated),
-        ))
+        stages.append(
+            DirectorStageRecord(
+                skill_id=skill_id,
+                status=state["stage_statuses"][skill_id],
+                output_keys=sorted(validated),
+            )
+        )
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
         )
@@ -603,10 +748,15 @@ class ComicDirectorCoordinator:
                 output_keys=sorted(validated),
             )
         self._event(
-            run_id, RuntimeEventType.NODE_PROGRESS, "director_stage_completed",
-            trace_id=trace_id, project_id=request.snapshot.project.project_id,
+            run_id,
+            RuntimeEventType.NODE_PROGRESS,
+            "director_stage_failed" if review_failed else "director_stage_completed",
+            trace_id=trace_id,
+            project_id=request.snapshot.project.project_id,
             mode=request.execution_mode,
-            visible_stage=node_id if request.execution_mode == "professional"
+            stage_status=state["stage_statuses"][skill_id],
+            visible_stage=node_id
+            if request.execution_mode == "professional"
             else FAST_LABELS[node_id],
         )
 
@@ -669,6 +819,13 @@ class ComicDirectorCoordinator:
             raise ToolError("来源导演 Run 缺少阶段结果", detail=str(error)) from error
         if any(not isinstance(value, dict) for value in reused.values()):
             raise ToolError("来源导演 Run 阶段结果无效")
+        if start >= 3 and previous.state.get("director_candidate") is not None:
+            # 同一任务恢复审核时使用最近真实修订，不能退回修订前的阶段输出。
+            candidate = DirectorSpecDraft.model_validate(previous.state["director_candidate"])
+            for skill_id, field in zip(order[:3], (
+                "creative_decision", "director_plan", "cinematography",
+            ), strict=True):
+                reused[skill_id] = {field: getattr(candidate, field).model_dump(mode="json")}
         return reused
 
     @staticmethod

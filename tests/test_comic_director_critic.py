@@ -565,7 +565,7 @@ def test_coordinator_persists_patch_events_and_the_approved_candidate(tmp_path: 
         assert event.payload["project_id"] == project_id
 
 
-def test_model_failure_marks_the_existing_run_failed_without_a_default_plan(tmp_path: Path) -> None:
+def test_review_failure_preserves_real_draft_without_approving_it(tmp_path: Path) -> None:
     coordinator, projects, runtime, _calls = _setup(tmp_path)
     project_id = _project(projects)
 
@@ -573,10 +573,136 @@ def test_model_failure_marks_the_existing_run_failed_without_a_default_plan(tmp_
         raise ToolError("审核模型暂不可用")
 
     coordinator.critic_engine = DirectorCriticEngine(unavailable)
-    with pytest.raises(ToolError, match="审核模型暂不可用"):
-        coordinator.execute(_request(projects, project_id, "professional"))
+    result = coordinator.execute(_request(projects, project_id, "professional"))
     run = runtime.list_runs()[0]
-    assert run.status == ExecutionStatus.FAILED
+    assert run.status == ExecutionStatus.WAITING
+    assert result.needs_review and result.director_spec is None
+    assert result.director_draft is not None
+    assert result.director_draft.creative_decision == _spec().creative_decision
     assert run.state["failed_skill_id"] == "comic.director_critic"
     assert run.state["error_id"].startswith("ERR-")
+    assert run.state["completed_stages"] == SKILLS[:3]
+    assert run.state["last_completed_step"] == "cinematography"
+    assert run.state["stage_statuses"][SKILLS[3]] == "failed"
+    failure = run.state["stage_failures"][SKILLS[3]]
+    assert failure["trace_id"] == result.trace_id
+    assert failure["input_version"]["creative_brief"] == 1
+    assert set(failure["output_before_failure"]) == set(SKILLS[:3])
+    assert failure["exception"]["type"] == "ToolError"
+    names = [event.payload["director_event"] for event in runtime.list_events(run.id)]
+    assert "director_draft_created" in names
+    assert "director_critic_failed" in names
+    assert "director_stage_failed" in names
+    assert "director_critic_completed" not in names
+    with pytest.raises(ToolError):
+        require_approved_director(result.director_draft)
     assert projects.get(project_id).project.director_version is None
+
+
+@pytest.mark.parametrize("patch", [
+    {"field": "creative_brief.original_request", "value": "不能改用户需求"},
+    {"field": "project_id", "value": "another-project"},
+    {"field": "director_plan.composition_strategy", "value": "   "},
+    {"field": "director_plan.composition_strategy", "value": {"reasoning": "private"}},
+    {"field": "director_plan.composition_strategy", "value": "有效构图", "extra": True},
+])
+def test_invalid_patch_is_diagnostic_not_a_destroyed_director(patch: dict[str, Any]) -> None:
+    spec = _spec()
+    malformed = {**_patch(spec), **patch}
+    engine = DirectorCriticEngine(lambda _: _semantic([_finding(spec)], [malformed]))
+    result = engine.review_and_revise(spec, _brief())
+    assert result.needs_review
+    assert result.revision_count == 0
+    assert any(item.code == "INVALID_PATCH" for item in result.critic_result.findings)
+    assert result.critic_result.suggested_patches == []
+    assert result.director_spec.director_plan == spec.director_plan
+    assert result.director_spec.constraints == spec.constraints
+    assert "private" not in result.model_dump_json()
+    with pytest.raises(ToolError):
+        require_approved_director(result.director_spec)
+
+
+def test_patch_application_exception_retains_candidate_and_no_false_pass(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    spec = _spec()
+    engine = DirectorCriticEngine(lambda _: _semantic([_finding(spec)], [_patch(spec)]))
+
+    def fail_apply(_spec: Any, _result: Any) -> DirectorSpecDraft:
+        raise ToolError("模拟 Patch 校验失败")
+
+    monkeypatch.setattr(engine, "apply_patches", fail_apply)
+    events: list[tuple[str, dict[str, Any]]] = []
+    with request_trace("trace-patch-failure"):
+        result = engine.review_and_revise(
+            spec, _brief(), emit=lambda name, payload: events.append((name, payload)),
+        )
+    assert result.needs_review and result.revision_count == 0
+    assert result.director_spec.director_plan == spec.director_plan
+    failure = next(payload for name, payload in events if name == "director_patch_invalid")
+    assert failure["error_id"].startswith("ERR-")
+    assert failure["trace_id"] == "trace-patch-failure"
+    assert not any(name == "director_patch_applied" for name, _payload in events)
+
+
+def test_invalid_patch_diagnostics_do_not_overflow_review_schema() -> None:
+    spec = _spec()
+    findings = [{**_finding(spec), "severity": "info"} for _ in range(45)]
+    patches = [{**_patch(spec), "field": "project_id"} for _ in range(20)]
+    result = DirectorCriticEngine(lambda _: _semantic(findings, patches)).review(spec, _brief())
+    assert len(result.findings) == 50
+    assert result.findings[-1].code == "REVIEW_FINDINGS_TRUNCATED"
+    assert result.suggested_patches == []
+
+
+def test_draft_is_persisted_before_first_critic_call(tmp_path: Path) -> None:
+    coordinator, projects, runtime, _calls = _setup(tmp_path)
+    project_id = _project(projects)
+
+    def review(_messages: Any) -> str:
+        run = runtime.list_runs()[0]
+        candidate = DirectorSpecDraft.model_validate(run.state["director_candidate"])
+        assert candidate.schema_version == 2
+        assert run.state["completed_stages"] == SKILLS[:3]
+        assert run.state["draft_status"] == "generated"
+        return _semantic()
+
+    coordinator.critic_engine = DirectorCriticEngine(review)
+    result = coordinator.execute(_request(projects, project_id, "fast"))
+    assert result.director_spec is not None and not result.needs_review
+
+
+def test_failure_after_one_patch_persists_revision_and_resume_reviews_it(tmp_path: Path) -> None:
+    coordinator, projects, runtime, _calls = _setup(tmp_path)
+    project_id = _project(projects)
+    calls = 0
+
+    def review(_messages: Any) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return _semantic([_finding(_spec())], [_patch(_spec())])
+        # 第二次审核尚未返回时，修订后的真实候选已经写入原 Run。
+        candidate = runtime.list_runs()[0].state["director_candidate"]
+        assert candidate["director_plan"]["composition_strategy"] == _patch(_spec())["value"]
+        raise ToolError("第二次审核请求失败")
+
+    coordinator.critic_engine = DirectorCriticEngine(review)
+    first = coordinator.execute(_request(projects, project_id, "fast"))
+    assert first.needs_review and first.director_spec is None
+    assert calls == 2
+    run = runtime.get_run(first.run_id)
+    assert run.state["revision_count"] == 1
+    assert first.director_draft.director_plan.composition_strategy == _patch(_spec())["value"]
+
+    def rereview(messages: Any) -> str:
+        spec = json.loads(messages[1]["content"])["director_spec"]
+        assert spec["director_plan"]["composition_strategy"] == _patch(_spec())["value"]
+        return _semantic()
+
+    coordinator.critic_engine = DirectorCriticEngine(rereview)
+    recovered = coordinator.execute(_request(
+        projects, project_id, "fast", previous_run_id=first.run_id, rerun_from="director_critic",
+    ))
+    assert recovered.director_spec is not None
+    assert recovered.director_spec.composition == _patch(_spec())["value"]

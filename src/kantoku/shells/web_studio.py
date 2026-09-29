@@ -2107,12 +2107,33 @@ class StudioApplication:
 
     def _comic_director_result(self, run: RunRecord) -> dict[str, Any]:
         spec = None
+        spec_status = "unavailable"
         if run.status is ExecutionStatus.COMPLETED:
             spec = self.comic_projects.get_director(
-                run.state["project_id"], project_version=run.state["project_version_after"],
+                run.state["project_id"],
+                project_version=run.state["project_version_after"],
             ).model_dump(mode="json")
+            spec_status = "reviewed"
+        elif run.status in {ExecutionStatus.WAITING, ExecutionStatus.FAILED}:
+            candidate = run.state.get("director_candidate")
+            if candidate is not None:
+                # 草案是 Run 中的真实分层输出，不伪造已保存的 spec_id/version 或审核成功。
+                spec = DirectorSpecDraft.model_validate(candidate).model_dump(mode="json")
+                spec.update(
+                    {
+                        "project_id": run.state["project_id"],
+                        "creative_brief_version": run.state["input_versions"]["creative_brief"],
+                        "draft": True,
+                        "source_run_id": run.id,
+                    }
+                )
+                spec_status = "draft"
         return {
-            "run_id": run.id, "status": run.status.value, "director_spec": spec,
+            "run_id": run.id,
+            "status": run.status.value,
+            "director_spec": spec,
+            "director_spec_status": spec_status,
+            "ready_for_prompt": spec_status == "reviewed",
             "director_execution_summary": director_execution_summary(run),
             "recovery_required": run.status is ExecutionStatus.RUNNING
             and run.state.get("worker_instance_id") != self._instance_id,

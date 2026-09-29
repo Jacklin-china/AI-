@@ -224,6 +224,18 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
   输入/Context/输出 SHA-256、长度、键名、来源版本、复用阶段与编辑来源。控制台和现有结构化
   日志能按 trace/run/project/skill 关联共享 LLM 请求 ID、provider、model、真实 token、耗时、
   retry、审核规范化 warning 与安全 error_id/traceback；不记录原始无效模型响应或 CoT。
+- **草案与审核结果分离**：前三个导演阶段的真实公开输出通过 Schema 后，先保存
+  `director_candidate`，发出 `director_draft_created`，再执行 Critic。审核待修订、审核请求
+  失败或 Patch 应用失败时保留原草案，Run 为 `waiting`，不伪造 pass，也不启动 Prompt/生图。
+  生成阶段失败仍为 `failed`，不默认填充方案。每阶段的 `stage_statuses` / `stage_failures`
+  复用现有 Run state，记录 stage_name、trace_id、error_id、input_version、已完成公开输出和
+  安全异常摘要；完整脱敏堆栈留在统一日志中。审核失败不得发出审核完成事件或推进完成检查点。
+  任务 API 的 `director_spec` 可返回真实草案，并明确 `director_spec_status=draft`、
+  `draft=true`、`ready_for_prompt=false`，不虚构已保存版本的 spec_id/version；通过审核后的
+  已存方案才返回 `reviewed`。Fast 隐藏节点输出，但返回最小真实状态和故障原因；Professional
+  提供完整公开阶段输出。重启只查询现有 Run，不自动重提；显式恢复只重做必要审核。
+  非法 Patch（未知字段、禁止写入、格式错误、过期预期值或替换值不符合 DirectorSpec Schema）
+  记录 `INVALID_PATCH` 并忽略该建议。硬约束/资产身份只读，最多自动修订一次，门禁不放宽。
 - **真实与离线验收分开**：`evals/director.jsonl` 定义异兽、人物、情绪、科幻四个独立案例。
   `uv run python scripts/verify_director_pipeline.py --allow-paid --max-cny 2` 经现有应用 API、
   Coordinator 和共享 LLM 执行；项目/会话/Run 位于独立 `data/qa/director-live-*/runtime.db`，

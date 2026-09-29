@@ -233,6 +233,19 @@ def _has_evidence(value: Any, evidence: str) -> bool:
     return False
 
 
+def _invalid_patch(field: str, reason: str) -> DirectorCriticFinding:
+    # 仅记录字段标识与固定诊断，不透传无效 Patch 的值、reasoning 或原始响应。
+    path = field if re.fullmatch(r"[a-z_][a-z0-9_.]{0,199}", field) else ""
+    _critic_warning(path or "<invalid>", action="invalid_patch")
+    return DirectorCriticFinding(
+        code="INVALID_PATCH",
+        severity="info",
+        field_path=path,
+        expected="Patch 必须符合 DirectorSpec Schema、写白名单和当前字段预期值",
+        suggested_action=reason,
+    )
+
+
 class DirectorCriticEngine:
     """复用共享文本调用；不解释图片、不绑定模型、不保存私有推理。"""
 
@@ -240,25 +253,36 @@ class DirectorCriticEngine:
         self.model_call = model_call or _shared_review
 
     def review(
-        self, spec: DirectorSpecDraft, brief: CreativeBriefInput, *,
+        self,
+        spec: DirectorSpecDraft,
+        brief: CreativeBriefInput,
+        *,
         assets: list[ComicAsset] | None = None,
-        storyboard: ComicStoryboard | None = None, shot: ComicShot | None = None,
+        storyboard: ComicStoryboard | None = None,
+        shot: ComicShot | None = None,
     ) -> DirectorCriticResult:
         try:
             return self._review(spec, brief, assets or [], storyboard, shot)
         except Exception as error:
-            # 在 Run 内由 Coordinator 生成唯一 error_id；独立调用复用同一错误日志入口。
+            # Run 内由审核闭环或 Coordinator 生成唯一 error_id；独立调用复用日志入口。
             if current_run_id() is None:
-                public_error(
-                    error, trace_id=current_trace_id(), component="comic.director_critic",
+                error._kantoku_public_failure = public_error(
+                    error,
+                    trace_id=current_trace_id(),
+                    component="comic.director_critic",
                     project_id=getattr(spec, "project_id", None)
-                    or getattr(brief, "project_id", None), skill_id="comic.director_critic",
+                    or getattr(brief, "project_id", None),
+                    skill_id="comic.director_critic",
                 )
             raise
 
     def _review(
-        self, spec: DirectorSpecDraft, brief: CreativeBriefInput,
-        assets: list[ComicAsset], storyboard: ComicStoryboard | None, shot: ComicShot | None,
+        self,
+        spec: DirectorSpecDraft,
+        brief: CreativeBriefInput,
+        assets: list[ComicAsset],
+        storyboard: ComicStoryboard | None,
+        shot: ComicShot | None,
     ) -> DirectorCriticResult:
         if spec.schema_version != 2:
             raise ToolError("Director Critic 需要 DirectorSpec v2")
@@ -388,10 +412,28 @@ class DirectorCriticEngine:
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ])
         try:
-            semantic = SemanticReview.model_validate_json(raw)
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("invalid review object")
+            raw_patches = payload.get("suggested_patches")
+            if not isinstance(raw_patches, list) or len(raw_patches) > 20:
+                raise ValueError("invalid patch collection")
+            semantic = SemanticReview.model_validate({**payload, "suggested_patches": []})
         except (ValueError, ValidationError):
             # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
             raise ToolError("导演审核模型未返回有效的公开审核结构") from None
+        invalid_patches: list[DirectorCriticFinding] = []
+        for patch_data in raw_patches:
+            try:
+                semantic.suggested_patches.append(DirectorCriticPatch.model_validate(patch_data))
+            except ValidationError:
+                field = patch_data.get("field", "") if isinstance(patch_data, dict) else ""
+                invalid_patches.append(
+                    _invalid_patch(
+                        field if isinstance(field, str) else "",
+                        "忽略不符合 Patch Schema 的建议",
+                    )
+                )
         evidence_context = {
             key: value for key, value in context.items()
             if key not in {"patch_fields", "allowed_field_paths"}
@@ -421,6 +463,7 @@ class DirectorCriticEngine:
         findings.extend(DirectorCriticFinding.model_validate(item.model_dump())
                         for item in verified)
         findings.extend(unverified)
+        findings.extend(invalid_patches)
         logger.info(
             "Director Critic Debug received_findings={} verified_findings={} "
             "ignored_findings={} unverified_findings={} spec_hash={}",
@@ -434,8 +477,11 @@ class DirectorCriticEngine:
 
     @staticmethod
     def _result(
-        spec: DirectorSpecDraft, findings: list[DirectorCriticFinding],
-        patches: list[DirectorCriticPatch], summary: str, confidence: float,
+        spec: DirectorSpecDraft,
+        findings: list[DirectorCriticFinding],
+        patches: list[DirectorCriticPatch],
+        summary: str,
+        confidence: float,
     ) -> DirectorCriticResult:
         errors = any(item.severity == "error" for item in findings)
         blocked = any(item.code in {
@@ -451,7 +497,7 @@ class DirectorCriticEngine:
         for patch in patches:
             normalized = _normalize_patch(spec, patch)
             if normalized.field not in PATCH_FIELDS:
-                _critic_warning(patch.field)
+                findings.append(_invalid_patch(patch.field, "忽略不存在或禁止写入的字段"))
                 continue
             normalized_patches.append(normalized)
         allowed = sorted({
@@ -471,13 +517,45 @@ class DirectorCriticEngine:
         for patch in normalized_patches:
             actual = _value(data, patch.field)
             if (
-                patch.field not in allowed or patch.value is None
-                or patch.expected_value != actual or patch.field in seen
+                patch.field not in allowed
+                or patch.value is None
+                or patch.expected_value != actual
+                or patch.field in seen
             ):
-                _critic_warning(patch.field)
+                findings.append(
+                    _invalid_patch(
+                        patch.field,
+                        "忽略未关联问题、预期值不符或重复的建议",
+                    )
+                )
+                continue
+            parent, key = patch.field.split(".")
+            trial = {**data, parent: {**data[parent], key: patch.value}}
+            try:
+                DirectorSpecDraft.model_validate(trial)
+            except ValidationError:
+                findings.append(
+                    _invalid_patch(
+                        patch.field,
+                        "替换值未通过 DirectorSpec Schema 校验",
+                    )
+                )
                 continue
             seen.add(patch.field)
             usable_patches.append(patch)
+        if len(findings) > 50:
+            # 阻断/修订项优先，非法 Patch 诊断不能挤掉关键证据。
+            rank = {"error": 0, "warning": 1, "info": 2}
+            ordered = sorted(findings, key=lambda item: rank[item.severity])
+            incomplete = any(item.severity != "info" for item in ordered[49:])
+            findings = [*ordered[:49], DirectorCriticFinding(
+                code="REVIEW_FINDINGS_TRUNCATED",
+                severity="warning" if incomplete else "info",
+                expected="审核诊断最多保存 50 项",
+                suggested_action="部分诊断已合并；查看 Trace，必要时显式重新审核",
+            )]
+            if incomplete and verdict == "pass":
+                verdict = "needs_revision"
         return DirectorCriticResult(
             verdict=verdict, public_summary=summary, findings=findings,
             suggested_patches=usable_patches, confidence=confidence,
@@ -528,16 +606,63 @@ class DirectorCriticEngine:
         return DirectorSpecDraft.model_validate(data)
 
     def review_and_revise(
-        self, spec: DirectorSpecDraft, brief: CreativeBriefInput, *,
-        assets: list[ComicAsset] | None = None, storyboard: ComicStoryboard | None = None,
-        shot: ComicShot | None = None, emit: EventSink | None = None,
+        self,
+        spec: DirectorSpecDraft,
+        brief: CreativeBriefInput,
+        *,
+        assets: list[ComicAsset] | None = None,
+        storyboard: ComicStoryboard | None = None,
+        shot: ComicShot | None = None,
+        emit: EventSink | None = None,
     ) -> DirectorReviewOutcome:
         current = spec
         revision_count = 0
+        result: DirectorCriticResult | None = None
+
+        def failed_review(error: Exception, event: str) -> DirectorCriticResult:
+            failure = getattr(error, "_kantoku_public_failure", None) or public_error(
+                error,
+                component="comic.director_critic",
+                project_id=getattr(brief, "project_id", None),
+                run_id=current_run_id(),
+                skill_id="comic.director_critic",
+            )
+            error._kantoku_public_failure = failure
+            if emit:
+                emit(
+                    event,
+                    {**failure, "error_type": type(error).__name__, "review_attempt": attempt,
+                     "exception_module": type(error).__module__},
+                )
+            retained = list(result.findings) if result is not None else []
+            retained.append(
+                DirectorCriticFinding(
+                    code="REVIEW_EXECUTION_FAILED"
+                    if event == "director_critic_failed"
+                    else "INVALID_PATCH",
+                    severity="warning",
+                    suggested_action="保留导演草案；查看错误详情或显式重新审核，不自动继续制作",
+                    expected=failure["safe_message"],
+                )
+            )
+            return self._result(
+                current, retained, [], "导演草案已生成，但审核未完成；原方案已保留。", 0.0
+            )
+
         for attempt in range(2):
             if emit:
                 emit("director_critic_started", {"review_attempt": attempt})
-            result = self.review(current, brief, assets=assets, storyboard=storyboard, shot=shot)
+            try:
+                result = self.review(
+                    current,
+                    brief,
+                    assets=assets,
+                    storyboard=storyboard,
+                    shot=shot,
+                )
+            except Exception as error:
+                result = failed_review(error, "director_critic_failed")
+                break
             if emit:
                 emit("director_critic_completed", {
                     "review_attempt": attempt, "critic_result": result.model_dump(),
@@ -547,15 +672,22 @@ class DirectorCriticEngine:
             if emit:
                 emit("director_revision_requested", {"verdict": result.verdict})
             if attempt == 0 and result.allowed_patches and result.suggested_patches:
-                current = self.apply_patches(current, result)
+                try:
+                    revised = self.apply_patches(current, result)
+                except Exception as error:
+                    result = failed_review(error, "director_patch_invalid")
+                    break
+                current = revised
                 revision_count = 1
                 if emit:
                     emit("director_patch_applied", {
                         "revision_count": revision_count,
                         "patches": [item.model_dump() for item in result.suggested_patches],
+                        "director_candidate": current.model_dump(mode="json"),
                     })
                 continue
             break
+        assert result is not None
         needs_review = result.verdict != "pass"
         if needs_review and emit:
             emit("director_review_blocked", {"verdict": result.verdict, "needs_review": True})
