@@ -113,7 +113,7 @@ def test_three_requested_ideas_generate_independently_with_trace_and_same_runtim
     for version, idea in enumerate(ideas, 1):
         observed.clear()
         result = _execute(app, project_id, task=idea, creation_mode=mode)
-        assert result["status"] == "completed" and result["ready_for_prompt"]
+        assert result["status"] == "completed" and not result["ready_for_prompt"]
         draft = result["director_spec"]
         assert draft["schema_version"] == 2
         assert idea in draft["creative_decision"]["intent_summary"]

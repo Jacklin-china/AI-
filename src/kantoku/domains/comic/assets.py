@@ -13,7 +13,7 @@ from kantoku.config import ToolError
 from kantoku.core.runtime.models import ArtifactType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
-from .models import ComicAsset, ComicAssetDraft, ComicAssetRef
+from .models import ComicAsset, ComicAssetDraft, ComicAssetRef, DirectorSpec
 from .projects import ComicProjectStore
 
 
@@ -106,6 +106,18 @@ class ComicAssetStore:
                 (project_id, asset_id),
             ).fetchall()
         return [ComicAsset.model_validate_json(row["payload_json"]) for row in rows]
+
+    def director_assets(self, spec: DirectorSpec) -> list[ComicAsset]:
+        """读取导演修订的精确绑定；锁定可沿用，未锁定的漂移必须重新审核。"""
+        selected = []
+        for key, version in spec.asset_versions.items():
+            asset_id = key.removeprefix("asset:")
+            current = self.get(spec.project_id, asset_id)
+            if (current.state != "active"
+                    or (current.pinned_version or current.version) != version):
+                raise ToolError("导演资产版本已变化，请先更新方案")
+            selected.append(self.get(spec.project_id, asset_id, version=version))
+        return selected
 
     def list(
         self, project_id: str, *, project_version: int | None = None,

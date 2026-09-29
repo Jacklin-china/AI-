@@ -141,6 +141,7 @@ class ComicPromptStore:
         self.storyboards = storyboards
         self.assets = assets
         self.runtime = runtime
+        self.projects.runtime_store = runtime
 
     def source(self, shot_id: str) -> tuple[
         ComicProjectSnapshot, DirectorSpec, ComicStoryboard, ComicShot, list[ComicAsset]
@@ -155,6 +156,7 @@ class ComicPromptStore:
             raise ToolError("导演方案已变化，请先创建当前方案的分镜")
         director = self.projects.get_director(shot.project_id)
         require_approved_director(director)
+        self.projects.require_confirmed_director(director)
         refs = [*shot.character_asset_versions, *shot.scene_asset_versions]
         if shot.style_version is not None:
             refs.append(shot.style_version)

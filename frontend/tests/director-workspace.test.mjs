@@ -2,10 +2,11 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
+import { reactive } from 'vue'
 
 const source = readFileSync(new URL('../src/domains/comic/directorPresentation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
-const { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, draftConfirmationKey, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+const { directorDraftFields, editableDirectorDraft, canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
 const spec = {
   schema_version: 2, spec_id: 'director', version: 2, creative_brief_version: 3,
   creative_decision: { intent_summary: '异兽观察文明', emotional_target: '孤独', private_thought: 'must not show' },
@@ -13,6 +14,21 @@ const spec = {
   cinematography: { camera_angle: '平视', light_direction: '侧光' }, critic_result: { verdict: 'pass' },
   asset_versions: { 'asset:character': 1 },
 }
+test('both modes edit public draft fields without changing identity or hard constraints', () => {
+  const original = structuredClone({ ...spec, creative_decision: { ...spec.creative_decision, hard_constraints: ['异兽'] } })
+  const fields = directorDraftFields(original)
+  assert.equal(fields['creative_decision.emotional_target'], '孤独')
+  assert.equal(fields['creative_decision.hard_constraints'], undefined)
+  assert.equal(fields['creative_decision.private_thought'], undefined)
+  const saved = editableDirectorDraft(original, { 'creative_decision.emotional_target': '期待' })
+  assert.equal(saved.creative_decision.emotional_target, '期待')
+  assert.deepEqual(saved.creative_decision.hard_constraints, ['异兽'])
+  assert.equal(saved.critic_result, null)
+  assert.equal(saved.version, undefined)
+  assert.equal(saved.user_confirmed, undefined)
+  assert.equal(original.creative_decision.emotional_target, '孤独')
+  assert.throws(() => editableDirectorDraft(original, { 'creative_decision.hard_constraints': '人物' }))
+})
 test('v2 public projection does not expose legacy fields or private model metadata', () => {
   const output = directorSummary({ ...spec, emotion: 'legacy emotion', camera_language: 'legacy camera' })
   assert.match(output, /异兽观察文明/)
@@ -28,13 +44,12 @@ test('only real completed reviewed v2 can be confirmed; draft changes invalidate
   assert.equal(canConfirmDirector('completed', { ...spec, critic_result: { verdict: 'needs_revision' } }, false, false), false)
   assert.equal(canConfirmDirector('completed', { ...spec, schema_version: 1 }, false, false), false)
 })
-test('confirmation belongs to one immutable project/spec/version and never to a mode or Run success flag', () => {
-  const key = draftConfirmationKey('project', spec)
-  assert.equal(key, draftConfirmationKey('project', structuredClone(spec)))
-  assert.notEqual(key, draftConfirmationKey('other', spec))
-  assert.notEqual(key, draftConfirmationKey('project', { ...spec, version: 3 }))
-  assert.notEqual(key, draftConfirmationKey('project', { ...spec, cinematography: { camera_angle: '俯视' } }))
-  assert.equal(draftConfirmationKey('project', null), '')
+test('Vue reactive drafts can be copied and saved without DataCloneError or changing the source', () => {
+  const original = reactive(structuredClone(spec))
+  const saved = editableDirectorDraft(original, { 'creative_decision.emotional_target': '期待' })
+  assert.equal(saved.creative_decision.emotional_target, '期待')
+  assert.equal(original.creative_decision.emotional_target, '孤独')
+  assert.equal(saved.critic_result, null)
 })
 test('dependency changes mark old spec stale; locked assets retain their referenced version', () => {
   const assets = [{ asset_id: 'character', version: 1, pinned_version: null, state: 'active' }]
@@ -86,7 +101,11 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /const id = String\(legacy \? legacy\.state\.project_id/)
   assert.match(view, /board\?\.director_spec_version !== spec\.value\?\.version/)
   assert.match(view, /restoreChoice === Number\(version\.version\)/)
-  assert.match(view, /!\['failed', 'waiting'\]\.includes\(active\.value\?\.status/)
+  assert.match(view, /latestVersion && !tasks.some/)
+  assert.match(view, /creative_operation: 'new'/)
+  assert.match(view, /spec\.value\?\.user_confirmed === true/)
+  assert.match(view, /confirmDirectorVersion/)
+  assert.doesNotMatch(view, /kantoku-director-confirmation:/)
   assert.match(view, /if \(failedRun\) \{ selectedRun\.value = failedRun\.run_id/)
 })
 test('Fast keeps only creative and director summary; v2 optional fields and narrative context are public', () => {

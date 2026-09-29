@@ -70,12 +70,6 @@ export function directorIsStale(
     return !asset || asset.state === 'deleted' || (asset.pinned_version ?? asset.version) !== version
   })
 }
-export function draftConfirmationKey(projectId: string, spec: Record<string, unknown> | null): string {
-  if (!spec || spec.schema_version !== 2) return ''
-  return JSON.stringify([projectId, spec.spec_id, spec.version, spec.creative_brief_version,
-    spec.asset_versions, spec.storyboard_version, spec.shot_version,
-    publicDirectorSections(spec), spec.critic_result])
-}
 export function canConfirmDirector(status: string | undefined, spec: Record<string, unknown> | null, stale: boolean, dirty: boolean): boolean {
   return status === 'completed' && spec?.schema_version === 2 && !stale && !dirty &&
     publicDirectorSections(spec).length === 3 && (spec.critic_result as { verdict?: string } | null)?.verdict === 'pass'
@@ -90,4 +84,30 @@ export function chronologicalDirectorExecutions<T extends { run_id: string }>(
   // assistant turn at the top; the pending user bubble remains until Run hydration.
   return executions.filter(item => !!records[item.run_id]).sort((a, b) =>
     records[a.run_id]!.started_at.localeCompare(records[b.run_id]!.started_at))
+}
+
+// 编辑只投影公开决策叶子，绑定身份、用户硬约束和审核结论保持只读。
+export function directorDraftFields(spec: Record<string, unknown> | null): Record<string, string> {
+  if (spec?.schema_version !== 2) return {}
+  return Object.fromEntries(['creative_decision', 'director_plan', 'cinematography'].flatMap(section =>
+    Object.entries(spec[section] as Record<string, unknown> ?? {})
+      .filter(([key, value]) => key !== 'hard_constraints' && key in directorFieldLabels &&
+        (value == null || typeof value === 'string' || Array.isArray(value)))
+      .map(([key, value]) => [`${section}.${key}`, Array.isArray(value) ? value.join('\n') : String(value ?? '')]),
+  ))
+}
+export function editableDirectorDraft(spec: Record<string, unknown>, fields: Record<string, string> = {}): Record<string, unknown> {
+  const keys = ['schema_version', 'visual_direction', 'storytelling_goal', 'camera_language', 'composition',
+    'lighting', 'color_language', 'emotion', 'character_focus', 'constraints', 'creative_choices',
+    'creative_decision', 'director_plan', 'cinematography', 'knowledge_refs', 'asset_versions', 'storyboard_version', 'shot_version']
+  // API 数据是 JSON；Vue 的嵌套 Proxy 不能直接 structuredClone。
+  const draft = JSON.parse(JSON.stringify(Object.fromEntries(keys.filter(key => key in spec).map(key => [key, spec[key]])))) as Record<string, unknown>
+  const allowed = directorDraftFields(spec)
+  Object.entries(fields).forEach(([path, text]) => {
+    if (!(path in allowed)) throw new Error('不能编辑身份、硬约束或审核结论')
+    const [section, key] = path.split('.') as [string, string]
+    const body = draft[section] as Record<string, unknown>
+    body[key] = Array.isArray(body[key]) ? text.split('\n').map(item => item.trim()).filter(Boolean) : body[key] == null && !text.trim() ? null : text
+  })
+  return { ...draft, critic_result: null }
 }

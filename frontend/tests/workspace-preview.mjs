@@ -10,6 +10,7 @@ const brief = { version: 1, original_request: project.title, hard_constraints: [
 const assets = [{ asset_id: 'qa-character', name: '穷奇', version: 1, pinned_version: 1, state: 'active', details: { kind: 'character', appearance: '远古异兽，保留翼与角', clothing: '无' }, fixed_constraints: ['保持异兽身份'], reference_artifact_ids: [] }]
 const stages = ['creative_understanding', 'visual_direction', 'cinematography', 'director_critic', 'director_assemble']
 const runs = []; const tasks = []; const versions = []
+const port = Number(process.env.KANTOKU_QA_PORT ?? 8765)
 function newSpec() {
   return { schema_version: 2, spec_id: 'qa-director', project_id: project.project_id, version: versions.length + 1, creative_brief_version: 1, asset_versions: { 'asset:qa-character': 1 }, created_at: new Date().toISOString(),
     creative_decision: { intent_summary: '表现异兽观察人类文明的孤独感，而非战斗威力。', narrative_context: '悬崖与远方城市形成时间和尺度的对比。', emotional_target: '孤独而克制', audience_experience: '远古生命的距离感', hard_constraints: brief.hard_constraints, narrative_focus: '观察而非攻击' },
@@ -19,7 +20,7 @@ function newSpec() {
 }
 function execute(body, pending = false, existing = null) {
   const failed = body.task?.includes('失败')
-  const spec = failed || pending ? null : newSpec()
+  const spec = failed || pending ? null : body.review_current ? { ...structuredClone(versions.at(-1)), version: versions.length + 1, critic_result: { verdict: 'pass', public_summary: '离线审核替身：当前手工修改已验证', findings: [] }, user_confirmed: false } : { ...newSpec(), user_confirmed: false }
   if (spec) { for (const [stage, patch] of Object.entries(body.stage_edits ?? {})) { const key = { creative_understanding: 'creative_decision', visual_direction: 'director_plan', cinematography: 'cinematography' }[stage]; spec[key] = patch } versions.push(spec); project.director_version = spec.version; project.current_version++ }
   const id = existing?.run_id ?? `qa-run-${runs.length + 1}`
   const run = { id, domain: 'comic', workflow: 'comic.director', status: pending ? 'running' : failed ? 'failed' : 'completed', started_at: existing ? runs.find(run => run.id === id).started_at : new Date().toISOString(), updated_at: new Date().toISOString(), completed_at: pending ? null : new Date().toISOString(), current_node: pending ? 'creative_understanding' : '__end__', nodes: [], cost_fen: 0, error: failed ? '离线测试：DirectorSpec validation failed' : null,
@@ -56,9 +57,22 @@ createServer(async (request, response) => {
     if (path.endsWith('/shots')) return json(response, { shots: [{ shot_id: 'qa-shot', sequence_number: 1, subject: '穷奇', purpose: '表现隔阂', action: '静静观察', version: 1, status: 'planned', character_asset_versions: [{ asset_id: 'qa-character', version: 1 }], scene_asset_versions: [] }] })
     if (path.endsWith('/prompt/versions')) return json(response, { versions: [] })
     if (path.endsWith('/director-spec/versions')) return json(response, { versions })
+    if (path.endsWith('/director-spec/confirm') && request.method === 'POST') {
+      const spec = versions.at(-1)
+      if (spec.version !== body.version || spec.critic_result?.verdict !== 'pass') return json(response, { safe_message: '离线测试：请先审核当前版本' }, 400)
+      spec.user_confirmed = true
+      return json(response, spec)
+    }
     if (path.endsWith('/director-spec/restore') && request.method === 'POST') { const spec = structuredClone(versions.find(item => item.version === body.version)); spec.version = versions.length + 1; spec.source = 'restored'; versions.push(spec); project.director_version = spec.version; project.current_version++; return json(response, spec) }
     if (path.endsWith('/director-spec')) {
       if (request.method !== 'POST') return json(response, versions.at(-1))
+      if (body.draft || body.revision_instruction) {
+        const current = versions.at(-1)
+        const spec = { ...structuredClone(body.draft ?? current), spec_id: 'qa-director', project_id: project.project_id, creative_brief_version: brief.version, version: versions.length + 1, critic_result: null, user_confirmed: false }
+        if (body.revision_instruction) spec.director_plan.composition_strategy = `离线修改指令：${body.revision_instruction}`
+        versions.push(spec); project.director_version = spec.version; project.current_version++
+        return json(response, spec)
+      }
       // 只在隔离 QA 中按明确测试指令模拟等待，生产代码没有人为延时或虚假状态。
       const slow = body.task?.includes('离线慢任务')
       const task = execute(body, slow)
@@ -71,4 +85,4 @@ createServer(async (request, response) => {
     const file = path.startsWith('/assets/') ? target : resolve(root, 'index.html')
     const content = await readFile(file); response.writeHead(200, { 'Content-Type': ({ '.js': 'text/javascript', '.css': 'text/css', '.html': 'text/html' })[extname(file)] ?? 'application/octet-stream' }); response.end(content)
   } catch (error) { json(response, { error: error.message }, 500) }
-}).listen(8765, '127.0.0.1', () => process.stdout.write('Offline Workspace QA: http://127.0.0.1:8765/workspace/comic/run/qa-run-1\n'))
+}).listen(port, '127.0.0.1', () => process.stdout.write(`Offline Workspace QA: http://127.0.0.1:${port}/workspace/comic/run/qa-run-1\n`))

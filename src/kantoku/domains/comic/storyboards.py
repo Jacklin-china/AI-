@@ -121,11 +121,13 @@ class ComicStoryboardStore:
                             or asset.details.kind != kind):
                         raise ToolError("镜头资产引用类型或状态无效", detail=ref.asset_id)
 
-    @staticmethod
-    def _require_current_director(snapshot, storyboard: ComicStoryboard) -> None:
+    def _require_current_director(self, snapshot, storyboard: ComicStoryboard) -> None:
         if (snapshot.project.director_id is None
                 or snapshot.project.director_version != storyboard.director_spec_version):
             raise ToolError("当前导演方案已变化，请基于新版方案新建分镜")
+        director = self.projects.get_director(storyboard.project_id)
+        self.projects.require_confirmed_director(director)
+        self.assets.director_assets(director)
 
     def _insert_storyboard(
         self, connection: sqlite3.Connection, storyboard: ComicStoryboard,
@@ -162,6 +164,9 @@ class ComicStoryboardStore:
         if len(planned) > 100:
             raise ToolError("单个分镜最多100个镜头")
         self._validate_refs(project_id, planned)
+        director = self.projects.get_director(project_id)
+        self.projects.require_confirmed_director(director)
+        self.assets.director_assets(director)
         with self.projects._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
             snapshot = self._project(connection, project_id, expected_project_version)

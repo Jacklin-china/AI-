@@ -175,9 +175,9 @@ HTTP：`POST /api/comic/shots/{id}/prompt/compile`（`expected_project_version`�
 
 漫剧工作台只维护一份 `DirectorWorkspace`，复用现有 Splitpanes、MessageComposer、用户气泡、Markdown 与图片附件。普通/专业模式控制下一次导演接口的 `creation_mode` 以及节点可见深度，不创建第二套 Conversation、Coordinator 或工作流。左侧资产入口切换中央资产页面，不再使用覆盖对话的制作资产 Drawer；Inspector 默认关闭，只占上方节点区，不改变下方聊天宽度。节点编辑草稿按 Project/Run/Stage 隔离，切换页面不丢草稿；实际保存、重跑、恢复与 Prompt 编译调用已有 API，使用已有预期版本检查。
 
-导演 Draft 的“待确认/本界面已确认”是**前端用户确认状态**，不是 Runtime 成功状态或服务端 Approval。确认绑定不可变 DirectorSpec v2、Brief/资产/分镜/镜头版本；真实失败、Critic 未通过、来源过期或未保存的当前任务修改均禁止确认。本浏览器保存确认指纹，修改/恢复新版本后必须重新确认。Prompt 编译和下一步制作入口检查该确认；后端没有对应确认契约，因此其他客户端与直接 API 调用的强制门禁仍需后续后端接入，不能宣称已经完成。
+导演 Draft 的确认现在复用服务端 Core Approval，不再由浏览器确认指纹充当权限。`POST /api/comic/projects/{id}/director-spec/confirm` 接收 `version/expected_project_version`，只确认当前 Brief 下已经通过实际 Critic 的不可变导演修订，并检查绑定资产/镜头依赖。确认绑定 Project/Spec/Version/Brief，编辑或恢复产生新版本，不继承旧审批。Storyboard 创建和修改、Shot 操作、Prompt Store 在后端检查审核及确认；创建分镜在文本模型调用前拦截。旧 v1 生产契约保留兼容，新 v2 不能通过直接 API 绕过。确认记录使用同一 Core Run/Approval/Event，不增加数据库表。
 
-当前导演 API 接收 `conversation_id` 并保存在 Core Run，但不追加 Conversation Message。前端为 Project 复用一个既有 Conversation ID，并由真实关联 Run 的用户任务、公开导演摘要与修改记录恢复连续对话展示；不调用旧 Guided 聊天路由去偷偷创建单镜头生产。**数据库 Conversation.messages 同步、跨设备确认仍未接入**。已有单镜头 Run/Artifact/审批/供应商查询保留兼容入口；新作品没有接入图片生产时必须明确说明，不伪装出图。UI 只呈现 v2 白名单公开字段、真实节点摘要和 trace/error ID，不输出旧字段或私有思考。
+当前导演 API 接收 `conversation_id` 并保存在 Core Run，但不追加 Conversation Message。前端为 Project 复用一个既有 Conversation ID，并由真实关联 Run 的用户任务、公开导演摘要与修改记录恢复连续对话展示；不调用旧 Guided 聊天路由去偷偷创建单镜头生产。**数据库 Conversation.messages 同步仍未接入**；用户确认已从共享 Runtime 持久化读取，不依赖当前浏览器。已有单镜头 Run/Artifact/审批/供应商查询保留兼容入口；新作品没有接入图片生产时必须明确说明，不伪装出图。UI 只呈现 v2 白名单公开字段、真实节点摘要和 trace/error ID，不输出旧字段或私有思考。
 
 布局参考 [Figma 导航](https://help.figma.com/hc/en-us/articles/360039831974-Explore-the-navigation-bar-and-left-sidebar)、[Runway 对话式创作](https://help.runwayml.com/hc/en-us/articles/51601639579667-Creating-with-Runway-Agent)、[InvokeAI](https://github.com/invoke-ai/InvokeAI)、[Langflow](https://github.com/langflow-ai/langflow) 与 [ComfyUI Frontend](https://github.com/Comfy-Org/ComfyUI_frontend)。只提炼可收起导航、节点工作区、上下文详情与结果历史，不复制节点 Runtime 或引入另一套组件体系。离线 UI 验收可运行 `frontend/tests/workspace-preview.mjs`，使用隔离端口与内存测试数据；测试数据不写入业务数据库，不冒充真实模型验收。
 
@@ -195,12 +195,13 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
 
 ## Director Pipeline 稳定性与真实验收（2026-09-29）
 
-前端 Workspace 改造暂缓。本轮收口既有 Director Coordinator / Critic / Context，
+前端 Workspace 大规模布局改造暂缓；本轮仅补现有草稿编辑/确认交互。
+收口既有 Director Coordinator / Critic / Context，
 不创建 Runtime、Skill、Asset、Prompt 或 Provider 副本。
 
 - **输入隔离**：导演调用只读取当前 Brief、当前任务与选中资产。项目标题/描述属于导航元数据，
   可能保留旧创意，不再送入导演模型充当故事事实；Project API 仍保留导航元数据，
-  分叉后的 Context 只传 project_id，兼容的旧导演入口也不能从标题恢复旧创意。
+  所有 Context 只传 project_id，兼容的旧导演入口也不能从标题恢复旧创意。
   新的导演 `task` 先经 Context Builder 的语义边界检查（复用共享文本出口，无关键词映射）；
   同方向修改保留 Brief。新方向以当前请求创建独立 Brief 修订，不携带旧偏好或硬约束；
   `CreativeBriefFork` 通过现有 `comic_entity_versions` 和 CAS 追加父版本、原因及归档生命周期，
@@ -231,8 +232,10 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
   复用现有 Run state，记录 stage_name、trace_id、error_id、input_version、已完成公开输出和
   安全异常摘要；完整脱敏堆栈留在统一日志中。审核失败不得发出审核完成事件或推进完成检查点。
   任务 API 的 `director_spec` 可返回真实草案，并明确 `director_spec_status=draft`、
-  `draft=true`、`ready_for_prompt=false`，不虚构已保存版本的 spec_id/version；通过审核后的
-  已存方案才返回 `reviewed`。Fast 隐藏节点输出，但返回最小真实状态和故障原因；Professional
+  `draft=true`、`ready_for_prompt=false`。满足不可变约束的待审草稿追加到原实体版本表，
+  返回真实 spec_id/version；违反硬约束的候选只保留 Run，不提升为当前修订。
+  通过审核后的已存方案才返回 `reviewed`；ready_for_prompt 还须当前版本的用户确认。
+  Fast 隐藏节点输出，但返回最小真实状态和故障原因；Professional
   提供完整公开阶段输出。重启只查询现有 Run，不自动重提；显式恢复只重做必要审核。
   非法 Patch（未知字段、禁止写入、格式错误、过期预期值或替换值不符合 DirectorSpec Schema）
   记录 `INVALID_PATCH` 并忽略该建议。硬约束/资产身份只读，最多自动修订一次，门禁不放宽。
@@ -244,6 +247,25 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
   不自动重试、不自动切备用供应商。总额是按配置的保守单价估算，不冒充供应商最终账单。
   四组均完成、实际 pass、主体无串案、视觉策略不完全相同，才能标记通过；
   四个样本不代表所有创意的审美质量已获证明。离线替身只验证工程契约，不替代真实验收。
+
+### 当前创意和可编辑草稿补充（2026-09-29）
+
+- 工作台新输入显式发送 `creative_operation=new`；不同于当前 Brief 时直接分叉，
+  不把旧 Brief 交给模型猜测是否沿用。新任务只使用本轮显式绑定资产，旧 StyleBible
+  不自动继承。旧客户端的 `auto` 语义边界接口保留兼容；恢复操作仍严格绑定原请求。
+  阶段系统指令不再把所有当前任务都解释为旧作品补充。
+- 两种模式均可直接编辑公开分层方案；未保存编辑可以放弃，版本历史可恢复为新修订。
+  指令式修改必须绑定 `expected_director_version`，只传当前 Brief、当前公开草稿及其资产，
+  通过原共享文本出口产生修订。当前方案未选中、版本变化或硬约束/资产引用改动即拒绝。
+- 原 POST 的 `draft` 保存人工修订，`revision_instruction` 保存指令修订，均清除旧 Critic
+  结果。`creation_mode + review_current=true + expected_director_version` 通过同一 Coordinator
+  重新审核当前稿，不重新生成前三阶段、不接受客户端 pass。审核通过仍需显式用户确认。
+  手工修改在原 Run 中记录请求、版本与 Conversation，任务 API 投影为保存草稿，
+  不伪造 Skill 执行。没有新 Runtime、Skill、Prompt、Asset、Provider 或数据库表。
+- 当前修订由后端版本/审批恢复；旧 Run 入口 URL 不应让工作台在刷新后默认编辑第一版。
+  前端仅复用已有 DirectorNodeView、MessageComposer、Markdown、历史和 API 客户端，
+  保留现有布局与字号。离线浏览器验收复用 `workspace-preview.mjs` 的内存数据，
+  与真实付费模型验收分开。
 
 ## 唯一入口
 

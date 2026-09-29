@@ -50,7 +50,7 @@ def execute_director_stage(
     raw = model_call([
         {"role": "system", "content": (
             instruction + " 只返回符合下述 Schema 的公开决策 JSON 对象，"
-            "当前任务是对当前作品的补充；原始 Brief 和固定资产仍是约束。"
+            "本轮 Brief、当前任务和显式绑定资产是唯一创意依据，不预设为历史作品的补充。"
             "只依据此次提供的上下文，不沿用其他作品或历史示例的主体。"
             "未知细节只作为可编辑的创作选择，不得冒充用户硬约束。"
             "不输出私有思维链、reasoning 或 CoT："
@@ -104,3 +104,27 @@ def plan_director_spec(
     if len(constraints) > 50:
         raise ToolError("导演方案约束过多")
     return draft.model_copy(update={"constraints": constraints})
+
+
+def revise_director_spec(
+    snapshot: ComicProjectSnapshot, draft: DirectorSpecDraft, instruction: str,
+    *, assets: list[ComicAsset], model_call: DirectorModel,
+) -> DirectorSpecDraft:
+    """显式修改当前草稿；只传本轮 Brief、绑定资产与公开方案。"""
+    context = ComicContextBuilder.build(snapshot, assets=assets).model_dump()
+    raw = model_call([
+        {"role": "system", "content": (
+            "根据用户修改指令编辑当前导演草稿，不生成新故事或 Prompt。"
+            "保留用户硬约束、资产和来源版本，只输出公开决策，不输出思维链。"
+            "critic_result 必须为 null，修改后需要重新审核。只返回符合 Schema 的 JSON："
+            + json.dumps(DirectorSpecDraft.model_json_schema(), ensure_ascii=False)
+        )},
+        {"role": "user", "content": json.dumps({
+            "context": context, "current_draft": draft.model_dump(mode="json"),
+            "revision_instruction": instruction,
+        }, ensure_ascii=False)},
+    ])
+    try:
+        return DirectorSpecDraft.model_validate_json(raw)
+    except (ValidationError, ValueError):
+        raise ToolError("导演修改未返回有效公开草稿") from None

@@ -8,8 +8,8 @@ import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
-import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorFieldLabels, directorIsStale, directorNodeLabels, directorStateLabels, directorSummary, draftConfirmationKey, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
-import { CoreApiError, cancelRun, compileComicPrompt, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorDraftFields, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
+import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { CoreRun } from '../types'
 
 const props = defineProps<{ initialRunId?: string }>()
@@ -46,7 +46,7 @@ const error = ref('')
 const pendingText = ref('')
 const previousRunIds = ref<string[]>([])
 const drafts = ref<Record<string, Record<string, string>>>({})
-const confirmedKey = ref('')
+const revisionVersion = ref<number | null>(null)
 const restoredSpec = ref<Record<string, unknown> | null>(null)
 const events = ref<RuntimeEvent[]>([])
 const conversationId = ref('')
@@ -78,15 +78,14 @@ const summary = computed(() => restoredSpec.value ? undefined : active.value?.di
 const spec = computed(() => restoredSpec.value ?? active.value?.director_spec ?? null)
 const node = computed(() => summary.value?.stages.find(item => item.stage === selectedStage.value))
 const hasRunning = computed(() => executions.value.some(item => ['running', 'pending'].includes(item.status) && !item.recovery_required))
-const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', active.value?.run_id ?? '', selectedStage.value))
+const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', selectedStage.value === 'director_assemble' ? `version:${spec.value?.version}` : active.value?.run_id ?? '', selectedStage.value))
 const fields = computed(() => drafts.value[draftKey.value] ?? {})
 const editing = computed(() => draftKey.value in drafts.value)
-const dirty = computed(() => Object.keys(drafts.value).some(key => JSON.parse(key)[1] === active.value?.run_id))
+const dirty = computed(() => Object.keys(drafts.value).length > 0)
 const stale = computed(() => directorIsStale(spec.value, project.value?.creative_brief.version, project.value?.project.director_version, assets.value))
-const confirmationKey = computed(() => draftConfirmationKey(project.value?.project.project_id ?? '', spec.value))
 const confirmable = computed(() => canConfirmDirector(restoredSpec.value ? 'completed' : active.value?.status, spec.value, stale.value, dirty.value) && !busy.value && !hasRunning.value)
-const confirmed = computed(() => confirmable.value && !!confirmationKey.value && confirmedKey.value === confirmationKey.value)
-const editable = computed(() => !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
+const confirmed = computed(() => confirmable.value && spec.value?.user_confirmed === true)
+const editable = computed(() => selectedStage.value === 'director_assemble' ? spec.value?.schema_version === 2 && !stale.value : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const title = computed(() => section.value === 'director' ? directorNodeLabels[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
 const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
@@ -105,17 +104,51 @@ function failureText(failure: unknown): string {
   if (failure instanceof CoreApiError) return `${failure.message}${failure.traceId ? ` · Trace：${failure.traceId}` : ''}`
   return failure instanceof Error ? failure.message : '操作未完成，请查看真实任务状态'
 }
-function rememberConfirmation(): void {
-  if (project.value) localStorage.setItem(`kantoku-director-confirmation:${project.value.project.project_id}`, confirmedKey.value)
+async function confirm(): Promise<void> {
+  if (!confirmable.value || !project.value || !spec.value) return
+  busy.value = true
+  try { restoredSpec.value = await confirmDirectorVersion(project.value.project.project_id, Number(spec.value.version), project.value.project.current_version); await refresh() }
+  catch (failure) { error.value = failureText(failure) }
+  finally { busy.value = false }
 }
-function confirm(): void { if (!confirmable.value) return; confirmedKey.value = confirmationKey.value; rememberConfirmation() }
-function invalidate(): void { confirmedKey.value = ''; rememberConfirmation() }
+function invalidate(): void { revisionVersion.value = null }
 function beginEdit(): void {
-  if (!editable.value || !node.value) return
+  if (!editable.value) return
+  if (selectedStage.value === 'director_assemble') {
+    drafts.value[draftKey.value] ??= directorDraftFields(spec.value)
+    return
+  }
+  if (!node.value) return
   if (!editing.value) drafts.value[draftKey.value] = Object.fromEntries(Object.entries(Object.values(node.value.output)[0] ?? {})
     .filter(([key, value]) => key !== 'hard_constraints' && key in directorFieldLabels && (value == null || typeof value === 'string' || Array.isArray(value)))
     .map(([key, value]) => [key, Array.isArray(value) ? value.join('\n') : String(value ?? '')]))
   invalidate()
+}
+function editFinal(): void { selectedStage.value = 'director_assemble'; section.value = 'director'; beginEdit() }
+function reviseByInstruction(): void {
+  if (!spec.value?.version || stale.value || busy.value || hasRunning.value) return
+  revisionVersion.value = Number(spec.value.version)
+  composer.value?.fill('')
+}
+async function saveFinal(instruction?: string): Promise<void> {
+  if (!project.value || !spec.value || busy.value || hasRunning.value) return
+  const key = draftKey.value
+  busy.value = true; error.value = ''
+  try {
+    restoredSpec.value = await saveDirectorDraft(project.value.project.project_id, {
+      expected_project_version: project.value.project.current_version,
+      expected_director_version: instruction ? revisionVersion.value : spec.value.version,
+      conversation_id: await ensureConversation(),
+      ...(instruction ? { revision_instruction: instruction } : { draft: editableDirectorDraft(spec.value, fields.value) }),
+    })
+    delete drafts.value[key]; revisionVersion.value = null
+    await refresh()
+  } catch (failure) { error.value = failureText(failure) }
+  finally { busy.value = false }
+}
+async function reviewFinal(): Promise<void> {
+  if (!spec.value || dirty.value) return
+  await execute('', { review_current: true, expected_director_version: spec.value.version })
 }
 function updateField(key: string, value: string): void { if (editing.value) drafts.value[draftKey.value]![key] = value }
 async function openReference(id: string): Promise<void> {
@@ -142,7 +175,7 @@ async function refresh(): Promise<void> {
     if (disposed || id !== project.value?.project.project_id) return
     records.forEach(run => { if (run) runs.value[run.id] = run })
     const latestVersion = context?.project.director_version
-    if (!busy.value && !hasRunning.value && !['failed', 'waiting'].includes(active.value?.status ?? '') && latestVersion && !tasks.some(item => item.director_spec?.version === latestVersion) && restoredSpec.value?.version !== latestVersion) {
+    if (!busy.value && !hasRunning.value && latestVersion && !tasks.some(item => item.director_spec?.version === latestVersion) && restoredSpec.value?.version !== latestVersion) {
       const current = await getCurrentDirector(id)
       if (!disposed && id === project.value?.project.project_id) restoredSpec.value = current
     }
@@ -172,6 +205,7 @@ async function execute(text: string, options: Record<string, unknown> = {}, sele
     const conversation = await ensureConversation()
     const result = await createDirectorExecution(project.value.project.project_id, {
       expected_project_version: project.value.project.current_version, creation_mode: selectedMode,
+      creative_operation: 'new',
       conversation_id: conversation,
       ...('previous_run_id' in options || 'resume_run_id' in options ? {} : { task: text || null }), ...options,
     })
@@ -189,6 +223,7 @@ async function execute(text: string, options: Record<string, unknown> = {}, sele
 }
 function sendInput(text: string): void {
   if (!text.trim()) return
+  if (revisionVersion.value !== null) { void saveFinal(text); return }
   if (busy.value || hasRunning.value || cancelling.value || queuedInputs.value.length) {
     queuedInputs.value.push({ id: ++nextInputId, text, mode: mode.value })
     void dispatchQueued()
@@ -292,7 +327,7 @@ function newProject(): void {
   if (busy.value || hasRunning.value || ((Object.keys(drafts.value).length || queuedInputs.value.length) && !window.confirm('放弃未保存的修改和待发送补充并新建作品？'))) return
   queuedInputs.value = []
   pageRequest++; project.value = null; executions.value = []; runs.value = {}; assets.value = []; boards.value = []; shots.value = []; versions.value = []; prompts.value = []
-  selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; conversationId.value = ''; confirmedKey.value = ''; error.value = ''; pendingText.value = ''
+  selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; conversationId.value = ''; revisionVersion.value = null; error.value = ''; pendingText.value = ''
   section.value = 'director'; selectedStage.value = 'director_assemble'; inspectorOpen.value = false; restoreChoice.value = null
   localStorage.removeItem('kantoku-comic-project')
   if (props.initialRunId) emit('newProject')
@@ -326,9 +361,10 @@ onMounted(async () => {
     if (id) {
       project.value = await getComicProject(id); await refresh()
       if (project.value) localStorage.setItem('kantoku-comic-project', id)
-      selectedRun.value = legacy?.workflow === 'comic.director' ? legacy.id : ''
+      // 作品级 Workspace 恢复当前版本；入口 URL 可能仍指向第一轮 Run。
+      selectedRun.value = executions.value.find(item => item.director_spec?.version === project.value?.project.director_version)?.run_id
+        ?? (legacy?.workflow === 'comic.director' ? legacy.id : '')
       mode.value = active.value?.director_execution_summary.mode ?? 'fast'
-      confirmedKey.value = localStorage.getItem(`kantoku-director-confirmation:${id}`) ?? ''
     }
     if (legacy && legacy.workflow !== 'comic.director') section.value = 'assets'
   } catch (failure) { error.value = failureText(failure) }
@@ -363,8 +399,8 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 <template v-if="section === 'director'">
                   <p v-if="restoredSpec" class="pane-note">此方案恢复自历史版本，节点没有重新执行。继续修改可在下方对话中提出新方向；不会沿用其他版本的节点或 Trace。</p>
                   <p v-if="summary?.mode === 'fast' && selectedStage !== 'director_assemble'" class="pane-note">此方案在普通模式执行，后端未公开独立节点结果。切换模式不会伪造节点；可在专业模式发送新需求。</p>
-                  <DirectorNodeView :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="!!node && !!summary?.available_actions.includes('rerun_stage')" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="delete drafts[draftKey]" @save="rerun(true)" @rerun="rerun()" @revise="visitStage('visual_direction')" />
-                  <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '本界面已确认' : '导演草案 · 待确认' }}</strong><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">进入 Prompt</button></div>
+                  <DirectorNodeView :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="!!node && !!summary?.available_actions.includes('rerun_stage')" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="delete drafts[draftKey]" @save="selectedStage === 'director_assemble' ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal" />
+                  <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '方案已确认' : '导演草案 · 待确认' }}</strong><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">重新审核草稿</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">进入 Prompt</button></div>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
                 <template v-else-if="section === 'assets'">
@@ -407,7 +443,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 <AssistantMessageBlock :content="entry.answer || entry.label" :show-mark="false" />
                 <p v-if="entry.execution.status === 'failed'" role="alert">任务失败 · {{ entry.execution.director_execution_summary.error_id ?? '打开详情查看错误' }}</p>
                 <template v-if="!restoredSpec && entry.execution.run_id === active?.run_id">
-                  <div v-if="entry.execution.director_spec" class="draft-actions"><span><Check v-if="confirmed" :size="14" />{{ stale ? '来源已变化' : confirmed ? '本界面已确认' : '待确认的导演草案' }}</span><button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="mode === 'professional' ? visitStage('visual_direction') : composer?.fill('请调整当前导演方案：')">修改方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button quiet sm" :disabled="!confirmed" @click="section = 'prompt'; chatExpanded = false">进入 Prompt</button></div>
+                  <div v-if="entry.execution.director_spec" class="draft-actions"><span><Check v-if="confirmed" :size="14" />{{ stale ? '来源已变化' : confirmed ? '方案已确认' : '待确认的导演草案' }}</span><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale" @click="editFinal">直接编辑</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button quiet sm" :disabled="!confirmed" @click="section = 'prompt'; chatExpanded = false">进入 Prompt</button></div>
                   <button v-if="entry.execution.recovery_required || summary?.available_actions.includes('resume')" class="ui-button sm" :disabled="busy || hasRunning" @click="resume">恢复原导演任务</button>
                 </template>
               </article>
@@ -421,8 +457,11 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <button v-if="queuedInputs.length && error && !busy && !hasRunning" class="ui-button sm" @click="dispatchQueued(true)">继续处理已发送的补充</button>
               <p v-if="error" class="workspace-error" role="alert">{{ error }}</p>
               <p v-if="dirty" class="pane-note">有未保存的节点修改。切换节点会保留草稿；保存并重新审核后才能确认。</p>
-              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>已恢复方案 v{{ restoredSpec.version }} · {{ confirmed ? '本界面已确认' : '待确认' }}</span><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
-              <p v-if="confirmed" class="pane-note">方案已在本浏览器确认；此确认不是后端审批。修改或恢复版本后需重新确认。</p>
+              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>方案 v{{ restoredSpec.version }} · {{ confirmed ? '已确认' : '草稿' }}</span><button class="ui-button sm" :disabled="busy || hasRunning || stale" @click="editFinal">直接编辑</button><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
+              <DirectorNodeView v-if="editing && selectedStage === 'director_assemble' && (mode === 'fast' || chatExpanded)" stage="director_assemble" :spec="spec" :fields="fields" :editing="true" :editable="true" :rerunnable="false" :busy="busy || hasRunning" @field="updateField" @cancel="delete drafts[draftKey]" @save="saveFinal()" />
+              <button v-if="spec && !confirmable && !stale && !dirty" class="ui-button sm" :disabled="busy || hasRunning" @click="reviewFinal">审核当前草稿</button>
+              <p v-if="confirmed" class="pane-note">当前版本已确认并保存到后端。编辑或恢复为新版本后，需要重新审核与确认。</p>
+              <p v-if="revisionVersion !== null" class="review-notice">正在修改当前方案 v{{ revisionVersion }}。下方输入将作为修改指令，不创建新创意。<button class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button></p>
             </div>
             <div class="workspace-composer"><p v-if="legacyOnly" class="pane-note">此历史单镜头任务没有作品级 Project。原审批与恢复仍在任务记录中；点击“新作品”进入作品级创作。</p><div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可以继续输入补充，按顺序处理</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div><MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" /><small>发送会生成或更新导演方案；不会自动进入生图。任务内补充暂存在当前页面，刷新前请保留；已执行对话由真实任务记录恢复。</small></div>
           </section>

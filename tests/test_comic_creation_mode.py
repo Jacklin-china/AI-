@@ -332,7 +332,7 @@ def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restar
     assert result["director_spec_status"] == "draft" and not result["ready_for_prompt"]
     draft = result["director_spec"]
     assert draft["schema_version"] == 2 and draft["draft"]
-    assert "spec_id" not in draft and "version" not in draft
+    assert draft["spec_id"] and draft["version"] == 1
     expected = DirectorSpecDraft.model_validate(_parts()[SKILLS[4]]["director_spec"])
     assert draft["creative_decision"] == expected.creative_decision.model_dump()
     assert draft["director_plan"] == expected.director_plan.model_dump()
@@ -351,7 +351,7 @@ def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restar
         assert summary["error_id"].startswith("ERR-")
         assert summary["failure"]["output_before_failure"]
     assert bool(summary["stages"]) == (mode == "professional")
-    assert app.comic_projects.get(project_id).project.director_version is None
+    assert app.comic_projects.get(project_id).project.director_version == 1
     with pytest.raises(ToolError):
         require_approved_director(DirectorSpecDraft.model_validate({
             key: value for key, value in draft.items() if key in DirectorSpecDraft.model_fields
@@ -364,7 +364,7 @@ def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restar
     monkeypatch.setattr(app, "_comic_director_model", original)
     model.clear()
     recovered = _execute(app, project_id, mode, resume_run_id=result["run_id"])
-    assert recovered["status"] == "completed" and recovered["ready_for_prompt"]
+    assert recovered["status"] == "completed" and not recovered["ready_for_prompt"]
     assert model == [SKILLS[3]]
 
 
@@ -566,6 +566,9 @@ def test_mode_director_enters_existing_prompt_compiler_without_image_call(
     monkeypatch.setattr(web_studio.get_settings().image, "model", "qwen-image-3.0")
     project_id = _project(app.comic_projects)
     director = _execute(app, project_id, mode)["director_spec"]
+    app.confirm_comic_director(project_id, {
+        "version": director["version"], "expected_project_version": 2,
+    })
     storyboard = app.create_comic_storyboard(project_id, {
         "expected_project_version": 2, "draft": {"title": "雨夜迎战"},
     })["storyboard"]

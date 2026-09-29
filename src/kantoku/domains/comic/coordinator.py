@@ -191,6 +191,7 @@ class DirectorCoordinatorRequest(BaseModel):
     worker_instance_id: str | None = Field(default=None, max_length=100)
     stage_edits: dict[str, Any] = Field(default_factory=dict, max_length=1)
     creative_context: dict[str, Any] = Field(default_factory=dict)
+    review_draft: DirectorSpec | None = None
 
     @model_validator(mode="after")
     def validate_scope(self) -> DirectorCoordinatorRequest:
@@ -207,6 +208,13 @@ class DirectorCoordinatorRequest(BaseModel):
                 raise ValueError("镜头必须属于传入的分镜")
         if self.prior_spec is not None and self.prior_spec.project_id != project_id:
             raise ValueError("导演方案必须属于当前作品")
+        if self.review_draft is not None and (
+            self.review_draft.project_id != project_id
+            or self.review_draft.creative_brief_version != self.snapshot.creative_brief.version
+            or self.review_draft.version != self.snapshot.project.director_version
+            or self.previous_run_id or self.stage_edits
+        ):
+            raise ValueError("只能重新审核当前 Brief 下的当前导演草稿")
         if (self.rerun_from is None) != (self.previous_run_id is None):
             raise ValueError("重新执行阶段必须指定来源 Run 和起始阶段")
         if self.stage_edits:
@@ -260,6 +268,7 @@ class ComicDirectorCoordinator:
         self.registry = registry
         self.runtime_store = runtime_store
         self.project_store = project_store
+        self.project_store.runtime_store = runtime_store
         self.stage_executor = stage_executor
         self.critic_engine = critic_engine or DirectorCriticEngine()
 
@@ -438,6 +447,19 @@ class ComicDirectorCoordinator:
                     }, context_payload, request, state, outputs, stages,
                 )
                 if state.get("needs_review"):
+                    candidate = DirectorSpecDraft.model_validate(state["director_candidate"])
+                    hard = request.snapshot.creative_brief.hard_constraints
+                    # 违反不可变输入的候选仍保留 Run；不能提升为当前作品的合法版本。
+                    if (candidate.creative_decision.hard_constraints == hard
+                            and all(item in candidate.constraints for item in hard)):
+                        saved_draft = self.project_store.save_director(
+                            project.project_id, candidate,
+                            expected_project_version=project.current_version, source="model",
+                        )
+                        state.update(director_spec_version=saved_draft.version,
+                                     director_spec_id=saved_draft.spec_id,
+                                     project_version_after=self.project_store.get(
+                                         project.project_id).project.current_version)
                     self.runtime_store.update_run(
                         run.id, status=ExecutionStatus.WAITING, state=state,
                         current_node="director_critic",
@@ -767,6 +789,19 @@ class ComicDirectorCoordinator:
     def _reused_outputs(
         self, request: DirectorCoordinatorRequest, input_versions: Mapping[str, int],
     ) -> dict[str, dict[str, Any]]:
+        if request.review_draft is not None:
+            draft = request.review_draft
+            if (draft.schema_version != 2 or draft.asset_versions != {
+                key: value for key, value in input_versions.items() if key.startswith("asset:")
+            } or draft.storyboard_version != input_versions.get("storyboard")
+                    or draft.shot_version != input_versions.get("shot")):
+                raise ToolError("待审核草稿的资产或镜头版本已变化")
+            return {
+                "comic.creative_understanding": {
+                    "creative_decision": draft.creative_decision.model_dump()},
+                "comic.visual_direction": {"director_plan": draft.director_plan.model_dump()},
+                "comic.cinematography": {"cinematography": draft.cinematography.model_dump()},
+            }
         if request.previous_run_id is None or request.rerun_from is None:
             return {}
         previous = self.runtime_store.get_run(request.previous_run_id)

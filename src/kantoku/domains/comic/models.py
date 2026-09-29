@@ -329,9 +329,22 @@ class DirectorSpecRequest(BaseModel):
     ] | None = None
     stage_edits: dict[str, Any] = Field(default_factory=dict, max_length=1)
     resume_run_id: str | None = Field(default=None, max_length=100)
+    creative_operation: Literal["auto", "new"] = "auto"
+    revision_instruction: str | None = Field(default=None, min_length=1, max_length=1000)
+    expected_director_version: int | None = Field(default=None, ge=1)
+    review_current: bool = False
 
     @model_validator(mode="after")
     def validate_creation_mode(self) -> DirectorSpecRequest:
+        if self.revision_instruction or self.review_current:
+            if self.expected_director_version is None:
+                raise ValueError("修改或审核草稿必须绑定导演版本")
+            if self.task or self.previous_run_id or self.resume_run_id or self.stage_edits:
+                raise ValueError("当前草稿操作不能混入新创意或历史任务")
+        if self.revision_instruction and (self.draft or self.creation_mode):
+            raise ValueError("指令修改先保存草稿，不绕过审核")
+        if self.review_current and (self.creation_mode is None or self.draft):
+            raise ValueError("审核当前草稿需要创作模式且不能传入审核结果")
         if self.creation_mode is None and (
             self.previous_run_id or self.rerun_from or self.stage_edits or self.resume_run_id
         ):

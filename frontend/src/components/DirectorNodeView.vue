@@ -23,11 +23,11 @@ function display(value: unknown): string { return Array.isArray(value) ? value.j
     </div>
     <p v-if="node?.output_summary">{{ node.output_summary }}</p>
     <template v-if="editing">
-      <label v-for="(value, key) in fields" :key="key" class="node-edit-field">{{ directorFieldLabels[key] ?? key }}
+      <label v-for="(value, key) in fields" :key="key" class="node-edit-field">{{ directorFieldLabels[String(key).split('.').at(-1)!] ?? key }}
         <textarea :value="value" rows="3" @input="emit('field', String(key), ($event.target as HTMLTextAreaElement).value)" />
       </label>
-      <p class="pane-note">硬约束不可在这里修改。保存会追加方案版本，并重新执行后续审核。</p>
-      <button class="ui-button primary sm" :disabled="busy" @click="emit('save')">保存并重新审核</button>
+      <p class="pane-note">硬约束不可在这里修改。保存追加新版本，历史保留；审核通过并确认后才能继续。</p>
+      <button class="ui-button primary sm" :disabled="busy" @click="emit('save')">{{ stage === 'director_assemble' ? '保存草稿版本' : '保存并重新审核' }}</button>
       <button class="ui-button quiet sm" :disabled="busy" @click="emit('cancel')">放弃本节点修改</button>
     </template>
     <template v-else>

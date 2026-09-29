@@ -14,7 +14,9 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from kantoku.config import ToolError
-from kantoku.core.runtime.models import utc_now
+from kantoku.core.conversations import InteractionMode
+from kantoku.core.runtime.models import ApprovalDecision, ExecutionStatus, utc_now
+from kantoku.core.runtime.store import RuntimeStore
 
 from .models import (
     ComicAsset,
@@ -40,6 +42,7 @@ class ComicProjectStore:
 
     def __init__(self, path: Path) -> None:
         self.path = path
+        self.runtime_store: RuntimeStore | None = None
         self.path.parent.mkdir(parents=True, exist_ok=True)
         self.migrate()
 
@@ -492,6 +495,66 @@ class ComicProjectStore:
             source="restored", restored_from_version=version,
         )
 
+    def director_confirmed(self, spec: DirectorSpec) -> bool:
+        """确认只对应一个不可变修订；不继承旧版本的审批。"""
+        if spec.schema_version == 1:
+            return True  # 旧生产契约保持兼容；新 v2 一律显式确认。
+        if self.runtime_store is None:
+            return False
+        return any(
+            approval.decision is ApprovalDecision.APPROVE
+            and approval.request == self._confirmation_request(spec)
+            for approval in self.runtime_store.list_approvals()
+        )
+
+    @staticmethod
+    def _confirmation_request(spec: DirectorSpec) -> dict:
+        return {"kind": "comic.director.confirmation", "project_id": spec.project_id,
+                "spec_id": spec.spec_id, "version": spec.version,
+                "brief_version": spec.creative_brief_version}
+
+    def require_confirmed_director(self, spec: DirectorSpec) -> None:
+        from .critic import require_approved_director
+
+        require_approved_director(spec)
+        if not self.director_confirmed(spec):
+            raise ToolError("请先确认当前导演方案，才能进入下一步")
+
+    def confirm_director(self, project_id: str, *, version: int,
+                         expected_project_version: int) -> DirectorSpec:
+        from .critic import require_approved_director
+
+        # 与保存/分叉共用写锁，不能在确认过程中将旧方案标为当前。
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            snapshot = self._snapshot(connection, project_id, expected_project_version)
+            current = connection.execute(
+                "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,),
+            ).fetchone()
+            if current is None or current[0] != expected_project_version:
+                raise ToolError("作品已更新，请刷新后确认")
+            spec = self.get_director(project_id)
+            if (spec.version != version
+                    or spec.creative_brief_version != snapshot.creative_brief.version):
+                raise ToolError("只能确认当前 Brief 下的当前导演版本")
+            require_approved_director(spec)
+            if self.runtime_store is None:
+                raise ToolError("导演确认尚未绑定现有 Runtime")
+            # 审批库可能与作品库是同一 SQLite，先持有写锁验证，再提交后写审批。
+        if not self.director_confirmed(spec):
+            run = self.runtime_store.create_run(
+                "comic", "comic.director.confirmation", {"project_id": project_id,
+                "director_spec_version": version}, "director_confirmation",
+                interaction_mode=InteractionMode.GUIDED,
+            )
+            approval = self.runtime_store.create_approval(
+                run.id, "director_confirmation", self._confirmation_request(spec),
+            )
+            self.runtime_store.decide_approval(approval.id, ApprovalDecision.APPROVE)
+            self.runtime_store.update_run(run.id, status=ExecutionStatus.COMPLETED,
+                                          state=run.state, current_node="director_confirmation")
+        return spec
+
 
 class ComicContextBuilder:
     """只组合调用方确实选中的导演方案与资产；不读聊天全文。"""
@@ -548,9 +611,7 @@ class ComicContextBuilder:
         project = snapshot.project
         brief = snapshot.creative_brief
         project_context = {"project_id": project.project_id}
-        if brief.parent_brief_version is None:
-            project_context.update(title=project.title, description=project.description)
-        # 分叉后旧作品标题仅是导航元数据，不能重新成为新创意的故事事实。
+        # 所有入口均排除导航标题/描述；旧标题不能成为当前故事事实。
         stable_context = {
             "project": project_context,
             "creative_brief": {

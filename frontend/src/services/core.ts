@@ -91,6 +91,12 @@ export function getCurrentDirector(id: string): Promise<Record<string, unknown> 
 export function restoreDirectorVersion(id: string, version: number, projectVersion: number): Promise<Record<string, unknown>> {
   return corePost(`/api/comic/projects/${encodeURIComponent(id)}/director-spec/restore`, { version, expected_project_version: projectVersion })
 }
+export function saveDirectorDraft(id: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/projects/${encodeURIComponent(id)}/director-spec`, body)
+}
+export function confirmDirectorVersion(id: string, version: number, projectVersion: number): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/projects/${encodeURIComponent(id)}/director-spec/confirm`, { version, expected_project_version: projectVersion })
+}
 export async function getComicPromptVersions(id: string): Promise<Record<string, unknown>[]> {
   return (await coreGet<{ versions: Record<string, unknown>[] }>(`/api/comic/shots/${encodeURIComponent(id)}/prompt/versions`, `comic-prompt-versions:${id}`))?.versions ?? []
 }

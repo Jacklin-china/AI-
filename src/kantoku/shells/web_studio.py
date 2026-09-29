@@ -96,7 +96,11 @@ from kantoku.domains.comic.coordinator import (
     director_execution_summary,
 )
 from kantoku.domains.comic.critic import DirectorCriticEngine
-from kantoku.domains.comic.director import execute_director_stage, plan_director_spec
+from kantoku.domains.comic.director import (
+    execute_director_stage,
+    plan_director_spec,
+    revise_director_spec,
+)
 from kantoku.domains.comic.models import (
     ComicAsset,
     ComicAssetCreateRequest,
@@ -1830,6 +1834,24 @@ class StudioApplication:
         brief = snapshot.creative_brief
         reason = "same request"
         fork_created = False
+        if (request.creative_operation == "new" and request.task is not None
+                and request.task.strip() != brief.original_request
+                and not (request.resume_run_id or request.previous_run_id)):
+            if request.storyboard_id or request.shot_id:
+                raise ToolError("新创意不能继承旧分镜或镜头")
+            snapshot = self.comic_projects.fork_brief(
+                snapshot.project.project_id, CreativeBriefFork(
+                    original_request=request.task.strip(),
+                    expected_version=snapshot.project.current_version,
+                    parent_brief_id=brief.brief_id, parent_brief_version=brief.version,
+                    reason="explicit new creative direction",
+                ),
+            )
+            selected = snapshot.creative_brief
+            return snapshot, {"brief_used": f"{selected.brief_id}@v{selected.version}",
+                "input_brief_id": selected.brief_id, "input_brief_version": selected.version,
+                "previous_brief_detected": True, "fork_created": True,
+                "reason": "explicit new creative direction"}
         if request.task is not None and not (request.resume_run_id or request.previous_run_id):
             with request_trace(trace_id), logger.contextualize(
                 component="comic.context_boundary", project_id=snapshot.project.project_id,
@@ -1908,7 +1930,7 @@ class StudioApplication:
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
         snapshot, creative_context = self._resolve_comic_creative_context(
             snapshot, request, trace_id,
-        ) if request.draft is None else (snapshot, {})
+        ) if request.draft is None and request.revision_instruction is None else (snapshot, {})
         state: dict[str, Any] = {
             "project_id": project_id, "task_id": task_id, "trace_id": trace_id,
             "conversation_id": request.conversation_id,
@@ -1922,6 +1944,8 @@ class StudioApplication:
             "input_brief_id": snapshot.creative_brief.brief_id,
             "input_brief_version": snapshot.creative_brief.version,
             "creative_context": creative_context,
+            "task": request.revision_instruction or request.task
+            or ("保存导演草稿修改" if request.draft else snapshot.creative_brief.original_request),
         }
         run = self.runtime_store.create_run(
             "comic", "comic.director-spec", state, "director_spec",
@@ -1953,11 +1977,11 @@ class StudioApplication:
                 "task received task_type=director_spec brief_version={} created_at={} "
                 "user_input={}", snapshot.creative_brief.version,
                 run.started_at.isoformat(),
-                redact_secrets(request.task or snapshot.creative_brief.original_request)[:1000],
+                redact_secrets(state["task"])[:1000],
             )
             try:
                 step("planning", "brief_loaded")
-                if request.draft is None:
+                if request.draft is None and request.revision_instruction is None:
                     assets = self._select_comic_director_assets(
                         snapshot, request.task, request.asset_ids,
                     )
@@ -1979,7 +2003,39 @@ class StudioApplication:
                     )
                     source = "model"
                 else:
-                    draft = DirectorSpecDraft.model_validate(request.draft)
+                    current = self.comic_projects.get_director(project_id) \
+                        if snapshot.project.director_id else None
+                    if request.expected_director_version is not None and (
+                        current is None or current.version != request.expected_director_version
+                        or current.creative_brief_version != snapshot.creative_brief.version
+                    ):
+                        raise ToolError("导演草稿已更新，请刷新后修改")
+                    if request.revision_instruction is not None:
+                        bound = self.comic_assets.director_assets(current)
+                        draft = revise_director_spec(
+                            snapshot, DirectorSpecDraft.model_validate(current.model_dump(
+                                include=set(DirectorSpecDraft.model_fields))),
+                            request.revision_instruction, assets=bound,
+                            model_call=self._comic_director_model,
+                        )
+                    else:
+                        draft = DirectorSpecDraft.model_validate(request.draft)
+                    if current and current.schema_version == 2:
+                        state.update(self._comic_director_bindings(project_id, current))
+                        state.update(input_director_version=current.version,
+                                     input_director_id=current.spec_id,
+                                     input_versions={
+                                         "creative_brief": snapshot.creative_brief.version,
+                                         **current.asset_versions})
+                        for name in ("constraints", "asset_versions", "storyboard_version",
+                                     "shot_version"):
+                            if getattr(draft, name) != getattr(current, name):
+                                raise ToolError("草稿编辑不能修改硬约束或绑定资产/镜头版本")
+                        if (draft.schema_version != 2 or draft.creative_decision.hard_constraints
+                                != current.creative_decision.hard_constraints):
+                            raise ToolError("草稿编辑不能修改用户硬约束")
+                    # 客户端或修改模型的 pass 不是真实审核；编辑保存后必须重新审核。
+                    draft = draft.model_copy(update={"critic_result": None})
                     source = "manual"
                 step("checking", "director_draft_ready")
                 spec = self.comic_projects.save_director(
@@ -1989,6 +2045,7 @@ class StudioApplication:
                 state.update(
                     task_status="completed", last_completed_step="director_spec_saved",
                     director_spec_id=spec.spec_id, director_spec_version=spec.version,
+                    project_version_after=self.comic_projects.get(project_id).project.current_version,
                 )
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.COMPLETED, state=state,
@@ -2003,7 +2060,7 @@ class StudioApplication:
                     "decision_summary={}", source, spec.spec_id, spec.version,
                     spec.creative_brief_version, redact_secrets(spec.visual_direction)[:300],
                 )
-                return spec.model_dump(mode="json")
+                return self._comic_director_spec_payload(spec)
             except Exception as error:
                 failure = public_error(
                     error, component="comic.director", project_id=project_id,
@@ -2058,6 +2115,9 @@ class StudioApplication:
              if key.startswith("asset:")] if previous else []
         )
         assets = self._select_comic_director_assets(snapshot, task, asset_ids)
+        if request.creative_operation == "new" and not source_id and not request.review_current:
+            # 新任务只绑定本轮显式选择，不能从旧作品隐式带入 StyleBible。
+            assets = [asset for asset in assets if asset.asset_id in asset_ids]
         storyboard_id = request.storyboard_id if "storyboard_id" in request.model_fields_set else (
             previous.state.get("storyboard_id") if previous else None
         )
@@ -2095,6 +2155,15 @@ class StudioApplication:
                               "director_critic")
         prior_spec = self.comic_projects.get_director(project_id) \
             if snapshot.project.director_id else None
+        if request.review_current:
+            if prior_spec is None or prior_spec.version != request.expected_director_version:
+                raise ToolError("只能审核当前导演草稿")
+            assets = self.comic_assets.director_assets(prior_spec)
+            bindings = self._comic_director_bindings(project_id, prior_spec)
+            if bindings.get("storyboard_id"):
+                storyboard = self.comic_storyboards.get(bindings["storyboard_id"])
+            if bindings.get("shot_id"):
+                shot = self.comic_storyboards.get_shot(bindings["shot_id"])
         result = self.comic_director.execute(DirectorCoordinatorRequest(
             snapshot=snapshot, assets=assets, task=task,
             execution_mode=request.creation_mode, storyboard=storyboard, shot=shot,
@@ -2102,6 +2171,7 @@ class StudioApplication:
             stage_edits=request.stage_edits, conversation_id=request.conversation_id,
             worker_instance_id=self._instance_id,
             trace_id=trace_id, creative_context=creative_context,
+            review_draft=prior_spec if request.review_current else None,
         ))
         return self._comic_director_result(self.runtime_store.get_run(result.run_id))
 
@@ -2128,12 +2198,24 @@ class StudioApplication:
                     }
                 )
                 spec_status = "draft"
+                if run.state.get("project_version_after"):
+                    spec = self.comic_projects.get_director(
+                        run.state["project_id"], project_version=run.state["project_version_after"],
+                    ).model_dump(mode="json")
+                    spec.update(draft=True, source_run_id=run.id)
+        confirmed = False
+        if spec is not None and "version" in spec:
+            saved = self.comic_projects.get_director(
+                run.state["project_id"], project_version=run.state["project_version_after"],
+            )
+            confirmed = self.comic_projects.director_confirmed(saved)
+            spec["user_confirmed"] = confirmed
         return {
             "run_id": run.id,
             "status": run.status.value,
             "director_spec": spec,
             "director_spec_status": spec_status,
-            "ready_for_prompt": spec_status == "reviewed",
+            "ready_for_prompt": spec_status == "reviewed" and confirmed,
             "director_execution_summary": director_execution_summary(run),
             "recovery_required": run.status is ExecutionStatus.RUNNING
             and run.state.get("worker_instance_id") != self._instance_id,
@@ -2151,6 +2233,22 @@ class StudioApplication:
                 continue
             payload = self._comic_director_result(run) if run.workflow == "comic.director" \
                 else self._run_payload(run.id)
+            if (run.workflow == "comic.director-spec"
+                    and run.state.get("project_version_after")):
+                spec = self.comic_projects.get_director(
+                    project_id, project_version=run.state["project_version_after"],
+                )
+                if spec.schema_version == 2:
+                    payload = {
+                        "run_id": run.id, "status": run.status.value,
+                        "director_spec": self._comic_director_spec_payload(spec),
+                        "director_execution_summary": {
+                            "mode": "fast", "current_stage": "director_assemble",
+                            "status_label": "草稿版本已保存，等待审核和确认",
+                            "available_actions": ["view", "edit_draft", "review"],
+                            "stages": [], "error_id": run.state.get("error_id"),
+                        },
+                    }
             payload["recovery_required"] = (
                 run.status is ExecutionStatus.RUNNING
                 and run.state.get("worker_instance_id") != self._instance_id
@@ -2268,6 +2366,8 @@ class StudioApplication:
             if snapshot.project.current_version != request.expected_project_version:
                 raise ToolError("作品已由其他操作更新，请刷新后重试")
             director = self.comic_projects.get_director(project_id)
+            self.comic_projects.require_confirmed_director(director)
+            self.comic_assets.director_assets(director)
             if request.generate:
                 assets = self.comic_assets.select_relevant(
                     project_id, task=request.task,
@@ -2508,7 +2608,44 @@ class StudioApplication:
         )
 
     def get_comic_director(self, project_id: str) -> dict[str, Any]:
-        return self.comic_projects.get_director(project_id).model_dump(mode="json")
+        return self._comic_director_spec_payload(self.comic_projects.get_director(project_id))
+
+    def _comic_director_spec_payload(self, spec) -> dict[str, Any]:
+        return {**spec.model_dump(mode="json"),
+                "user_confirmed": self.comic_projects.director_confirmed(spec)}
+
+    def _comic_director_bindings(self, project_id: str, spec) -> dict[str, Any]:
+        """只定位该修订的来源身份；不得从最近失败任务猜测镜头或故事。"""
+        if spec.storyboard_version is None and spec.shot_version is None:
+            return {}
+        for run in self.runtime_store.list_runs(limit=100000, domain="comic"):
+            if (run.state.get("project_id") == project_id
+                    and run.state.get("director_spec_id") == spec.spec_id
+                    and run.state.get("director_spec_version") == spec.version):
+                return {key: run.state.get(key) for key in ("storyboard_id", "shot_id")}
+        if spec.restored_from_version:
+            historical = next(item for item in self.comic_projects.director_versions(project_id)
+                              if item.version == spec.restored_from_version)
+            return self._comic_director_bindings(project_id, historical)
+        raise ToolError("该导演版本缺少镜头身份绑定，请重新生成，不自动继承历史任务")
+
+    def confirm_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = DirectorSpecRestore.model_validate(data)
+        spec = self.comic_projects.get_director(project_id)
+        self.comic_assets.director_assets(spec)
+        bindings = self._comic_director_bindings(project_id, spec)
+        if (spec.storyboard_version is not None and (
+                not bindings.get("storyboard_id") or self.comic_storyboards.get(
+                    bindings["storyboard_id"]).version != spec.storyboard_version)):
+            raise ToolError("导演分镜版本已变化，请先更新方案")
+        if (spec.shot_version is not None and (
+                not bindings.get("shot_id") or self.comic_storyboards.get_shot(
+                    bindings["shot_id"]).version != spec.shot_version)):
+            raise ToolError("导演镜头版本已变化，请先更新方案")
+        return self._comic_director_spec_payload(self.comic_projects.confirm_director(
+            project_id, version=request.version,
+            expected_project_version=request.expected_project_version,
+        ))
 
     def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:
         return {"versions": [
@@ -2522,7 +2659,7 @@ class StudioApplication:
             project_id, version=request.version,
             expected_project_version=request.expected_project_version,
         )
-        return spec.model_dump(mode="json")
+        return self._comic_director_spec_payload(spec)
 
     def _run_payload(self, run_id: str) -> dict[str, Any]:
         run = self.runtime_store.get_run(run_id)
@@ -3162,6 +3299,9 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
                         and comic_parts[3:] == ["director-spec", "restore"]:
                     self.json_reply(201, app.restore_comic_director(comic_parts[2], data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
+                        and comic_parts[3:] == ["director-spec", "confirm"]:
+                    self.json_reply(200, app.confirm_comic_director(comic_parts[2], data))
                 elif request_path == "/api/runs":
                     self.json_reply(201, app.create_core_run(data))
                 elif request_path == "/api/conversations":

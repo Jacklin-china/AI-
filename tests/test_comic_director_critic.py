@@ -487,8 +487,10 @@ def test_major_review_waits_in_existing_run_without_saving_a_spec(tmp_path: Path
     assert "director_critic_completed" in names
     assert "director_review_blocked" in names
     assert "director_spec_created" not in names
-    with pytest.raises(ToolError, match="尚无导演方案"):
-        projects.get_director(project_id)
+    saved = projects.get_director(project_id)
+    assert saved.version == 1 and saved.critic_result.verdict == "needs_revision"
+    with pytest.raises(ToolError):
+        projects.require_confirmed_director(saved)
 
 
 def test_compiler_rejects_unreviewed_or_changed_v2_before_model_call(tmp_path: Path) -> None:
@@ -596,7 +598,7 @@ def test_review_failure_preserves_real_draft_without_approving_it(tmp_path: Path
     assert "director_critic_completed" not in names
     with pytest.raises(ToolError):
         require_approved_director(result.director_draft)
-    assert projects.get(project_id).project.director_version is None
+    assert projects.get(project_id).project.director_version == 1
 
 
 @pytest.mark.parametrize("patch", [
