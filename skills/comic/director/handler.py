@@ -11,6 +11,7 @@ from collections.abc import Mapping
 from typing import Any, TypeVar
 
 from kantoku.config import ToolError
+from kantoku.domains.comic.cinematography import parse_cinematography
 from kantoku.domains.comic.models import (
     CinematographyPlan,
     CreativeDecision,
@@ -49,7 +50,20 @@ def execute_visual_direction(
 def execute_cinematography(
     inputs: Mapping[str, Any], _context: Mapping[str, Any]
 ) -> Mapping[str, Any]:
-    return _contract_output(inputs, "cinematography", CinematographyPlan)
+    raw = inputs.get("_contract_output")
+    if not isinstance(raw, Mapping):
+        raise ToolError("摄影 Skill 需要公开决策对象")
+    value = raw.get("cinematography")
+    if isinstance(value, CinematographyPlan):
+        plan = value
+    else:
+        plan, _diagnostics = parse_cinematography(raw)
+    return {
+        "cinematography": plan.model_dump(),
+        "public_decision": {"summary": plan.public_decision} if plan.public_decision else {},
+        "structured_plan": plan.model_dump(exclude={"public_decision", "creative_reason"}),
+        "creative_reason": plan.creative_reason,
+    }
 
 
 def execute_director_critic(

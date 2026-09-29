@@ -28,6 +28,7 @@ from kantoku.core.runtime.models import ExecutionStatus, RuntimeEventType
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillRegistry
 
+from .cinematography import parse_cinematography
 from .critic import DirectorCriticEngine, require_approved_director
 from .models import (
     CinematographyPlan,
@@ -154,6 +155,7 @@ def director_execution_summary(run: Any) -> dict[str, Any]:
                             value.get("public_summary")
                             or value.get("intent_summary")
                             or value.get("visual_strategy")
+                            or value.get("public_decision")
                             or value.get("lighting")
                             or value.get("visual_direction")
                             for value in public_output.values()
@@ -721,8 +723,35 @@ class ComicDirectorCoordinator:
                 }[node_id]
                 raw_output = {output_key: request.stage_edits[node_id]}
             else:
-                raw_output = self.stage_executor(skill_id, inputs, stage_context)
+                try:
+                    raw_output = self.stage_executor(skill_id, inputs, stage_context)
+                except _DirectorCancelled:
+                    raise
+                except Exception as error:
+                    if skill_id != "comic.cinematography":
+                        raise
+                    self._check_cancelled(run_id)
+                    failure = public_error(
+                        error, trace_id=trace_id, project_id=request.snapshot.project.project_id,
+                        run_id=run_id, skill_id=skill_id, component="comic.cinematography",
+                    )
+                    raw_output = {"cinematography": CinematographyPlan(
+                        status="missing").model_dump(), "parse_diagnostics": {
+                            "failure": failure, "errors": [type(error).__name__],
+                            "raw_output": "", "missing_fields": [],
+                        }}
             self._check_cancelled(run_id)
+            if skill_id == "comic.cinematography":
+                diagnostics = raw_output.get("parse_diagnostics", {}) \
+                    if isinstance(raw_output, Mapping) else {}
+                payload = {key: value for key, value in raw_output.items()
+                           if key != "parse_diagnostics"} \
+                    if isinstance(raw_output, Mapping) else raw_output
+                camera, normalized = parse_cinematography(payload)
+                diagnostics = {**normalized, **diagnostics,
+                               "missing_fields": camera.missing_fields, "status": camera.status}
+                raw_output = {"cinematography": camera.model_dump()}
+                self._camera_diagnostics(run_id, diagnostics, request, state)
             if not isinstance(raw_output, Mapping):
                 raise ToolError("导演 Skill 未返回结构化对象", detail=skill_id)
             validated = self.registry.execute(
@@ -738,17 +767,19 @@ class ComicDirectorCoordinator:
         )
         logger.info("Director Debug Result skill_id={} output={}", skill_id, debug["output"])
         state["stage_outputs"][skill_id] = validated
-        review_failed = skill_id in state["stage_failures"]
-        state["stage_statuses"][skill_id] = (
-            "failed"
-            if review_failed
-            else (
+        camera_incomplete = skill_id == "comic.cinematography" and (
+            validated["cinematography"]["status"] != "complete")
+        review_failed = skill_id in state["stage_failures"] and not camera_incomplete
+        if camera_incomplete:
+            state["stage_statuses"][skill_id] = "needs_revision"
+        elif review_failed:
+            state["stage_statuses"][skill_id] = "failed"
+        else:
+            state["stage_statuses"][skill_id] = (
                 "needs_revision"
                 if skill_id == "comic.director_critic" and state.get("needs_review")
-                else "completed"
-            )
-        )
-        if not review_failed:
+                else "completed")
+        if not review_failed and not camera_incomplete:
             state["completed_stages"].append(skill_id)
             state["last_completed_step"] = node_id
         state["task_status"] = "planning" if not state.get("needs_review") else "needs_review"
@@ -762,7 +793,7 @@ class ComicDirectorCoordinator:
         self.runtime_store.update_run(
             run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
         )
-        if skill_id != "comic.director_critic":
+        if skill_id != "comic.director_critic" and not camera_incomplete:
             self._event(
                 run_id, RuntimeEventType.NODE_COMPLETED, f"{event_name}_completed",
                 trace_id=trace_id, project_id=request.snapshot.project.project_id,
@@ -772,7 +803,8 @@ class ComicDirectorCoordinator:
         self._event(
             run_id,
             RuntimeEventType.NODE_PROGRESS,
-            "director_stage_failed" if review_failed else "director_stage_completed",
+            "node_warning" if camera_incomplete else (
+                "director_stage_failed" if review_failed else "director_stage_completed"),
             trace_id=trace_id,
             project_id=request.snapshot.project.project_id,
             mode=request.execution_mode,
@@ -781,6 +813,47 @@ class ComicDirectorCoordinator:
             if request.execution_mode == "professional"
             else FAST_LABELS[node_id],
         )
+
+    def _camera_diagnostics(
+        self, run_id: str, diagnostics: dict[str, Any], request: DirectorCoordinatorRequest,
+        state: dict[str, Any],
+    ) -> None:
+        """摄影缺失可保留草稿，但不能成为已完成检查点或绕过审核。"""
+        skill_id = "comic.cinematography"
+        metadata = {"skill_id": skill_id, "trace_id": state["trace_id"],
+                    "project_id": request.snapshot.project.project_id,
+                    "input_versions": state["input_versions"], **diagnostics}
+        state["director_debug"]["stages"][skill_id]["parsing"] = metadata
+        if diagnostics.get("errors") or diagnostics.get("failure"):
+            self._event(run_id, RuntimeEventType.NODE_PROGRESS,
+                        "schema_validation_failed", **metadata)
+        if diagnostics["status"] != "complete":
+            failure = diagnostics.get("failure")
+            if not failure:
+                try:
+                    raise ToolError("摄影方案不完整，已保留公开输出，需要修订")
+                except ToolError as error:
+                    failure = public_error(
+                        error, trace_id=state["trace_id"], run_id=run_id, skill_id=skill_id,
+                        project_id=request.snapshot.project.project_id,
+                    )
+            state["stage_failures"][skill_id] = {
+                **failure, "stage_name": "cinematography", "status": "needs_revision",
+                "input_version": state["input_versions"],
+                "output_before_failure": dict(state["stage_outputs"]),
+                "missing_fields": diagnostics["missing_fields"],
+                "raw_output": diagnostics.get("raw_output", ""),
+                "exception": {"type": "CinematographyOutputError",
+                              "message": failure["safe_message"]},
+            }
+            state["error_id"] = failure["error_id"]
+            metadata["error_id"] = failure["error_id"]
+            self._event(run_id, RuntimeEventType.NODE_PROGRESS, "node_warning", **metadata)
+        self._event(run_id, RuntimeEventType.NODE_PROGRESS, "stage_output_saved", **metadata)
+        logger.info("Cinematography parse status={} missing_fields={} trace_id={}",
+                    diagnostics["status"], diagnostics["missing_fields"], state["trace_id"])
+        self.runtime_store.update_run(run_id, status=ExecutionStatus.RUNNING,
+                                      state=state, current_node="cinematography")
 
     def _check_cancelled(self, run_id: str) -> None:
         if self.runtime_store.get_run(run_id).status is ExecutionStatus.CANCELLED:
@@ -924,11 +997,12 @@ class ComicDirectorCoordinator:
             "visual_direction": plan["visual_focus"],
             "storytelling_goal": decision["intent_summary"],
             "camera_language": (
-                f"{camera['shot_size']}；{camera['camera_angle']}；"
-                f"{camera['spatial_feel']}"
+                camera.get("camera_language") or "；".join(
+                    camera[key] for key in ("shot_size", "camera_angle", "spatial_feel")
+                    if camera.get(key)) or camera.get("public_decision") or "摄影方案待修订"
             ),
             "composition": plan["composition_strategy"],
-            "lighting": camera["lighting"],
+            "lighting": camera.get("lighting") or "光影方案待修订",
             "color_language": plan["color_strategy"],
             "emotion": decision["emotional_target"],
             "character_focus": plan["visual_focus"],

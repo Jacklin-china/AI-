@@ -150,7 +150,7 @@ def _event_names(runtime_store: RuntimeStore, run_id: str) -> list[str]:
     return [event.payload["director_event"] for event in runtime_store.list_events(run_id)]
 
 
-@pytest.mark.parametrize("failed_stage", SKILLS[:3])
+@pytest.mark.parametrize("failed_stage", SKILLS[:2])
 def test_each_generation_failure_retains_real_completed_output_and_trace(
     tmp_path: Path, failed_stage: str,
 ) -> None:

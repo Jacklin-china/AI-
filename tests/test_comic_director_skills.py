@@ -100,12 +100,16 @@ def test_director_manifests_are_discoverable_and_have_required_metadata() -> Non
     for skill_id, output_key in DIRECTOR_SKILLS.items():
         item = metadata[skill_id]
         assert item.domain == "comic"
-        assert item.version == ("1.1.0" if skill_id == "comic.director_critic" else "1.0.0")
+        assert item.version == ("1.1.0" if skill_id in {
+            "comic.director_critic", "comic.cinematography",
+        } else "1.0.0")
         assert item.required_tools == ()
         assert item.input_schema["type"] == "object"
         assert item.input_schema["required"] == DIRECTOR_INPUTS[skill_id]
         assert item.output_schema["type"] == "object"
-        assert item.output_schema["required"] == [output_key]
+        assert item.output_schema["required"] == (
+            ["public_decision", "structured_plan", "creative_reason"]
+            if skill_id == "comic.cinematography" else [output_key])
         assert set(item.execution_policy["allowed_execution_modes"]) == {
             "fast", "professional",
         }

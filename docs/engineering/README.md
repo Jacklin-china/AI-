@@ -267,6 +267,24 @@ DirectorPlan 追加可选 `style_boundary`、`character_expression`、`character
   保留现有布局与字号。离线浏览器验收复用 `workspace-preview.mjs` 的内存数据，
   与真实付费模型验收分开。
 
+### Phase 7.3.1：摄影输出适配与阶段恢复
+
+摄影阶段保留旧 JSON 读取，并支持公开说明 `public_decision`、`structured_plan` 和
+`creative_reason`；Skill 契约适配仍使用原 Registry，不绑定 Provider。自然语言只通过
+共享文本出口做一次语义提取，不重新导演、不追加历史上下文、不按情绪套用摄影公式。
+提取只整理原文，未表达字段保持 null。已有完整摄影计划默认 complete，历史审核指纹
+不因新增空值字段改变；不完整计划显式为 needs_revision 或 missing，不能伪装完整。
+
+摄影阶段解析/调用失败保留已完成的创意、视觉方案，形成可版本化 v2 草稿和 WAITING Run，
+不是整条流程 FAILED；其他阶段的基础设施/契约异常仍保留其原失败语义，不凭空填充决策。
+沿用原 Runtime Event payload 的 `node_warning/schema_validation_failed/stage_output_saved`，
+记录 skill/trace/project/输入版本、错误 ID、缺失字段、解析问题及有界脱敏公开原输出。
+私有 think/reasoning/CoT 和未知 JSON 字段不进入快照；原响应仅保存 SHA-256 用于关联。
+摄影未完成不发 completed 事件、不推进摄影完成检查点，显式恢复只重做摄影及后续审核。
+Critic 仍检查硬约束与资产身份，缺失摄影转为待修订，无默认镜头或自动补齐 Patch。
+没有实际 complete、Critic pass 及用户确认，不能进入 Prompt/制作。没有 UI、表结构、
+Runtime 架构或 PromptCompiler 改动；离线解析/恢复测试不代表真实模型的摄影质量验收。
+
 ## 唯一入口
 
 - 后端：`src/kantoku/__main__.py` → `shells/web_studio.py` → `core/runtime/`。PyCharm 共享运行配置在 `.run/Kantoku Backend.run.xml`，使用项目 `.venv` 与 `scripts/run_backend.py`；标准命令为 `python -m kantoku serve`。

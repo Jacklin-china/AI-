@@ -43,7 +43,7 @@ CRITIC_ALLOWED_FIELD_PATHS = frozenset(
         ("cinematography", CinematographyPlan),
     )
     for name in model.model_fields
-    if name not in {"hard_constraints", "soft_preferences", "creative_freedom"}
+    if name not in {"hard_constraints", "soft_preferences", "creative_freedom", "status"}
 )
 PATCH_FIELDS = frozenset({
     "creative_decision.emotional_target",
@@ -111,6 +111,14 @@ def director_hash(spec: DirectorSpecDraft) -> str:
         ):
             if plan.get(key) is None:
                 plan.pop(key, None)
+    camera = payload.get("cinematography")
+    if isinstance(camera, dict):
+        # 已有完整 v2 的审核指纹保持兼容；不完整状态始终计入指纹。
+        if camera.get("status") == "complete":
+            camera.pop("status", None)
+        for key in ("public_decision", "creative_reason"):
+            if camera.get(key) is None:
+                camera.pop(key, None)
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -119,6 +127,8 @@ def require_approved_director(spec: DirectorSpecDraft) -> None:
     """旧 v1 保持兼容；v2 必须有绑定当前方案的实际审核凭据。"""
     if spec.schema_version == 1:
         return
+    if spec.cinematography is None or spec.cinematography.status != "complete":
+        raise ToolError("摄影方案待修订，不能进入下一步")
     review = spec.critic_result
     if (
         review is None or review.verdict != "pass"
@@ -354,6 +364,15 @@ class DirectorCriticEngine:
         if not spec.director_plan.creative_choices:
             finding("DIRECTOR_REASON_MISSING", "error", "director_plan.creative_choices",
                     "[]", "解释构图、色彩、光影和人物关系如何服务叙事")
+        camera = spec.cinematography
+        if camera is None or camera.status != "complete":
+            finding("CINEMATOGRAPHY_INCOMPLETE", "warning", "cinematography",
+                    camera.status if camera else "missing",
+                    "补充当前摄影方案缺失字段：" + ",".join(
+                        camera.missing_fields if camera else []))
+            # 仍执行了上面的约束与资产审核；缺失摄影不是整个导演链路失败。
+            # 不让语义模型或 Patch 替用户填入一套默认摄影方案。
+            return self._result(spec, findings, [], "导演草案已保留，摄影方案需要修订。", 1.0)
         for path in (
             "director_plan.visual_strategy", "director_plan.composition_strategy",
             "director_plan.color_strategy", "cinematography.lighting",

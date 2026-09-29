@@ -123,6 +123,8 @@ def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> 
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
     for field in ("style_boundary", "character_expression", "character_pose", "character_presence"):
         payload["director_plan"].pop(field)
+    for field in ("status", "public_decision", "creative_reason"):
+        payload["cinematography"].pop(field)
     historical_hash = hashlib.sha256(json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     ).encode("utf-8")).hexdigest()

@@ -195,20 +195,42 @@ class CinematographyPlan(BaseModel):
 
     model_config = ConfigDict(extra="forbid", strict=True)
 
-    shot_size: BriefText
-    camera_angle: BriefText
-    camera_distance: BriefText
+    status: Literal["complete", "needs_revision", "missing"] = "complete"
+    public_decision: BriefText | None = None
+    creative_reason: BriefText | None = None
+    shot_size: BriefText | None = None
+    camera_angle: BriefText | None = None
+    camera_distance: BriefText | None = None
     # 兼容审核模型可能使用的总括摄影语言；具体镜头字段仍是首选来源。
     camera_language: BriefText | None = None
-    spatial_feel: BriefText
-    lens_or_spatial_feel: BriefText
+    spatial_feel: BriefText | None = None
+    lens_or_spatial_feel: BriefText | None = None
     movement: BriefText | None = None
-    lighting: BriefText
-    light_source: BriefText
-    light_direction: BriefText
-    color_relationship: BriefText
-    depth_strategy: BriefText
-    material_language: BriefText
+    lighting: BriefText | None = None
+    light_source: BriefText | None = None
+    light_direction: BriefText | None = None
+    color_relationship: BriefText | None = None
+    depth_strategy: BriefText | None = None
+    material_language: BriefText | None = None
+
+    @property
+    def missing_fields(self) -> list[str]:
+        return [name for name in (
+            "shot_size", "camera_angle", "camera_distance", "spatial_feel",
+            "lens_or_spatial_feel", "lighting", "light_source", "light_direction",
+            "color_relationship", "depth_strategy", "material_language",
+        ) if getattr(self, name) is None]
+
+    @model_validator(mode="after")
+    def validate_completeness(self) -> CinematographyPlan:
+        if self.status == "missing" and len(self.missing_fields) < 11:
+            # 用户在现有草稿编辑入口补字段时，状态随真实内容更新，不要求改隐藏状态。
+            self.status = "needs_revision"
+        if self.status == "needs_revision" and not self.missing_fields:
+            self.status = "complete"
+        if self.status == "complete" and self.missing_fields:
+            raise ValueError("完整摄影方案不能缺少摄影字段")
+        return self
 
 
 class DirectorCriticFinding(BaseModel):
@@ -293,6 +315,7 @@ class DirectorSpecDraft(BaseModel):
         if (
             self.schema_version == 2
             and self.cinematography is not None
+            and self.cinematography.status == "complete"
             and self.cinematography.camera_language is None
         ):
             # 旧 v2 记录只有顶层兼容字段。读取时投影到分层结构，避免迁移覆盖历史数据。

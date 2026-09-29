@@ -10,6 +10,7 @@ from pydantic import ValidationError
 
 from kantoku.config import ToolError
 
+from .cinematography import parse_cinematography
 from .models import (
     CinematographyPlan,
     ComicAsset,
@@ -47,9 +48,15 @@ def execute_director_stage(
     if skill_id not in contracts:
         raise ToolError("不支持的导演模型阶段", detail=skill_id)
     key, model, instruction = contracts[skill_id]
+    output_instruction = (
+        " 可以返回自然语言摄影方案，或 public_decision、structured_plan、creative_reason "
+        "三个字段的公开对象；也兼容已有摄影字段 JSON。不要为了填满字段编造信息。"
+        if skill_id == "comic.cinematography"
+        else " 只返回符合下述 Schema 的公开决策 JSON 对象，"
+    )
     raw = model_call([
         {"role": "system", "content": (
-            instruction + " 只返回符合下述 Schema 的公开决策 JSON 对象，"
+            instruction + output_instruction +
             "本轮 Brief、当前任务和显式绑定资产是唯一创意依据，不预设为历史作品的补充。"
             "只依据此次提供的上下文，不沿用其他作品或历史示例的主体。"
             "未知细节只作为可编辑的创作选择，不得冒充用户硬约束。"
@@ -60,6 +67,9 @@ def execute_director_stage(
             "inputs": inputs, "context": context["context"],
         }, ensure_ascii=False)},
     ])
+    if skill_id == "comic.cinematography":
+        plan, diagnostics = parse_cinematography(raw, model_call=model_call)
+        return {"cinematography": plan.model_dump(), "parse_diagnostics": diagnostics}
     try:
         output = model.model_validate_json(raw)
     except ValidationError as error:
