@@ -40,7 +40,7 @@ export const fastDirectorNodeLabels: Record<string, string> = {
 const fastDirectorFields: Record<string, Record<string, string>> = {
   creative_decision: { intent_summary: '你想表达的内容', narrative_context: '故事背景', emotional_target: '氛围', hard_constraints: '必须保留' },
   director_plan: { visual_strategy: '整体方向', visual_focus: '画面重点', subject_environment_relation: '人物和环境', composition_strategy: '画面安排', color_strategy: '色彩感觉' },
-  cinematography: { public_decision: '镜头建议', shot_size: '画面范围', camera_angle: '观看角度', lighting: '光线感觉' },
+  cinematography: { public_decision: '镜头建议', shot_size: '画面范围', spatial_feel: '画面空间' },
 }
 export function directorPageFields(section: string, body: Record<string, unknown>, mode = 'professional'): Record<string, unknown> {
   const labels = mode === 'fast' ? fastDirectorFields[section] ?? {} : directorFieldLabels
@@ -70,6 +70,16 @@ export function directorSummary(spec: Record<string, unknown> | null, mode = 'pr
     const values = Object.values(section.fields).filter(value => typeof value === 'string' && value)
     return `**${section.title}**\n\n${values.slice(0, 2).join('；')}`
   }).join('\n\n')
+}
+export function directorConversationSummary(spec: Record<string, unknown> | null): string {
+  if (spec?.schema_version !== 2) return ''
+  const understanding = spec.creative_decision as Record<string, unknown> | undefined
+  if (typeof understanding?.intent_summary !== 'string' || !understanding.intent_summary.trim()) return ''
+  // One concise entry into the workspace, not a second copy of the director report.
+  const mood = typeof understanding.emotional_target === 'string' && understanding.emotional_target.trim()
+    ? `\n\n氛围：${understanding.emotional_target}` : ''
+  const state = typeof spec.version === 'number' ? '导演方案草稿已保存，可以进入工作区查看和修改。' : '已整理导演草稿，尚未保存为正式版本。'
+  return `**我理解你的创意**\n\n${understanding.intent_summary}${mood}\n\n${state}`
 }
 export function workspaceProjectTitle(title: string | undefined, request: string | undefined): string {
   // 自动生成的原话标题已在对话中出现，不再把长需求复制到工具栏。

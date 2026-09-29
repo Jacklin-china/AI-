@@ -3,10 +3,14 @@ import { readFileSync } from 'node:fs'
 import test from 'node:test'
 import ts from 'typescript'
 import { reactive } from 'vue'
+import { compileScript, parse } from '@vue/compiler-sfc'
+import { createSSRApp } from 'vue'
+import { renderToString } from '@vue/server-renderer'
 
 const source = readFileSync(new URL('../src/domains/comic/directorPresentation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
-const { discardDirectorNodeDraft, directorPageFields, directorPageFieldLabel, fastDirectorNodeLabels, directorDraftFields, editableDirectorDraft, canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+const presentationUrl = `data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`
+const { discardDirectorNodeDraft, directorConversationSummary, directorPageFields, directorPageFieldLabel, fastDirectorNodeLabels, directorDraftFields, editableDirectorDraft, canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorIsStale, directorSummary, stageDraftKey, publicDirectorSections, workspaceProjectTitle } = await import(presentationUrl)
 const spec = {
   schema_version: 2, spec_id: 'director', version: 2, creative_brief_version: 3,
   creative_decision: { intent_summary: '异兽观察文明', emotional_target: '孤独', private_thought: 'must not show' },
@@ -84,7 +88,9 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /conversation_id: conversation/)
   assert.match(view, /UserMessageBubble/)
   assert.match(view, /MessageComposer/)
-  assert.match(view, /Splitpanes horizontal/)
+  assert.doesNotMatch(view, /Splitpanes|<Pane(?:\s|>)|stage-navigation|chatSize/)
+  assert.match(view, /class="director-flow" aria-label="导演流程"/)
+  assert.match(view, /navOpen = ref\(!window.matchMedia/)
   assert.match(view, /inspectorOpen = ref\(false\)/)
   assert.match(view, /:disabled="!confirmed"/)
   assert.match(view, /id: 'conversation', label: '对话'/)
@@ -107,6 +113,66 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /confirmDirectorVersion/)
   assert.doesNotMatch(view, /kantoku-director-confirmation:/)
   assert.match(view, /if \(failedRun\) \{ selectedRun\.value = failedRun\.run_id/)
+})
+
+test('Chat gives a concise entry to the real draft, never another technical director report', () => {
+  const text = directorConversationSummary({ ...spec, director_plan: { visual_strategy: 'do not repeat the report' }, cinematography: { camera_angle: 'hidden camera' } })
+  assert.match(text, /异兽观察文明/)
+  assert.match(text, /草稿/)
+  assert.doesNotMatch(text, /do not repeat|hidden camera|must not show/)
+  assert.equal(directorConversationSummary(null), '')
+  assert.equal(directorConversationSummary({ schema_version: 1, emotion: 'old' }), '')
+  assert.match(directorConversationSummary({ ...spec, version: undefined }), /尚未保存/)
+})
+
+test('Fast photography hides technical fields, while Professional preserves the same data', () => {
+  const body = { public_decision: '让人物与环境共同进入画面', shot_size: '远景', camera_angle: '低机位', lighting: '侧光', continuity_rules: ['人物不变'], private_thought: 'hidden' }
+  assert.deepEqual(directorPageFields('cinematography', body, 'fast'), { public_decision: body.public_decision, shot_size: '远景' })
+  assert.equal(directorPageFields('cinematography', body, 'professional').camera_angle, '低机位')
+  assert.equal(directorPageFields('cinematography', body, 'professional').lighting, '侧光')
+})
+
+test('fixed shared input is outside node switching; returning from Chat preserves the selected node', () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const { descriptor, errors } = parse(view)
+  assert.deepEqual(errors, [])
+  assert.match(descriptor.template.content, /<footer class="workspace-composer" aria-label="统一创作输入">/)
+  assert.equal((descriptor.template.content.match(/<MessageComposer /g) ?? []).length, 1)
+  assert.match(view, /if \(page && page !== 'conversation'\)/)
+  assert.match(view, /v-show="chatExpanded" ref="timeline"/)
+  assert.match(view, /if \(!text.trim\(\)\) return\s+chatExpanded.value = true/)
+  const modifyAction = view.slice(view.indexOf('function reviseByInstruction'), view.indexOf('async function saveFinal'))
+  assert.doesNotMatch(modifyAction, /composer.value\?\.fill\(''\)/)
+  assert.doesNotMatch(view, /scrollIntoView|location.hash|role="tab"|role="tablist"/)
+})
+
+// Render the actual shared node component, not a test-only copy of its layout.
+const nodeSource = readFileSync(new URL('../src/components/DirectorNodeView.vue', import.meta.url), 'utf8')
+const nodeScript = compileScript(parse(nodeSource).descriptor, { id: 'workspace-node-contract', inlineTemplate: true }).content
+const nodeModule = ts.transpileModule(nodeScript, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+  .replaceAll("'../domains/comic/directorPresentation'", JSON.stringify(presentationUrl))
+  .replace(/from (["'])vue\1/g, `from ${JSON.stringify(import.meta.resolve('vue'))}`)
+  .replace(/from (["'])lucide-vue-next\1/g, `from ${JSON.stringify(import.meta.resolve('lucide-vue-next'))}`)
+const { default: NodeView } = await import(`data:text/javascript;base64,${Buffer.from(nodeModule).toString('base64')}`)
+const renderNode = props => renderToString(createSSRApp(NodeView, { node: undefined, spec, editing: false, fields: {}, editable: true, rerunnable: false, busy: false, ...props }))
+
+test('actual node page renders only the selected node and mode-appropriate controls', async () => {
+  const saved = { ...spec, cinematography: { public_decision: '人物与环境同框', shot_size: '远景', camera_angle: '低角度', lighting: '逆光' } }
+  const fast = await renderNode({ spec: saved, stage: 'cinematography', mode: 'fast' })
+  const pro = await renderNode({ spec: saved, stage: 'cinematography', mode: 'professional' })
+  assert.match(fast, /人物与环境同框|画面范围/)
+  assert.doesNotMatch(fast, /低角度|逆光|异兽观察文明|留出环境空间/)
+  assert.match(pro, /低角度|逆光|编辑节点/)
+  const edit = await renderNode({ stage: 'visual_direction', mode: 'professional', editing: true, fields: { 'director_plan.composition_strategy': '局部修改', 'cinematography.camera_angle': '别的节点' } })
+  assert.match(edit, /textarea|局部修改|保存草稿版本/)
+  assert.doesNotMatch(edit, /别的节点/)
+})
+
+test('final draft is a navigable approval index, not stacked report cards', async () => {
+  const html = await renderNode({ stage: 'director_assemble', mode: 'professional' })
+  assert.match(html, /方案组成|plan-index/)
+  assert.doesNotMatch(html, /plan-card|node-fields|textarea/)
+  assert.equal((html.match(/<button/g) ?? []).length, 3)
 })
 test('Fast keeps only creative and director summary; v2 optional fields and narrative context are public', () => {
   const current = { ...spec, creative_decision: { narrative_context: '远古异兽观察文明' },

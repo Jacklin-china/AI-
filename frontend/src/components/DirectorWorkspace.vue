@@ -1,15 +1,13 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelLeft, PanelRight, ChevronUp, ChevronDown, X, Check } from 'lucide-vue-next'
-import { Pane, Splitpanes } from 'splitpanes'
-import 'splitpanes/dist/splitpanes.css'
+import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelLeft, PanelRight, ArrowLeft, ArrowRight, X, Check } from 'lucide-vue-next'
 import MessageComposer from './chat/MessageComposer.vue'
 import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import { navigate, route } from '../router'
-import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
+import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
 import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { CoreRun } from '../types'
 
@@ -31,11 +29,9 @@ const selectedShot = ref('')
 const selectedRun = ref('')
 const selectedStage = ref(route.value.directorStage ?? 'director_assemble')
 const section = ref(route.value.workspacePage === 'conversation' ? 'director' : route.value.workspacePage ?? 'director')
-const navOpen = ref(false)
+const navOpen = ref(!window.matchMedia('(max-width: 600px)').matches)
 const inspectorOpen = ref(false)
 const chatExpanded = ref(!route.value.workspacePage || route.value.workspacePage === 'conversation')
-const chatSize = ref(58)
-const modeChatSizes: Record<CreationMode, number> = { fast: 58, professional: 42 }
 const composer = ref<InstanceType<typeof MessageComposer> | null>(null)
 const timeline = ref<HTMLElement | null>(null)
 const nearBottom = ref(true)
@@ -103,8 +99,22 @@ const transcript = computed(() => chronologicalDirectorExecutions(executions.val
   const text = String(run?.state.task ?? '')
   const rerun = String(run?.state.rerun_from ?? '').replace('comic.', '')
   return { execution: item, text: rerun ? `修改 / 重新执行：${directorNodeLabels[rerun] ?? rerun}` : text,
-    answer: directorSummary(item.director_spec, mode.value), label: item.director_execution_summary.status_label }
+    answer: directorConversationSummary(item.director_spec), label: item.director_execution_summary.status_label }
 }))
+function nodeState(stage: string): string {
+  if (stale.value) return '已过期'
+  if (restoredSpec.value) return '保存的方案'
+  const actual = summary.value?.stages.find(item => item.stage === stage)
+  // A saved plan is not evidence that a node was executed. Fast runs hide these records.
+  return actual ? directorStateLabels[actual.status] ?? actual.status : spec.value ? '方案内容' : '未开始'
+}
+function nodeStatus(stage: string): string {
+  return !restoredSpec.value && !stale.value ? summary.value?.stages.find(item => item.stage === stage)?.status ?? '' : ''
+}
+function openDraft(runId?: string): void {
+  if (runId && runId !== active.value?.run_id) { selectedRun.value = runId; restoredSpec.value = null }
+  visitStage('director_assemble')
+}
 
 function failureText(failure: unknown): string {
   if (failure instanceof CoreApiError) return `${failure.message}${failure.traceId ? ` · Trace：${failure.traceId}` : ''}`
@@ -137,7 +147,6 @@ function reviseByInstruction(): void {
   if (!spec.value?.version || stale.value || busy.value || hasRunning.value) return
   revisionVersion.value = Number(spec.value.version)
   chatExpanded.value = true
-  composer.value?.fill('')
 }
 async function saveFinal(instruction?: string): Promise<void> {
   if (!project.value || !spec.value || busy.value || hasRunning.value) return
@@ -238,6 +247,7 @@ async function execute(text: string, options: Record<string, unknown> = {}, sele
 }
 function sendInput(text: string): void {
   if (!text.trim()) return
+  chatExpanded.value = true
   if (revisionVersion.value !== null) { void saveFinal(text); return }
   if (busy.value || hasRunning.value || cancelling.value || queuedInputs.value.length) {
     queuedInputs.value.push({ id: ++nextInputId, text, mode: mode.value })
@@ -364,8 +374,11 @@ watch(section, () => { void loadPage() })
 watch(() => [route.value.workspacePage, route.value.directorStage], async ([page, stage]) => {
   applyingRoute = true
   chatExpanded.value = !page || page === 'conversation'
-  section.value = !page || page === 'conversation' ? 'director' : page
-  selectedStage.value = stage ?? 'director_assemble'
+  // Opening Chat does not reset the node to which the user will return.
+  if (page && page !== 'conversation') {
+    section.value = page
+    if (page === 'director') selectedStage.value = stage ?? 'director_assemble'
+  }
   if (!loading.value && mode.value === 'fast' && selectedStage.value === 'director_critic') {
     navigate({ ...route.value, directorStage: 'director_assemble' }, true)
   }
@@ -381,9 +394,7 @@ watch([section, selectedStage, chatExpanded], () => {
     navigate({ ...route.value, workspacePage, directorStage })
   }
 })
-watch(mode, (value, previous) => {
-  modeChatSizes[previous] = chatSize.value
-  chatSize.value = modeChatSizes[value]
+watch(mode, value => {
   if (value === 'fast' && selectedStage.value === 'director_critic') selectedStage.value = 'director_assemble'
   if (project.value) sessionStorage.setItem(`kantoku-comic-view-mode:${project.value.project.project_id}`, value)
 })
@@ -428,26 +439,35 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
       <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="newProject">新作品</button>
     </header>
     <div class="workspace-body">
-      <nav class="workspace-navigation" :class="{ expanded: navOpen }" aria-label="创作导航">
-        <button :aria-expanded="navOpen" aria-label="展开项目导航" title="展开 / 收起导航" @click="navOpen = !navOpen"><PanelLeft :size="18" /></button>
-        <button v-for="item in navigation" :key="item.id" :title="item.id === 'prompt' && !confirmed ? '请先确认导演方案' : item.label" :aria-label="item.label" :disabled="item.id === 'prompt' && !confirmed" :aria-current="activeNavigation === item.id ? 'page' : undefined" @click="openSection(item.id)"><component :is="item.icon" :size="18" /><span v-if="navOpen">{{ item.label }}</span></button>
+      <nav class="workspace-navigation" :class="{ collapsed: !navOpen }" aria-label="创作导航">
+        <button class="navigation-toggle" :aria-expanded="navOpen" :aria-label="navOpen ? '收起项目导航' : '展开项目导航'" @click="navOpen = !navOpen"><PanelLeft :size="18" /><span v-if="navOpen">项目工作区</span></button>
+        <div v-show="navOpen" class="navigation-pages">
+          <template v-for="item in navigation" :key="item.id">
+            <button class="navigation-entry" :aria-label="item.label" :aria-current="activeNavigation === item.id ? 'page' : undefined" @click="openSection(item.id)"><component :is="item.icon" :size="17" /><span>{{ item.label }}</span></button>
+            <nav v-if="item.id === 'director' && section === 'director' && !chatExpanded" class="director-flow" aria-label="导演流程">
+              <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" :data-status="nodeStatus(String(stage))" @click="visitStage(String(stage))">
+                <span class="flow-marker"><Check v-if="nodeStatus(String(stage)) === 'completed'" :size="11" /></span>
+                <span>{{ label }}<small v-if="mode === 'professional'">{{ nodeState(String(stage)) }}</small></span>
+              </button>
+            </nav>
+          </template>
+        </div>
       </nav>
-      <Splitpanes horizontal class="workspace-split" @resized="payload => { if (payload.event) chatSize = payload.panes.at(-1)?.size ?? chatSize }">
-        <Pane v-if="!chatExpanded" :size="100 - chatSize" :min-size="25">
-          <div class="workspace-upper">
+      <div class="workspace-main">
+        <div class="workspace-content">
             <main class="workspace-stage">
-              <header class="stage-heading"><h2>{{ title }}</h2><button class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button></header>
-              <nav v-if="section === 'director'" class="stage-navigation" aria-label="导演节点">
-                <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" @click="visitStage(String(stage))">{{ label }}<small v-if="mode === 'professional'">{{ restoredSpec ? '保存的版本' : summary?.mode === 'fast' ? '查看方案内容' : directorStateLabels[summary?.stages.find(item => item.stage === stage)?.status ?? 'pending'] ?? '未开始' }}</small></button>
-              </nav>
-              <div :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll">
+              <header class="stage-heading">
+                <div><small>{{ chatExpanded ? '同一个项目，同一段创作对话' : section === 'director' ? '导演工作区' : '项目工作区' }}</small><h2>{{ chatExpanded ? '与 AI 导演协作' : title }}</h2></div>
+                <span v-if="!chatExpanded && section === 'director' && spec" class="node-version">v{{ spec.version }}<span v-if="dirty"> · 未保存修改</span></span>
+                <button v-if="!chatExpanded" class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button>
+              </header>
+              <div v-if="!chatExpanded" :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll" aria-label="当前节点工作区">
                 <template v-if="section === 'director'">
-                  <p v-if="spec && mode === 'professional'" class="version-line">导演稿 v{{ spec.version }} · 创意 v{{ spec.creative_brief_version }} <span v-if="dirty">· 有未保存修改</span></p>
                   <p v-if="restoredSpec && mode === 'professional'" class="pane-note">查看当前保存的版本；节点没有重新执行，不沿用其他版本的执行状态。</p>
                   <p v-if="summary?.mode === 'fast' && mode === 'professional' && selectedStage !== 'director_assemble'" class="pane-note">显示已保存方案的对应内容；此任务未公开逐节点执行记录。</p>
                   <p v-if="selectedStage === 'cinematography' && (spec?.cinematography as { status?: string })?.status && (spec?.cinematography as { status?: string })?.status !== 'complete'" class="review-notice">摄影方案待补充或调整。已保留真实草稿，不会自动进入制作。</p>
-                  <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="editFinal" />
-                  <div v-if="spec && selectedStage === 'director_assemble'" class="draft-actions"><strong>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '方案已确认' : '最终导演稿 · 待确认' }}</strong><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed" @click="section = 'prompt'">确认后进入下一步</button></div>
+                  <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="visitStage" />
+                  <div v-if="spec && selectedStage === 'director_assemble'" class="final-approval"><p>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '当前版本已确认' : dirty ? '请先保存编辑，再检查并确认' : '这是可修改的草稿，确认后才进入下一阶段。' }}</p><div class="draft-actions"><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">用对话修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed" @click="openSection('prompt')">进入下一步</button></div></div>
                   <button v-if="spec && selectedStage !== 'director_assemble' && !editing && selectedStage !== 'director_critic'" class="ui-button quiet sm" @click="visitStage('director_assemble')">{{ mode === 'fast' ? '查看整体方案并确认' : '返回最终导演稿' }}</button>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
@@ -468,30 +488,18 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <template v-else><label v-if="shots.length">镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="shot in shots" :key="shot.shot_id" :value="shot.shot_id">{{ shot.sequence_number }} · {{ shot.subject }}</option></select></label><details v-for="prompt in prompts" :key="String(prompt.prompt_id) + prompt.version"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }}</summary><p>{{ prompt.positive_prompt }}</p><h3>负向约束</h3><p>{{ prompt.negative_prompt }}</p><small>导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }} · {{ prompt.compiler_version }}</small></details><p v-if="selectedShot && !prompts.length" class="pane-note">当前镜头没有已保存的 Prompt 版本。</p><button v-if="selectedShot" class="ui-button primary sm" :disabled="!confirmed || compiling || busy || hasRunning || boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" @click="compilePrompt">{{ compiling ? '正在编译 Prompt' : '编译当前镜头 Prompt' }}</button><p v-if="selectedShot && boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" class="pane-note">分镜引用的导演版本与当前方案不同。请先更新分镜，旧 Prompt 可继续查看。</p><button class="ui-button sm" :disabled="!confirmed" @click="section = 'assets'">查看生成结果</button></template>
                 </template>
                 <template v-else-if="section === 'history'">
-                  <h3>方案版本</h3><article v-for="version in versions" :key="Number(version.version)" class="history-row"><strong>导演方案 v{{ version.version }}</strong><small>{{ version.created_at }}</small><AssistantMessageBlock :content="directorSummary(version) || '旧版方案（只读）'" :show-mark="false" /><button class="ui-button sm" :disabled="busy || hasRunning" @click="restoreChoice = Number(version.version)">恢复为新版本</button><div v-if="restoreChoice === Number(version.version)" class="review-notice" role="status"><p>将 v{{ version.version }} 恢复为新版本。历史保留，当前确认状态会清除。</p><button class="ui-button primary sm" :disabled="busy || hasRunning" @click="restore(Number(version.version))">确认恢复</button><button class="ui-button quiet sm" :disabled="busy" @click="restoreChoice = null">取消</button></div></article><p v-if="!versions.length" class="pane-note">暂无已保存方案版本。</p>
+                  <h3>方案版本</h3><article v-for="version in versions" :key="Number(version.version)" class="history-row"><header><div><strong>导演方案 v{{ version.version }}</strong><small>{{ version.created_at }}</small></div><button class="ui-button sm" :disabled="busy || hasRunning" @click="restoreChoice = Number(version.version)">恢复为新版本</button></header><details><summary>查看版本摘要</summary><AssistantMessageBlock :content="directorSummary(version, mode) || '旧版方案（只读）'" :show-mark="false" /></details><div v-if="restoreChoice === Number(version.version)" class="review-notice" role="status"><p>将 v{{ version.version }} 恢复为新版本。历史保留，当前确认状态会清除。</p><button class="ui-button primary sm" :disabled="busy || hasRunning" @click="restore(Number(version.version))">确认恢复</button><button class="ui-button quiet sm" :disabled="busy" @click="restoreChoice = null">取消</button></div></article><p v-if="!versions.length" class="pane-note">暂无已保存方案版本。</p>
                   <h3>真实执行记录</h3><button v-for="item in executions" :key="item.run_id" class="history-task" @click="selectedRun = item.run_id; restoredSpec = null; visitStage('director_assemble')">{{ item.director_execution_summary.mode === 'fast' ? '普通模式' : '专业模式' }} · {{ directorStateLabels[item.status] ?? item.status }}<small>{{ item.run_id }}</small></button>
                 </template>
               </div>
-            </main>
-            <aside v-if="inspectorOpen" class="workspace-inspector" aria-label="节点详情">
-              <header><strong>详情</strong><button class="ui-button quiet sm" aria-label="关闭详情" @click="inspectorOpen = false"><X :size="15" /></button></header>
-              <dl><div><dt>方案版本</dt><dd>{{ spec?.version ?? '未生成' }}</dd></div><div><dt>Brief</dt><dd>{{ spec?.creative_brief_version ?? '未关联' }}</dd></div><div v-for="(version, key) in node?.input_versions ?? activeRun?.state.input_versions ?? spec?.asset_versions ?? {}" :key="String(key)"><dt>{{ key }}</dt><dd>v{{ version }}</dd></div><div><dt>Run</dt><dd>{{ activeRun?.id ?? '本版本未关联' }}</dd></div><div><dt>Trace</dt><dd>{{ activeRun?.state.trace_id ?? '本版本未关联' }}</dd></div><div><dt>错误</dt><dd>{{ activeRun?.error ?? summary?.error_id ?? '无' }}</dd></div></dl>
-              <details v-if="!restoredSpec"><summary>公开执行事件 · {{ events.length }}</summary><p v-for="event in events" :key="event.id">{{ event.event_type }}</p></details>
-              <p class="pane-note">只展示真实版本、公开结果和执行事件，不展示模型私有思考。</p>
-            </aside>
-          </div>
-        </Pane>
-        <Pane key="conversation" :size="chatExpanded ? 100 : chatSize" :min-size="35">
-          <section class="workspace-conversation" aria-label="连续创作对话">
-            <header class="conversation-toolbar"><strong>AI 导演助手</strong><small v-if="conversationId">当前项目会话</small><span /><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ChevronDown v-if="chatExpanded" :size="15" /><ChevronUp v-else :size="15" />{{ chatExpanded ? '返回工作区' : '展开对话' }}</button></header>
-            <div ref="timeline" class="workspace-messages" @scroll="scrollState">
+            <section v-show="chatExpanded" ref="timeline" class="workspace-messages" aria-label="连续创作对话" @scroll="scrollState">
               <p v-if="!transcript.length && !pendingText" class="conversation-welcome">描述你的故事、人物或希望观众感受到的情绪。我们从创作理解开始，再一起确认导演方案。</p>
               <article v-for="entry in transcript" :key="entry.execution.run_id" class="creative-turn">
                 <UserMessageBubble v-if="entry.text" :content="entry.text" />
                 <AssistantMessageBlock :content="entry.answer || entry.label" :show-mark="false" />
                 <p v-if="entry.execution.status === 'failed'" role="alert">任务失败 · {{ entry.execution.director_execution_summary.error_id ?? '打开详情查看错误' }}</p>
                 <template v-if="!restoredSpec && entry.execution.run_id === active?.run_id">
-                  <div v-if="entry.execution.director_spec" class="draft-actions"><span><Check v-if="confirmed" :size="14" />{{ stale ? '来源已变化' : confirmed ? '方案已确认' : '待确认的导演草案' }}</span><button class="ui-button quiet sm" @click="visitStage('director_assemble')">查看方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale" @click="editFinal()">直接编辑</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成方案</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button><button class="ui-button quiet sm" :disabled="!confirmed" @click="openSection('prompt')">进入 Prompt</button></div>
+                  <div v-if="entry.execution.director_spec" class="draft-actions"><button class="ui-button sm" @click="openDraft(entry.execution.run_id)">进入导演方案 <ArrowRight :size="15" /></button><span>{{ stale ? '来源已变化' : confirmed ? '已确认' : '待确认草稿' }}</span></div>
                   <button v-if="entry.execution.recovery_required || summary?.available_actions.includes('resume')" class="ui-button sm" :disabled="busy || hasRunning" @click="resume">恢复原导演任务</button>
                 </template>
               </article>
@@ -505,15 +513,26 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <button v-if="queuedInputs.length && error && !busy && !hasRunning" class="ui-button sm" @click="dispatchQueued(true)">继续处理已发送的补充</button>
               <p v-if="error" class="workspace-error" role="alert">{{ error }}</p>
               <p v-if="dirty" class="pane-note">有未保存的节点修改。切换节点会保留草稿；保存并重新审核后才能确认。</p>
-              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorSummary(restoredSpec, mode)" :show-mark="false" /><div class="draft-actions"><span>方案 v{{ restoredSpec.version }} · {{ confirmed ? '已确认' : '草稿' }}</span><button class="ui-button sm" @click="visitStage('director_assemble')">查看方案</button><button class="ui-button sm" :disabled="busy || hasRunning || stale" @click="editFinal()">直接编辑</button><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">指令式修改</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认方案</button></div></template>
+              <template v-if="restoredSpec"><AssistantMessageBlock :content="directorConversationSummary(restoredSpec)" :show-mark="false" /><div class="draft-actions"><span>方案 v{{ restoredSpec.version }} · {{ confirmed ? '已确认' : '草稿' }}</span><button class="ui-button sm" @click="openDraft()">进入导演方案 <ArrowRight :size="15" /></button></div></template>
               <button v-if="spec && !confirmable && !stale && !dirty" class="ui-button sm" :disabled="busy || hasRunning" @click="reviewFinal">审核当前草稿</button>
               <p v-if="confirmed" class="pane-note">当前版本已确认并保存到后端。编辑或恢复为新版本后，需要重新审核与确认。</p>
-              <p v-if="revisionVersion !== null" class="review-notice">正在修改当前方案 v{{ revisionVersion }}。下方输入将作为修改指令，不创建新创意。<button class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button></p>
-            </div>
-            <div class="workspace-composer"><p v-if="legacyOnly" class="pane-note">此历史单镜头任务没有作品级 Project。原审批与恢复仍在任务记录中；点击“新作品”进入作品级创作。</p><div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可以继续输入补充，按顺序处理</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div><MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" /><small>发送会生成或更新导演方案；不会自动进入生图。任务内补充暂存在当前页面，刷新前请保留；已执行对话由真实任务记录恢复。</small></div>
-          </section>
-        </Pane>
-      </Splitpanes>
+            </section>
+            </main>
+            <aside v-if="inspectorOpen && !chatExpanded" class="workspace-inspector" aria-label="节点详情">
+              <header><strong>节点详情</strong><button class="ui-button quiet sm" aria-label="关闭详情" @click="inspectorOpen = false"><X :size="15" /></button></header>
+              <dl><div><dt>方案版本</dt><dd>{{ spec?.version ?? '未生成' }}</dd></div><div><dt>Brief</dt><dd>{{ spec?.creative_brief_version ?? '未关联' }}</dd></div><div v-for="(version, key) in node?.input_versions ?? activeRun?.state.input_versions ?? {}" :key="String(key)"><dt>{{ key }}</dt><dd>v{{ version }}</dd></div><div><dt>来源资产</dt><dd v-for="(version, id) in spec?.asset_versions ?? {}" :key="String(id)">{{ id }} · v{{ version }}</dd><dd v-if="!Object.keys(spec?.asset_versions as object ?? {}).length">未绑定</dd></div><div><dt>知识引用</dt><dd>{{ Array.isArray(spec?.knowledge_refs) ? spec.knowledge_refs.join('、') || '未记录' : '未记录' }}</dd></div><div><dt>Run</dt><dd>{{ activeRun?.id ?? '本版本未关联' }}</dd></div><div><dt>Trace</dt><dd>{{ activeRun?.state.trace_id ?? '本版本未关联' }}</dd></div><div><dt>错误</dt><dd>{{ activeRun?.error ?? summary?.error_id ?? '无' }}</dd></div></dl>
+              <details v-if="!restoredSpec"><summary>公开执行事件 · {{ events.length }}</summary><p v-for="event in events" :key="event.id">{{ event.event_type }}</p></details>
+            </aside>
+        </div>
+        <footer class="workspace-composer" aria-label="统一创作输入">
+          <div class="composer-context"><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ArrowLeft v-if="chatExpanded" :size="15" /><MessageSquareText v-else :size="15" />{{ chatExpanded ? '返回工作区' : '打开创作对话' }}</button><small>{{ revisionVersion !== null ? `修改当前草稿 v${revisionVersion}` : '当前项目的同一个对话' }}</small><button v-if="revisionVersion !== null" class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button><button v-else-if="spec" class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">修改当前方案</button></div>
+          <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击“新作品”进入作品级创作。</p>
+          <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可继续输入</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
+          <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
+          <MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
+          <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '方案先保存为草稿，审核并确认后再进入制作。' }}</small>
+        </footer>
+      </div>
     </div>
   </section>
 </template>
@@ -526,51 +545,59 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
 select { color:var(--text-primary); background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-control); padding:6px; font:inherit; max-width:100%; }
 .workspace-execution { color:var(--text-secondary); font-size:12px; }
 .workspace-body { display:flex; flex:1; min-height:0; }
-.workspace-navigation { width:48px; flex-shrink:0; padding:8px 4px; border-right:1px solid var(--border); background:var(--canvas); }
-.workspace-navigation.expanded { width:116px; }
-.workspace-navigation button { display:flex; align-items:center; gap:10px; width:100%; padding:10px; margin-bottom:5px; border:0; border-radius:var(--radius-control); background:transparent; color:var(--text-secondary); font:inherit; font-size:13px; text-align:left; }
-.workspace-navigation button[aria-current], .stage-navigation button[aria-current] { background:var(--canvas-inset); color:var(--accent); }
+.workspace-navigation { width:184px; box-sizing:border-box; flex-shrink:0; padding:10px 8px; border-right:1px solid var(--border); background:var(--canvas); overflow:auto; }
+.workspace-navigation.collapsed { width:46px; padding-inline:4px; }
+.workspace-navigation button { display:flex; align-items:center; gap:10px; width:100%; padding:10px; border:0; border-radius:var(--radius-control); background:transparent; color:var(--text-secondary); font:inherit; font-size:13px; text-align:left; cursor:pointer; }
+.workspace-navigation .navigation-toggle { font-size:12px; color:var(--text-muted); margin-bottom:12px; }
+.workspace-navigation .navigation-entry { margin-block:3px; }
+.workspace-navigation button:hover { background:var(--canvas-inset); color:var(--text-primary); }
+.workspace-navigation button[aria-current] { background:var(--canvas-inset); color:var(--accent); }
 .workspace-navigation button:disabled { color:var(--text-muted); opacity:.5; cursor:not-allowed; }
-.workspace-split { min-width:0; flex:1; }
-.workspace-split :deep(.splitpanes__splitter) { height:6px; min-height:6px; background:var(--canvas-inset); border-block:1px solid var(--border); cursor:row-resize; }
-.workspace-split :deep(.splitpanes__splitter:hover) { background:var(--border-strong); }
-.workspace-upper { display:flex; height:100%; min-height:0; }
+.director-flow { position:relative; margin:6px 0 14px 17px; border-left:1px solid var(--border-strong); padding-left:6px; }
+.director-flow button { padding:9px 6px; gap:7px; line-height:1.4; font-size:12px; align-items:flex-start; }
+.director-flow small { display:block; font-size:10px; margin-top:2px; color:var(--text-muted); }
+.flow-marker { display:flex; align-items:center; justify-content:center; width:11px; height:11px; margin-top:3px; border:1px solid var(--border-strong); border-radius:50%; flex-shrink:0; }
+.director-flow button[aria-current] .flow-marker { border-color:var(--accent); background:var(--accent); color:var(--surface); }
+.director-flow button[data-status="completed"] .flow-marker { border-color:var(--text-secondary); }
+.director-flow button[data-status="running"] .flow-marker { border-color:var(--accent); }
+.workspace-main { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; }
+.workspace-content { display:flex; flex:1; min-height:0; min-width:0; }
 .workspace-stage { display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
-.stage-heading, .conversation-toolbar { display:flex; align-items:center; gap:10px; padding:10px 18px; flex-shrink:0; border-bottom:1px solid var(--border); }
-.stage-heading h2 { font-size:15px; flex:1; margin:0; }
-.stage-navigation { display:flex; gap:4px; padding:8px 14px; border-bottom:1px solid var(--border); overflow-x:auto; flex-shrink:0; }
-.stage-navigation button { background:transparent; color:var(--text-secondary); border:0; padding:7px 10px; border-radius:var(--radius-control); font-size:12px; flex-shrink:0; }
-.stage-navigation small { display:block; font-size:11px; margin-top:4px; }
-.stage-scroll { flex:1; overflow:auto; padding:18px max(20px, calc((100% - 800px) / 2)); font-size:14px; line-height:1.65; }
-.stage-scroll { animation:node-enter 140ms ease-out; }
+.stage-heading { display:flex; align-items:center; gap:10px; padding:12px 28px; flex-shrink:0; border-bottom:1px solid var(--border); }
+.stage-heading > div { flex:1; } .stage-heading small { font-size:11px; color:var(--text-muted); }
+.stage-heading h2 { font-size:16px; margin:3px 0 0; }
+.node-version { font-size:11px; color:var(--text-muted); }
+.stage-scroll { flex:1; min-height:0; overflow:auto; padding:28px max(28px, calc((100% - 780px) / 2)); font-size:14px; line-height:1.65; animation:node-enter 140ms ease-out; }
 @keyframes node-enter { from { opacity:0; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
 @media(prefers-reduced-motion:reduce) { .stage-scroll { animation:none; } }
 .stage-scroll h3 { font-size:15px; }
-.version-line { margin:0 0 12px; color:var(--text-muted); font-size:12px; }
 .stage-scroll details { padding:12px 0; border-bottom:1px solid var(--border); }
 .stage-scroll summary { cursor:pointer; } .stage-scroll dd { margin:4px 0 14px; white-space:pre-wrap; }
 .workspace-inspector { width:240px; box-sizing:border-box; padding:14px; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--canvas); }
 .workspace-inspector header { display:flex; justify-content:space-between; align-items:center; }
 .workspace-inspector dd { margin:4px 0 14px; overflow-wrap:anywhere; color:var(--text-secondary); }
-.workspace-conversation { display:flex; flex-direction:column; height:100%; min-height:0; }
-.conversation-toolbar { padding:6px 18px; font-size:12px; }
-.conversation-toolbar span { flex:1; } .conversation-toolbar small { color:var(--text-muted); }
 .workspace-messages { flex:1; min-height:0; overflow:auto; padding:18px max(20px, calc((100% - 820px) / 2)); }
 .creative-turn { margin-bottom:24px; } .conversation-welcome { color:var(--text-secondary); font-size:14px; line-height:1.8; max-width:650px; }
-.workspace-composer { padding:8px max(20px, calc((100% - 820px) / 2)) 10px; flex-shrink:0; }
+.workspace-composer { padding:8px max(24px, calc((100% - 820px) / 2)) 12px; flex-shrink:0; border-top:1px solid var(--border); background:var(--surface); }
+.composer-context { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
+.composer-context small { color:var(--text-muted); font-size:11px; }
 .workspace-composer > small { display:block; margin-top:6px; color:var(--text-muted); font-size:11px; }
 .execution-controls, .queued-note { display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--text-secondary); font-size:12px; }
 .execution-controls { margin-bottom:6px; }
 .queued-note { justify-content:flex-end; margin:6px 0 16px; }
 .draft-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; font-size:12px; }
 .draft-actions span { display:flex; gap:5px; align-items:center; color:var(--text-secondary); }
+.final-approval { margin-top:24px; padding-top:14px; border-top:1px solid var(--border); }
+.final-approval > p { color:var(--text-secondary); font-size:13px; margin:0; }
 .asset-group, .shot-row, .history-row { padding-bottom:14px; margin-bottom:18px; border-bottom:1px solid var(--border); }
-.history-row > small { display:block; color:var(--text-muted); }
+.history-row header { display:flex; gap:12px; align-items:center; justify-content:space-between; }
+.history-row small { display:block; color:var(--text-muted); font-size:11px; }
 .history-task { display:block; background:transparent; color:var(--text-primary); border:0; padding:10px 0; width:100%; text-align:left; }
 .history-task small { display:block; color:var(--text-muted); overflow-wrap:anywhere; }
 .review-notice { color:var(--text-secondary); border-left:2px solid var(--accent); padding-left:12px; }
 .workspace-error { color:var(--danger); overflow-wrap:anywhere; }
 button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-@media(max-width:800px) { .workspace-inspector { width:180px; } .workspace-toolbar { gap:6px; } .workspace-execution { display:none; } }
-@media(max-width:600px) { .workspace-toolbar > strong { flex-basis:100%; } .workspace-navigation.expanded { width:96px; } .workspace-inspector { width:150px; } .stage-scroll, .workspace-messages { padding:12px; } .workspace-composer { padding:6px 12px; } .workspace-composer > small { display:none; } }
+@media(max-width:1100px) { .workspace-navigation { width:164px; } .workspace-inspector { width:180px; } .stage-heading { padding:12px 20px; } }
+@media(max-width:800px) { .workspace-toolbar { gap:6px; } .workspace-execution { display:none; } .stage-scroll { padding:20px; } .workspace-inspector { width:160px; } }
+@media(max-width:600px) { .workspace-toolbar > strong { flex-basis:100%; } .workspace-navigation { width:128px; padding-inline:4px; } .director-flow { margin-left:4px; padding-left:3px; } .workspace-inspector { width:140px; } .stage-scroll, .workspace-messages { padding:12px; } .workspace-composer { padding:6px 12px; } .workspace-composer > small, .composer-context > small, .stage-heading small, .node-version { display:none; } .stage-heading { padding:10px 12px; flex-wrap:wrap; } }
 </style>
