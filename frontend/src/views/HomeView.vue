@@ -244,7 +244,7 @@ async function newConversation(): Promise<void> {
 }
 
 async function selectFastDomain(domain: FastDomain | null): Promise<void> {
-  if (props.domain || switchingFastDomain.value || fastDomainTaskId.value || pendingFastDispatches.has(conversationId.value)) return
+  if (props.domain || switchingFastDomain.value || pendingFastDispatches.has(conversationId.value)) return
   if (!conversationId.value) await initialize()
   if (!conversationId.value || domain === fastDomain.value) return
   switchingFastDomain.value = true
@@ -662,10 +662,10 @@ watch(
 </script>
 
 <template>
-  <component :is="domain ? 'main' : WorkspaceShell" :class="domain ? ['chat-shell', { embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }] : 'home-workspace'" v-bind="domain ? {} : { navigation, activePage: 'conversation', navigationOpen: navOpen, creatingConversation, identity: 'Kantoku', subtitle: '对话工作区', workspaceLabel: '首页对话工作台', hideHeading: true }" @update:navigation-open="navOpen = $event" @new-conversation="newConversation">
+  <component :is="domain ? 'main' : WorkspaceShell" :class="domain ? ['chat-shell', { embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }] : 'home-workspace'" v-bind="domain ? {} : { navigation, activePage: 'conversation', navigationOpen: navOpen, creatingConversation, identity: 'Kantoku', subtitle: '对话工作区', workspaceLabel: '首页对话工作台', hideHeading: true }" @update:navigation-open="navOpen = $event" new-conversation-label="新建对话" @new-conversation="newConversation">
     <template #toolbar><strong class="home-conversation-title">{{ conversationTitle }}</strong></template>
     <template #recent><ConversationHistory list-only :conversations="conversations" :active-id="conversationId" :busy="creatingConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" /></template>
-    <template #composer><MessageComposer :key="conversationId" ref="composer" fast-domains :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p class="home-composer-hint">{{ fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接提问或描述创意，结果会保留在当前对话。' }}</p></template>
+    <template #composer><MessageComposer :key="conversationId" ref="composer" fast-domains :fast-domain="fastDomain" :fast-domain-busy="switchingFastDomain || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p class="home-composer-hint">{{ fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接提问或描述创意，结果会保留在当前对话。' }}</p></template>
     <ConversationHistory v-if="domain && (!studioFocus || historyOpen)" :conversations="conversations" :active-id="conversationId" :busy="sending" @create="newConversation" @select="(id) => { void selectConversation(id); if (studioFocus) historyOpen = false }" @rename="renameChat" @remove="removeChat" />
     <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
     <header v-if="domain" class="chat-home-head">

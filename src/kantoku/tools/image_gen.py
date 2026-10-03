@@ -8,13 +8,14 @@ import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import Path
+from time import perf_counter
 from typing import Protocol
 
 from loguru import logger
 from pydantic import ValidationError
 
 from kantoku.config import BudgetError, ToolError
-from kantoku.config.observability import current_run_id
+from kantoku.config.observability import current_run_id, public_error
 from kantoku.core.budget import (
     ReservationRequest,
     claim_submission,
@@ -206,14 +207,42 @@ def _rejected_result(error: BaseException) -> ImageGenerationResult:
     )
 
 
+def _image_failure(
+    error: Exception, *, provider: ImageProvider, request_id: str,
+    phase: str, started_at: float, provider_job_id: str | None = None,
+    run_id: str | None = None,
+) -> dict[str, object]:
+    identity = provider.generation_identity()
+    return public_error(
+        error, component="image-generation", task_id=request_id,
+        run_id=run_id or current_run_id() or "-", request_id=request_id,
+        generation_request_id=request_id, provider_task_id=provider_job_id,
+        provider=identity.get("provider", "unknown"), model=provider.model_id,
+        base_url=identity.get("base_url", "-"), phase=phase,
+        latency_ms=max(0, round((perf_counter() - started_at) * 1000)),
+    )
+
+
 def _record_result(
     reservation_id: str,
     provider_job_id: str,
     result: ImageGenerationResult,
+    *,
+    provider: ImageProvider,
+    started_at: float,
 ) -> ImageGenerationResult:
     if result.provider_job_id not in {None, provider_job_id}:
         raise ToolError("供应商查询结果的任务 ID 不一致")
     normalized = result.model_copy(update={"provider_job_id": provider_job_id})
+    if normalized.status == "failed" and not normalized.error_id:
+        failure = _image_failure(
+            ToolError(normalized.error or "供应商确认图片生成失败"), provider=provider,
+            request_id=reservation_id, provider_job_id=provider_job_id,
+            phase="query_result", started_at=started_at,
+        )
+        normalized = normalized.model_copy(update={
+            "error_id": failure["error_id"], "trace_id": failure["trace_id"],
+        })
     logger.bind(component="image-generation", generation_request_id=reservation_id,
                 provider_task_id=provider_job_id).info("result status={}", normalized.status)
     mark_outcome(
@@ -332,7 +361,9 @@ def gen_image(
     reservation = reserve(**request.model_dump())
     provider_name = str(provider.generation_identity().get("provider", "unknown"))
     event = logger.bind(component="image-generation", generation_request_id=client_request_id,
-                        idempotency_key=client_request_id, provider=provider_name)
+                        idempotency_key=client_request_id, provider=provider_name,
+                        task_id=client_request_id, model=provider.model_id,
+                        base_url=provider.generation_identity().get("base_url", "-"))
     event.info("reserve status={} est_fen={}", reservation.status, reservation.est_fen)
     if reservation.status != "reserved":
         saved = load_generation_result(client_request_id)
@@ -347,6 +378,8 @@ def gen_image(
             event.bind(provider_task_id=reservation.provider_job_id).info("poll existing task")
             return reconcile_image(client_request_id, provider=provider)
         event.warning("needs_reconciliation provider_task_id missing status={}", reservation.status)
+        if saved is not None:
+            return saved  # Preserve the original diagnostic ID across refresh/recovery.
         return ImageGenerationResult(
             path=None,
             provider_job_id=None,
@@ -360,6 +393,7 @@ def gen_image(
         return ImageGenerationResult(
             status="unknown", error="该请求已由另一执行者领取，请查询原任务"
         )
+    started_at = perf_counter()
     try:
         event.info("submit once")
         provider_job_id = provider.submit(
@@ -379,10 +413,16 @@ def gen_image(
             mark_outcome(client_request_id, "unknown")
             save_generation_result(client_request_id, _unknown_result(None, error))
             raise
+        failure = _image_failure(
+            error, provider=provider, request_id=client_request_id,
+            phase="submit", started_at=started_at,
+        )
         if _submit_rejected(error):
             mark_outcome(client_request_id, "failed")
             event.warning("submit rejected by provider detail={}", str(error)[:200])
-            rejected = _rejected_result(error)
+            rejected = _rejected_result(error).model_copy(update={
+                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
+            })
             save_generation_result(client_request_id, rejected)
             release(client_request_id)
             return rejected
@@ -391,10 +431,13 @@ def gen_image(
             "submit outcome unknown exception={} detail={}",
             type(error).__name__, str(error)[:200],
         )
-        result = _unknown_result(None, error)
+        result = _unknown_result(None, error).model_copy(update={
+            "error_id": failure["error_id"], "trace_id": failure["trace_id"],
+        })
         save_generation_result(client_request_id, result)
         return result
 
+    started_at = perf_counter()
     try:
         event.bind(provider_task_id=provider_job_id).info("poll")
         result = provider.query(provider_job_id)
@@ -405,6 +448,14 @@ def gen_image(
             provider_job_id=provider_job_id,
         )
         result = _unknown_result(provider_job_id, error)
+        if isinstance(error, Exception):
+            failure = _image_failure(
+                error, provider=provider, request_id=client_request_id,
+                provider_job_id=provider_job_id, phase="query", started_at=started_at,
+            )
+            result = result.model_copy(update={
+                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
+            })
         event.bind(provider_task_id=provider_job_id).warning(
             "poll outcome unknown exception={}", type(error).__name__
         )
@@ -412,7 +463,9 @@ def gen_image(
         if isinstance(error, KeyboardInterrupt):
             raise
         return result
-    return _record_result(client_request_id, provider_job_id, result)
+    return _record_result(
+        client_request_id, provider_job_id, result, provider=provider, started_at=started_at,
+    )
 
 
 def reconcile_image(
@@ -437,6 +490,8 @@ def reconcile_image(
         logger.bind(component="image-generation", generation_request_id=client_request_id).warning(
             "needs_reconciliation provider_task_id missing status={}", reservation.status
         )
+        if saved is not None:
+            return saved
         return ImageGenerationResult(
             path=None,
             provider_job_id=None,
@@ -444,17 +499,30 @@ def reconcile_image(
             actual_fen=None,
             error="NEEDS_RECONCILIATION：供应商任务 ID 未返回，需要人工查账",
         )
+    started_at = perf_counter()
     try:
         logger.bind(component="image-generation", generation_request_id=client_request_id,
                     provider_task_id=reservation.provider_job_id).info("poll existing task")
         result = provider.query(reservation.provider_job_id)
     except (Exception, KeyboardInterrupt) as error:
         result = _unknown_result(reservation.provider_job_id, error)
+        if isinstance(error, Exception):
+            failure = _image_failure(
+                error, provider=provider, request_id=client_request_id,
+                provider_job_id=reservation.provider_job_id, run_id=reservation.run_id,
+                phase="reconcile", started_at=started_at,
+            )
+            result = result.model_copy(update={
+                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
+            })
         save_generation_result(client_request_id, result)
         if isinstance(error, KeyboardInterrupt):
             raise
         return result
-    return _record_result(client_request_id, reservation.provider_job_id, result)
+    return _record_result(
+        client_request_id, reservation.provider_job_id, result,
+        provider=provider, started_at=started_at,
+    )
 
 
 def release_failed_image(client_request_id: str) -> None:

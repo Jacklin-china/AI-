@@ -105,3 +105,52 @@ def test_error_classification_and_development_log_archive(
     assert classify_error(
         RateLimitError("limit", response=response, body=None)
     ).value == "retryable"
+
+
+def test_native_exception_keeps_sanitized_chained_traceback_in_both_sinks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    monkeypatch.setenv("KANTOKU_TEST_API_KEY", "trace-private-credential-456")
+    try:
+        logging_setup.setup_logging("INFO")
+        try:
+            try:
+                raise ValueError("trace-private-credential-456 upstream failure")
+            except ValueError as cause:
+                raise RuntimeError("image parser failed") from cause
+        except RuntimeError:
+            logger.bind(trace_id="trace-native", run_id="run-native", task_id="image-native",
+                        provider="qwen", model="configured-model").exception("image_failure")
+    finally:
+        logger.remove()
+    console = capsys.readouterr().err
+    file = (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8")
+    for content in (console, file):
+        for fragment in ("test_logging.py", "ValueError", "RuntimeError", "Traceback",
+                         "trace-native", "run-native", "image-native", "configured-model"):
+            assert fragment in content
+        assert "trace-private-credential-456" not in content
+
+
+def test_error_conversion_keeps_original_identifier_and_http_diagnostics(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    try:
+        logging_setup.setup_logging("INFO")
+        response = MagicMock(status_code=401, request=MagicMock(), headers={"x-request-id": "up-1"})
+        error = AuthenticationError("request rejected", response=response,
+                                    body={"error": {"code": "InvalidKey", "message": "denied"}})
+        first = public_error(error, trace_id="trace-http", provider="qwen",
+                             model="qwen-image-2.0-pro", base_url="https://image.example/api/v1")
+        assert public_error(error) == first
+    finally:
+        logger.remove()
+    rows = [json.loads(line)["record"] for line in
+            (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8").splitlines()]
+    failures = [row for row in rows if row["extra"]["error_id"] == first["error_id"]]
+    assert len(failures) == 1
+    assert failures[0]["extra"]["http_status"] == "401"
+    assert failures[0]["extra"]["provider_error_code"] == "InvalidKey"
+    assert failures[0]["extra"]["provider_error_message"] == "denied"

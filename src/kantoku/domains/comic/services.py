@@ -82,7 +82,13 @@ class StudioComicServices:
                     reason[:120],
                     needs_reconciliation="NEEDS_RECONCILIATION" in reason,
                 )
-            raise ToolError(f"图片生成未完成：{reason[:120]}")
+            error = ToolError("图片生成失败；请按错误编号查看后端日志。")
+            if result.error_id:
+                error._kantoku_public_failure = {
+                    "error_id": result.error_id, "trace_id": result.trace_id or "-",
+                    "error_kind": "fatal", "safe_message": error.message, "retryable": False,
+                }
+            raise error
         return {
             "image_path": str(result.path),
             "provider_job_id": result.provider_job_id,

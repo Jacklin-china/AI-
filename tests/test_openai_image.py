@@ -477,6 +477,78 @@ def test_protocol_error_never_retries_paid_submit_or_switches_protocol(
         client.close()
 
 
+def test_qwen_http_failure_has_traceback_diagnostics_and_stable_error_id(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from loguru import logger
+    from test_image_gen import _settings as budget_settings
+
+    from kantoku.config import logging_setup
+    from kantoku.config.observability import request_trace, run_trace
+    from kantoku.core import budget
+    from kantoku.tools.image_gen import gen_image
+
+    requests = []
+
+    def handle(request):
+        requests.append(request)
+        return httpx2.Response(
+            400, headers={"x-request-id": "qwen-request-400"},
+            json={"code": "InvalidParameter", "message": "unsupported size"},
+        )
+
+    monkeypatch.setattr(budget, "get_settings", lambda: budget_settings(tmp_path / "budget.db"))
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    client = OpenAI(base_url=_DASHSCOPE_BASE_URL, api_key="offline-test-key", max_retries=0,
+                    http_client=httpx2.Client(transport=httpx2.MockTransport(handle)))
+    provider = AlibabaQwenImageProvider(settings=_settings(
+        tmp_path, provider="alibaba-qwen-image", protocol="dashscope-multimodal",
+        base_url=_DASHSCOPE_BASE_URL, model="qwen-image-2.0-pro",
+    ), client=client)
+    try:
+        logging_setup.setup_logging("INFO")
+        with request_trace("trace-qwen-failed"), run_trace("run-qwen-failed", "generate"):
+            result = gen_image("offline request", 1, project="test", episode="test",
+                               client_request_id="image-qwen-400", provider=provider, est_fen=30)
+            restored = gen_image("offline request", 1, project="test", episode="test",
+                                 client_request_id="image-qwen-400", provider=provider, est_fen=30)
+        assert result.status == "failed" and result.path is None
+        assert restored.error_id == result.error_id
+        assert len(requests) == 1
+        assert json.loads(requests[0].content)["model"] == "qwen-image-2.0-pro"
+        assert budget.get_reservation("image-qwen-400").status == "released"
+    finally:
+        client.close()
+        logger.remove()
+    for output in (capsys.readouterr().err,
+                   (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8")):
+        for field in ("openai_image.py", "image_gen.py", "BadRequestError", "Traceback",
+                      "qwen-request-400", "InvalidParameter", "unsupported size", "400",
+                      "latency_ms", "run-qwen-failed", "trace-qwen-failed", result.error_id):
+            assert field in output
+        assert "offline-test-key" not in output
+
+
+def test_dashscope_business_error_keeps_public_diagnostics_without_leaking_to_client(
+    tmp_path: Path,
+) -> None:
+    client = _client()
+    client.post = MagicMock(return_value={
+        "code": "ModelNotFound", "message": "model unavailable", "request_id": "request-business",
+    })
+    provider = AlibabaQwenImageProvider(settings=_settings(
+        tmp_path, provider="alibaba-qwen-image", protocol="dashscope-multimodal",
+        base_url=_DASHSCOPE_BASE_URL, model="future-configured-model",
+    ), client=client)
+    with pytest.raises(ToolError) as caught:
+        provider.submit(prompt="request", shot_no=1, client_request_id="business-error",
+                        reference_urls=(), seed=None)
+    assert caught.value.provider_error_code == "ModelNotFound"
+    assert caught.value.provider_error_message == "model unavailable"
+    assert caught.value.request_id == "request-business"
+    assert "model unavailable" not in str(caught.value)
+
+
 def test_qwen_output_safety_is_validated_before_submission_not_model_selection(
     tmp_path: Path,
 ) -> None:

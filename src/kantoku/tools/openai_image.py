@@ -241,10 +241,18 @@ class OpenAIImageProvider:
         started_at = perf_counter()
         ok = False
         error_name: str | None = None
+        response_request_id: str | None = None
         try:
             response = self._generate_response(
                 prompt=prompt, reference_urls=reference_urls, client_request_id=client_request_id,
             )
+            response_request_id = getattr(response, "_request_id", None)
+            logger.bind(
+                component="image-provider", provider=self.settings.provider, model=self.model_id,
+                base_url=self.settings.base_url, request_id=client_request_id,
+                provider_request_id=response_request_id or "-",
+                latency_ms=max(0, round((perf_counter() - started_at) * 1000)),
+            ).info("image response received; validating and persisting artifact data")
             data = getattr(response, "data", None)
             if not isinstance(data, list) or len(data) != 1:
                 raise ToolError("生图接口未返回唯一图片，费用需要人工对账")
@@ -264,6 +272,8 @@ class OpenAIImageProvider:
             return provider_job_id
         except Exception as error:
             error_name = self._safe_error(error)
+            if response_request_id and not getattr(error, "request_id", None):
+                error.request_id = response_request_id
             if isinstance(error, ToolError):
                 raise
             raise ToolError(
@@ -397,7 +407,10 @@ class OpenAIImageProvider:
                 )
             )
         except Exception as trace_error:
-            logger.error("GPT-Image trace 写入失败：{}", type(trace_error).__name__)
+            logger.bind(
+                component="image-provider", provider=self.settings.provider, model=self.model_id,
+                base_url=self.settings.base_url,
+            ).opt(exception=trace_error).error("image trace persistence failed")
 
 
 class AlibabaQwenImageProvider(OpenAIImageProvider):
@@ -443,7 +456,12 @@ class AlibabaQwenImageProvider(OpenAIImageProvider):
             options={"headers": {"Idempotency-Key": client_request_id}},
         )
         if not isinstance(response, dict) or response.get("code"):
-            raise ToolError("DashScope 生图未返回成功结果，费用需要人工对账")
+            error = ToolError("DashScope 生图未返回成功结果，费用需要人工对账")
+            if isinstance(response, dict):
+                error.request_id = response.get("request_id")
+                error.provider_error_code = response.get("code")
+                error.provider_error_message = response.get("message")
+            raise error
         # Normalize the wire response only; persistence/query/trace stay in the shared path.
         try:
             choices = response["output"]["choices"]
@@ -457,8 +475,12 @@ class AlibabaQwenImageProvider(OpenAIImageProvider):
             if len(images) != 1 or not isinstance(images[0], str) or not images[0]:
                 raise ValueError("non-unique image")
         except (KeyError, TypeError, ValueError) as error:
-            raise ToolError("DashScope 生图未返回唯一图片，费用需要人工对账") from error
-        return SimpleNamespace(data=[SimpleNamespace(url=images[0])])
+            failure = ToolError("DashScope 生图未返回唯一图片，费用需要人工对账")
+            failure.request_id = response.get("request_id")
+            raise failure from error
+        return SimpleNamespace(
+            data=[SimpleNamespace(url=images[0])], _request_id=response.get("request_id"),
+        )
 
     def check_access(self) -> ProviderAccessResult:
         """兼容接口没有可靠的免计费生图探针，不能把模型查询冒充可用性验证。"""

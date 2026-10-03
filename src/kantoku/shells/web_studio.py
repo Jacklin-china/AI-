@@ -492,8 +492,10 @@ class StudioApplication:
                     reservation = budget.get_reservation(generation_request_id)
                     if not (message.type == MessageType.STATUS and reservation
                             and reservation.provider_job_id):
+                        result = budget.load_generation_result(generation_request_id)
                         self.runtime_store.update_media_job(
                             generation_request_id, MediaJobStatus.FAILED,
+                            error_id=result.error_id if result else None,
                             error_message=message.content,
                         )
                         self.runtime_store.finish_fast_domain_task(
@@ -762,20 +764,18 @@ class StudioApplication:
         ).model_dump(mode="json")
 
     def _reconcile_fast_domain(self, conversation_id: str) -> None:
-        """Recover the one-shot selection after a run ends, including after restart."""
+        """Consume legacy selections once bound; the durable task remains independent."""
         conversation = self.runtime_store.get_conversation(conversation_id)
         task_id = conversation.fast_domain_task_id
         if not task_id:
             return
         job = self.runtime_store.get_media_job(task_id)
         if job is not None:
-            if job.status in {MediaJobStatus.COMPLETED, MediaJobStatus.FAILED}:
-                self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
+            self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
             return
         if task_id.startswith("run-"):
-            run = self.runtime_store.get_run(task_id)
-            if run.status in TERMINAL_STATUSES:
-                self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
+            self.runtime_store.get_run(task_id)
+            self.runtime_store.finish_fast_domain_task(conversation_id, task_id)
 
     def decide_media_cost(
         self, conversation_id: str, generation_request_id: str, approve: bool,

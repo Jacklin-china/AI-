@@ -92,6 +92,33 @@ def classify_error(error: Exception) -> ErrorKind:
 
 def public_error(error: Exception, **context: Any) -> dict[str, Any]:
     """Log traceback once and return a prompt/key-safe client payload."""
+    saved = getattr(error, "_kantoku_public_failure", None)
+    if isinstance(saved, dict) and saved.get("error_id"):
+        return saved
+    # Only read public diagnostic fields, never raw request headers or bodies.
+    current: BaseException | None = error
+    seen: set[int] = set()
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        for attribute, key in (
+            ("status_code", "http_status"), ("request_id", "provider_request_id"),
+            ("provider_error_code", "provider_error_code"),
+            ("provider_error_message", "provider_error_message"),
+        ):
+            value = getattr(current, attribute, None)
+            if isinstance(value, (str, int)):
+                context.setdefault(key, redact_secrets(str(value))[:1000])
+        body = getattr(current, "body", None)
+        if isinstance(body, dict):
+            detail = body.get("error", body)
+            if isinstance(detail, dict):
+                for key in ("code", "message"):
+                    value = detail.get(key)
+                    if isinstance(value, (str, int)):
+                        context.setdefault(
+                            f"provider_error_{key}", redact_secrets(str(value))[:1000],
+                        )
+        current = current.__cause__
     error_id = f"ERR-{uuid4().hex[:8].upper()}"
     kind = classify_error(error)
     safe_message = (
@@ -104,14 +131,18 @@ def public_error(error: Exception, **context: Any) -> dict[str, Any]:
         "scope={} traceback={} cause={}",
         error_id, kind.value, type(error).__name__, redact_secrets(str(error))[:500],
         {key: value for key, value in context.items()
-         if key in {"project_id", "run_id", "task_id", "asset_id", "brief_version", "model"}},
+         if key in {"project_id", "run_id", "task_id", "asset_id", "brief_version", "model",
+                    "provider", "base_url", "request_id", "provider_request_id", "http_status",
+                    "provider_error_code", "provider_error_message", "latency_ms", "phase"}},
         stack,
         type(error.__cause__).__name__ if error.__cause__ else "-",
     )
-    return {
+    failure = {
         "error_id": error_id,
         "trace_id": trace_id,
         "error_kind": kind.value,
         "safe_message": safe_message,
         "retryable": kind is ErrorKind.RETRYABLE,
     }
+    error._kantoku_public_failure = failure
+    return failure

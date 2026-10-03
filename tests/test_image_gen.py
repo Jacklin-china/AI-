@@ -11,8 +11,8 @@ from types import SimpleNamespace
 
 import pytest
 
-from kantoku.config import BudgetError, ToolError
-from kantoku.config.observability import run_trace
+from kantoku.config import BudgetError, ToolError, logging_setup
+from kantoku.config.observability import request_trace, run_trace
 from kantoku.core import budget
 from kantoku.schemas.media import ImageGenerationResult
 from kantoku.tools import image_gen
@@ -78,6 +78,45 @@ def test_fake_generation_runs_reserve_submit_query_and_settle(tmp_path: Path) ->
     assert saved.status == "settled"
     assert saved.actual_fen == 30
     assert provider.submit_count == 1
+
+
+def test_unknown_submission_logs_full_cause_and_persists_error_id_without_resubmission(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from loguru import logger
+
+    provider = LocalFakeImageProvider(
+        tmp_path / "images", model_id="configured-model", actual_fen=30,
+    )
+    calls = []
+
+    def fail(**_kwargs):
+        calls.append("submit")
+        try:
+            raise ConnectionError("upstream unavailable")
+        except ConnectionError as cause:
+            raise ToolError("生图结果未确认") from cause
+
+    monkeypatch.setattr(provider, "submit", fail)
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    try:
+        logging_setup.setup_logging("INFO")
+        with request_trace("trace-image-error"), run_trace("run-image-error", "generate"):
+            result = _generate(provider)
+            restored = _generate(provider)
+    finally:
+        logger.remove()
+    assert result.status == "unknown" and result.path is None
+    assert restored.error_id == result.error_id and result.error_id.startswith("ERR-")
+    assert result.trace_id == "trace-image-error"
+    assert calls == ["submit"]
+    saved = budget.load_generation_result("request-1")
+    assert saved.error_id == result.error_id
+    for content in (capsys.readouterr().err,
+                    (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8")):
+        for fragment in ("ConnectionError", "test_image_gen.py", "image_gen.py", "Traceback",
+                         "run-image-error", "request-1", "configured-model", result.error_id):
+            assert fragment in content
 
 
 def test_ten_shot_dry_run_stays_far_below_video_budget(tmp_path: Path) -> None:

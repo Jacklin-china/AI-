@@ -21,6 +21,8 @@ class ImageGenerationResult(BaseModel):
     status: ImageGenerationStatus
     actual_fen: int | None = Field(default=None, ge=0)
     error: NonBlank | None = None
+    error_id: NonBlank | None = None
+    trace_id: NonBlank | None = None
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:

@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import re
 import sys
+import traceback
 from contextlib import suppress
 from datetime import UTC, datetime
 from pathlib import Path
@@ -53,13 +54,18 @@ def redact_secrets(message: str) -> str:
 
 
 def _patch_record(record: dict[str, object]) -> bool:
+    exception = record.get("exception")
+    if exception is not None:
+        # Keep frames and chained causes, never Loguru's local-variable diagnostics.
+        stack = "".join(traceback.format_exception(*exception))
+        record["message"] = f"{record['message']}\n{stack}"
     record["message"] = redact_secrets(str(record["message"]))
     extra = record["extra"]
     if isinstance(extra, dict):
         for key, value in tuple(extra.items()):
             extra[key] = redact_secrets(str(value))
     # Loguru's native exception object can include unsanitized provider text.
-    # public_error() records safe traceback frames and the error ID explicitly.
+    # The sanitized stack above replaces the unsafe native exception object.
     record["exception"] = None
     return True
 
@@ -98,7 +104,8 @@ def setup_logging(level: str | None = None) -> None:
         format=("<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | "
                 "{extra[component]} | trace={extra[trace_id]} | "
                 "project={extra[project_id]} run={extra[run_id]} task={extra[task_id]} | "
-                "<cyan>{module}:{line}</cyan> | {message}"),
+                "error={extra[error_id]} provider={extra[provider]} model={extra[model]} | "
+                "<cyan>{file.path}:{function}:{line}</cyan> | {message}"),
         colorize=None,
         diagnose=False,
         filter=_console_filter,
@@ -118,6 +125,7 @@ def setup_logging(level: str | None = None) -> None:
         "component": "app", "trace_id": "-", "conversation_id": "-", "run_id": "-", "node_id": "-",
         "message_id": "-", "skill": "-", "provider": "-", "provider_request_id": "-",
         "request_id": "-", "error_id": "-", "project_id": "-", "task_id": "-",
+        "model": "-",
     })
 
 

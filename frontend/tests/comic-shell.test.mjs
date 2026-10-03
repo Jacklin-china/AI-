@@ -23,7 +23,7 @@ const Icon = () => h('span', { 'aria-hidden': true })
 async function render(page, navigationOpen = true) {
   return renderToString(createSSRApp({ render: () => h(Shell, {
     navigation: pages.map(label => ({ id: label, label, icon: Icon })), activePage: page,
-    navigationOpen, creatingConversation: false,
+    navigationOpen, creatingConversation: false, newConversationLabel: '新建对话',
   }, {
     recent: () => h('button', { 'aria-current': 'true' }, '当前创作对话'),
     toolbar: () => h('span', '当前作品'), heading: () => h('h2', page),
@@ -51,4 +51,14 @@ test('collapsing the second sidebar keeps its conversations and composer mounted
   assert.match(html, /aria-label="展开导航"/)
   assert.match(html, /当前创作对话/)
   assert.match(html, /尚未发送的补充/)
+})
+
+test('homepage supplies the real shared new-conversation action, never an empty label', async () => {
+  const home = readFileSync(new URL('../src/views/HomeView.vue', import.meta.url), 'utf8')
+  assert.match(home, /new-conversation-label="新建对话"/)
+  assert.match(home, /@new-conversation="newConversation"/)
+  assert.match(home, /await createConversation\(/)
+  assert.match(home, /await selectConversation\(created\.id\)/)
+  assert.doesNotMatch(home, /:fast-domain-busy="[^"\n]*fastDomainTaskId/)
+  assert.match(await render('对话'), /新建对话/)
 })

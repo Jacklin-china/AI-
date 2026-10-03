@@ -82,8 +82,8 @@ class ConversationImageService:
                     ("原请求状态未知且缺少供应商任务 ID，需要人工对账；不会重复提交或扣费。"
                      if not result.provider_job_id else
                      "原生成请求仍在查询，稍后可说‘继续任务’；不会重复提交或扣费。")
-                    if unknown else "这次生图未完成；不会自动重新付费提交。"
-                ),
+                    if unknown else "图片生成失败；不会自动重新付费提交。"
+                ) + (f" 错误编号：{result.error_id}" if result.error_id else ""),
                 event_id=f"generation-status:{generation_request_id}:{result.status}",
             )
         if not result.path.is_file():

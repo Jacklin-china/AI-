@@ -267,6 +267,61 @@ def test_explicit_null_does_not_inherit_pending_selection(
     assert next(data for event, data in second if event == "intent")["domain"] is None
 
 
+def test_legacy_waiting_run_cannot_lock_quick_menu_after_reload(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    waiting = _run(_send(app, cid))
+    app.runtime_store.set_conversation_domain(cid, "comic")
+    app.runtime_store.bind_fast_domain_task(cid, waiting["id"])
+    detail = app.conversation(cid)
+    assert detail["domain"] is None and detail["fast_domain_task_id"] is None
+    assert app.runtime_store.get_run(waiting["id"]).status is ExecutionStatus.WAITING
+    assert app.set_fast_domain(cid, "studio")["domain"] == "studio"
+    assert app.runtime_store.approval_for_node(waiting["id"], "director_gate").decision == "pending"
+
+
+def test_http_new_conversation_stays_empty_and_old_chat_artifact_remains_accessible(
+    app: web_studio.StudioApplication, production: list[str], server: int,
+) -> None:
+    connection = HTTPConnection("127.0.0.1", server, timeout=10)
+    headers = {"X-Studio-Token": app.token, "Content-Type": "application/json"}
+
+    def request(method, path, body=None):
+        connection.request(method, path, body=json.dumps(body) if body is not None else None,
+                           headers=headers)
+        response = connection.getresponse()
+        payload = json.loads(response.read())
+        assert response.status in {200, 201}, payload
+        return payload
+
+    try:
+        old = request("POST", "/api/conversations", {"interaction_mode": "autonomous"})
+        run = _run(_send(app, old["id"]))
+        completed = _confirm(app, run)
+        original = request("GET", f"/api/conversations/{old['id']}")
+        assert any(message["run_id"] == completed["id"] for message in original["messages"])
+        artifact = request("GET", f"/api/artifacts/{completed['state']['image_artifact_id']}")
+        assert artifact["conversation_id"] == old["id"] and artifact["type"] == "image"
+        connection.request("GET", f"/api/artifacts/{artifact['id']}/content", headers=headers)
+        response = connection.getresponse()
+        assert response.status == 200 and response.read().startswith(b"\x89PNG")
+        new = request("POST", "/api/conversations", {"interaction_mode": "autonomous"})
+        assert new["id"] != old["id"]
+        empty = request("GET", f"/api/conversations/{new['id']}")
+        assert empty["messages"] == [] and empty["active_run_id"] is None
+        assert empty["domain"] is None and empty["media_jobs"] == []
+        _send(app, new["id"], content="中式修仙少女站在竹林", generation_request_id="fresh-http")
+        updated = request("GET", f"/api/conversations/{new['id']}")
+        assert updated["active_run_id"] != original["active_run_id"]
+        assert updated["messages"][0]["content"] == "中式修仙少女站在竹林"
+        restored = request("GET", f"/api/conversations/{old['id']}")
+        assert restored["messages"] == original["messages"]
+        assert request("GET", f"/api/conversations/{new['id']}")["messages"] == updated["messages"]
+    finally:
+        connection.close()
+
+
 @pytest.mark.parametrize(
     "domain,mode", [("unknown", "fast"), ("comic", "normal"), ("comic", "professional")]
 )

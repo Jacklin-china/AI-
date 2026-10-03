@@ -1483,15 +1483,17 @@ def test_home_cost_confirmation_resumes_same_media_job(
     assert any(name == "cost_approval" for name, _ in events)
     assert app.image_service.provider.submit_count == 0
     waiting = app.conversation(conversation_id)
-    assert waiting["domain"] == "studio"
-    assert waiting["fast_domain_task_id"] == request_id
+    assert waiting["domain"] is None
+    assert waiting["fast_domain_task_id"] is None
     assert waiting["media_jobs"][0]["approval_status"] == "pending"
+    # A consumed skill cannot disable the menu while its own approval is pending.
+    assert app.set_fast_domain(conversation_id, "comic")["domain"] == "comic"
 
     app.decide_media_cost(conversation_id, request_id, True)
     app._media_futures[request_id].result(timeout=10)
     complete = app.conversation(conversation_id)
     assert app.image_service.provider.submit_count == 1
-    assert complete["domain"] is None
+    assert complete["domain"] == "comic"  # The older job must not clear a newer selection.
     assert complete["fast_domain_task_id"] is None
     assert complete["media_jobs"][0]["status"] == "completed"
     assert any(message["artifact_id"] for message in complete["messages"])
