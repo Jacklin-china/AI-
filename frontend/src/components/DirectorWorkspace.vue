@@ -1,14 +1,16 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelLeft, PanelRight, ArrowLeft, ArrowRight, X, Check } from 'lucide-vue-next'
+import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelRight, ArrowLeft, ArrowRight, X, Check, Pencil, Trash2 } from 'lucide-vue-next'
 import MessageComposer from './chat/MessageComposer.vue'
 import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
+import ComicWorkspaceShell from './layout/ComicWorkspaceShell.vue'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import { navigate, route } from '../router'
 import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
-import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import type { Conversation, ConversationMessage } from '../types'
 import type { CoreRun } from '../types'
 
 const props = defineProps<{ initialRunId?: string }>()
@@ -67,6 +69,84 @@ const navigation = [
   { id: 'prompt', label: 'Prompt', icon: FileText },
   { id: 'history', label: '历史', icon: History },
 ]
+/* 对话线程与工作流执行记录是两类数据：左侧只列用户 ↔ AI 的聊天线程。 */
+const conversations = ref<Conversation[]>([])
+const conversationSearch = ref('')
+const editingConversation = ref('')
+const conversationTitle = ref('')
+const conversationBusy = ref(false)
+const activeConversationId = ref('')
+/* Conversation（用户 ↔ AI 聊天）与 Run History（执行记录）是两套数据，这里只装聊天。 */
+const conversationMessages = ref<ConversationMessage[]>([])
+interface ChatTurn { id: string; role: 'user' | 'assistant'; content: string }
+async function loadConversationMessages(id: string): Promise<void> {
+  if (!id) { conversationMessages.value = []; return }
+  const loaded = await getConversation(id).catch(() => null)
+  conversationMessages.value = (loaded?.messages ?? []).filter(item => item.role !== 'system' && item.content.trim())
+}
+const chatTurns = computed<ChatTurn[]>(() => {
+  const turns: ChatTurn[] = conversationMessages.value.map(item => ({ id: item.id, role: item.role === 'user' ? 'user' : 'assistant', content: item.content }))
+  const known = new Set(turns.map(item => item.content.trim()))
+  for (const entry of transcript.value) {
+    if (entry.text && !known.has(entry.text.trim())) { turns.push({ id: `run-user-${entry.execution.run_id}`, role: 'user', content: entry.text }); known.add(entry.text.trim()) }
+    const answer = entry.answer || entry.label
+    if (answer && !known.has(answer.trim())) { turns.push({ id: `run-ai-${entry.execution.run_id}`, role: 'assistant', content: answer }); known.add(answer.trim()) }
+  }
+  return turns
+})
+
+const visibleConversations = computed(() => {
+  const keyword = conversationSearch.value.trim().toLowerCase()
+  if (!keyword) return conversations.value
+  return conversations.value.filter((item) => item.title.toLowerCase().includes(keyword))
+})
+
+async function loadConversations(): Promise<void> {
+  conversations.value = await getConversations('comic').catch(() => [])
+}
+async function startConversation(): Promise<void> {
+  if (conversationBusy.value) return
+  conversationBusy.value = true
+  try {
+    const created = await createConversation('guided', 'comic')
+    activeConversationId.value = created.id
+    conversationMessages.value = []
+    await loadConversations()
+    chatExpanded.value = true
+    inspectorOpen.value = false
+  } catch (failure) {
+    error.value = failureText(failure)
+  } finally {
+    conversationBusy.value = false
+  }
+}
+
+async function openConversation(id: string): Promise<void> {
+  activeConversationId.value = id
+  chatExpanded.value = true
+  inspectorOpen.value = false
+  await loadConversationMessages(id)
+}
+
+function beginConversationRename(item: Conversation): void {
+  editingConversation.value = item.id
+  conversationTitle.value = item.title
+}
+
+async function finishConversationRename(): Promise<void> {
+  const id = editingConversation.value
+  const title = conversationTitle.value.trim()
+  editingConversation.value = ''
+  if (!id || !title) return
+  await renameConversation(id, title).catch((failure) => { error.value = failureText(failure) })
+  await loadConversations()
+}
+
+async function removeConversation(id: string): Promise<void> {
+  await deleteConversation(id).catch((failure) => { error.value = failureText(failure) })
+  if (activeConversationId.value === id) { activeConversationId.value = ''; conversationMessages.value = [] }
+  await loadConversations()
+}
 const assetFieldLabels: Record<string, string> = {
   appearance: '外观', clothing: '服装', traits: '特征', location: '地点', time: '时间', weather: '天气',
   lighting: '光影', atmosphere: '氛围', environment_features: '环境特点', visual_style: '视觉风格',
@@ -77,7 +157,6 @@ const summary = computed(() => restoredSpec.value ? undefined : active.value?.di
 const spec = computed(() => restoredSpec.value ?? active.value?.director_spec ?? null)
 const node = computed(() => summary.value?.stages.find(item => item.stage === selectedStage.value))
 const hasRunning = computed(() => executions.value.some(item => ['running', 'pending'].includes(item.status) && !item.recovery_required))
-// All pages edit one version-bound draft, not independent copies of DirectorSpec.
 const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', spec.value?.schema_version === 2 ? `version:${spec.value.version}` : active.value?.run_id ?? '', spec.value?.schema_version === 2 ? 'director_assemble' : selectedStage.value))
 const fields = computed(() => drafts.value[draftKey.value] ?? {})
 const editing = computed(() => selectedStage.value !== 'director_assemble' && (spec.value?.schema_version === 2
@@ -88,24 +167,30 @@ const confirmable = computed(() => canConfirmDirector(restoredSpec.value ? 'comp
 const confirmed = computed(() => confirmable.value && spec.value?.user_confirmed === true)
 const editable = computed(() => spec.value?.schema_version === 2 ? !stale.value && editableDirectorNode(selectedStage.value) : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const visibleNodes = computed(() => mode.value === 'fast' ? fastDirectorNodeLabels : directorNodeLabels)
+const projectTitle = computed(() => workspaceProjectTitle(project.value?.project.title ?? '', project.value?.creative_brief.original_request ?? ''))
 const title = computed(() => section.value === 'director' ? visibleNodes.value[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
 const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
-const projectTitle = computed(() => workspaceProjectTitle(project.value?.project.title, project.value?.creative_brief.original_request))
 const runningExecution = computed(() => executions.value.find(item => ['running', 'pending'].includes(item.status) && !item.recovery_required))
 const canDispatch = computed(() => canDispatchDirectorInput({ busy: busy.value, running: hasRunning.value, loading: loading.value, error: !!error.value, cancelling: cancelling.value }))
 const transcript = computed(() => chronologicalDirectorExecutions(executions.value, runs.value).map(item => {
   const run = runs.value[item.run_id]
   const text = String(run?.state.task ?? '')
-  const rerun = String(run?.state.rerun_from ?? '').replace('comic.', '')
-  return { execution: item, text: rerun ? `修改 / 重新执行：${directorNodeLabels[rerun] ?? rerun}` : text,
+  // 聊天里只保留用户自己的创作表达；重跑/节点名属于执行记录，不进对话。
+  return { execution: item, text,
     answer: directorConversationSummary(item.director_spec), label: item.director_execution_summary.status_label }
+}))
+/* 执行记录（Run History）与创作对话分开：失败 / Trace 只在这里呈现。 */
+const runHistory = computed(() => chronologicalDirectorExecutions(executions.value, runs.value).map(item => {
+  const run = runs.value[item.run_id]
+  return { run_id: item.run_id, status: item.status, label: `${item.director_execution_summary.mode === 'fast' ? '普通模式' : '专业模式'} · ${String(run?.state.task ?? item.run_id).slice(0, 24)}`,
+    error: item.status === 'failed' ? (item.director_execution_summary.error_id ?? run?.error ?? '任务未完成') : '',
+    trace: String(run?.state.trace_id ?? ''), resumable: item.recovery_required || !!summary.value?.available_actions.includes('resume') }
 }))
 function nodeState(stage: string): string {
   if (stale.value) return '已过期'
   if (restoredSpec.value) return '保存的方案'
   const actual = summary.value?.stages.find(item => item.stage === stage)
-  // A saved plan is not evidence that a node was executed. Fast runs hide these records.
   return actual ? directorStateLabels[actual.status] ?? actual.status : spec.value ? '方案内容' : '未开始'
 }
 function nodeStatus(stage: string): string {
@@ -115,7 +200,6 @@ function openDraft(runId?: string): void {
   if (runId && runId !== active.value?.run_id) { selectedRun.value = runId; restoredSpec.value = null }
   visitStage('director_assemble')
 }
-
 function failureText(failure: unknown): string {
   if (failure instanceof CoreApiError) return `${failure.message}${failure.traceId ? ` · Trace：${failure.traceId}` : ''}`
   return failure instanceof Error ? failure.message : '操作未完成，请查看真实任务状态'
@@ -248,6 +332,7 @@ async function execute(text: string, options: Record<string, unknown> = {}, sele
 function sendInput(text: string): void {
   if (!text.trim()) return
   chatExpanded.value = true
+  void titleConversation(text)
   if (revisionVersion.value !== null) { void saveFinal(text); return }
   if (busy.value || hasRunning.value || cancelling.value || queuedInputs.value.length) {
     queuedInputs.value.push({ id: ++nextInputId, text, mode: mode.value })
@@ -255,6 +340,16 @@ function sendInput(text: string): void {
     return
   }
   void execute(text)
+}
+/* 新对话默认标题是占位名：用户发出第一条创作需求后，用需求本身命名，历史才可读。 */
+async function titleConversation(text: string): Promise<void> {
+  const id = activeConversationId.value
+  const current = conversations.value.find(item => item.id === id)
+  if (!id || !current || !/^新对话$/.test(current.title)) return
+  const title = text.trim().replace(/\s+/g, ' ').slice(0, 24)
+  if (!title) return
+  await renameConversation(id, title).catch(() => {})
+  await loadConversations()
 }
 async function dispatchQueued(explicit = false): Promise<void> {
   if (explicit) error.value = ''
@@ -370,11 +465,9 @@ function openSection(id: string): void {
 function scrollState(): void { const el = timeline.value; if (el) nearBottom.value = el.scrollHeight - el.scrollTop - el.clientHeight < 80 }
 function previewReference(media: { url: string }): void { window.open(media.url, '_blank', 'noopener') }
 watch(section, () => { void loadPage() })
-// Node navigation changes the URL only. The Workspace and its single Chat remain mounted.
 watch(() => [route.value.workspacePage, route.value.directorStage], async ([page, stage]) => {
   applyingRoute = true
   chatExpanded.value = !page || page === 'conversation'
-  // Opening Chat does not reset the node to which the user will return.
   if (page && page !== 'conversation') {
     section.value = page
     if (page === 'director') selectedStage.value = stage ?? 'director_assemble'
@@ -382,7 +475,6 @@ watch(() => [route.value.workspacePage, route.value.directorStage], async ([page
   if (!loading.value && mode.value === 'fast' && selectedStage.value === 'director_critic') {
     navigate({ ...route.value, directorStage: 'director_assemble' }, true)
   }
-  // Browser back/forward is read-only navigation, not another pushed history entry.
   await nextTick()
   applyingRoute = false
 }, { flush: 'sync' })
@@ -414,7 +506,6 @@ onMounted(async () => {
     if (id) {
       project.value = await getComicProject(id); await refresh()
       if (project.value) localStorage.setItem('kantoku-comic-project', id)
-      // 作品级 Workspace 恢复当前版本；入口 URL 可能仍指向第一轮 Run。
       selectedRun.value = executions.value.find(item => item.director_spec?.version === project.value?.project.director_version)?.run_id
         ?? (legacy?.workflow === 'comic.director' ? legacy.id : '')
       const viewMode = sessionStorage.getItem(`kantoku-comic-view-mode:${id}`)
@@ -423,6 +514,9 @@ onMounted(async () => {
     }
     if (legacy && legacy.workflow !== 'comic.director') { section.value = 'assets'; chatExpanded.value = false }
     await loadPage()
+    await loadConversations()
+    activeConversationId.value = conversations.value[0]?.id ?? ''
+    await loadConversationMessages(activeConversationId.value)
   } catch (failure) { error.value = failureText(failure) }
   finally { loading.value = false }
   timer = setInterval(() => { void refresh().catch(failure => { error.value = failureText(failure) }) }, 2000)
@@ -431,38 +525,49 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
 </script>
 
 <template>
-  <section class="director-workspace" aria-label="AI 导演工作台">
-    <header class="workspace-toolbar">
-      <strong>{{ project ? projectTitle : (legacyOnly ? '历史制作记录' : '漫剧创作') }}</strong>
-      <label>创作模式 <select v-model="mode" :disabled="busy || hasRunning || loading"><option value="fast">普通模式</option><option value="professional">专业导演模式</option></select></label>
-      <span class="workspace-execution" role="status">{{ loading ? '载入中' : busy && !active ? '提交创意' : restoredSpec ? '已载入保存的方案' : summary?.status_label ?? '等待创意' }}</span>
-      <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="newProject">新作品</button>
-    </header>
-    <div class="workspace-body">
-      <nav class="workspace-navigation" :class="{ collapsed: !navOpen }" aria-label="创作导航">
-        <button class="navigation-toggle" :aria-expanded="navOpen" :aria-label="navOpen ? '收起项目导航' : '展开项目导航'" @click="navOpen = !navOpen"><PanelLeft :size="18" /><span v-if="navOpen">项目工作区</span></button>
-        <div v-show="navOpen" class="navigation-pages">
-          <template v-for="item in navigation" :key="item.id">
-            <button class="navigation-entry" :aria-label="item.label" :aria-current="activeNavigation === item.id ? 'page' : undefined" @click="openSection(item.id)"><component :is="item.icon" :size="17" /><span>{{ item.label }}</span></button>
-            <nav v-if="item.id === 'director' && section === 'director' && !chatExpanded" class="director-flow" aria-label="导演流程">
-              <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" :data-status="nodeStatus(String(stage))" @click="visitStage(String(stage))">
-                <span class="flow-marker"><Check v-if="nodeStatus(String(stage)) === 'completed'" :size="11" /></span>
-                <span>{{ label }}<small v-if="mode === 'professional'">{{ nodeState(String(stage)) }}</small></span>
-              </button>
-            </nav>
+  <ComicWorkspaceShell v-model:navigation-open="navOpen" :navigation="navigation" :active-page="activeNavigation" :creating-conversation="conversationBusy" @select-page="openSection" @new-conversation="startConversation">
+    <template #toolbar>
+      <strong class="toolbar-project">{{ projectTitle }}</strong>
+      <label class="toolbar-mode"><span>创作模式</span>
+        <select v-model="mode" :disabled="busy || hasRunning || loading">
+          <option value="fast">普通模式</option><option value="professional">专业导演模式</option>
+        </select>
+      </label>
+      <span class="toolbar-status" role="status">{{ busy || hasRunning ? summary?.status_label ?? '正在生成' : '' }}</span>
+      <button class="ui-button quiet sm toolbar-new" :disabled="busy || hasRunning" @click="newProject">新作品</button>
+    </template>
+    <template #recent>
+      <input v-model="conversationSearch" class="history-search" type="search" placeholder="搜索对话" aria-label="搜索对话" />
+      <div class="history-list" tabindex="0" aria-label="最近对话列表">
+        <div v-for="item in visibleConversations" :key="item.id" class="conversation-row" :class="{ active: item.id === activeConversationId }">
+          <input v-if="editingConversation === item.id" v-model="conversationTitle" class="history-search" aria-label="重命名对话" @keyup.enter="finishConversationRename" @keyup.esc="editingConversation = ''" />
+          <template v-else>
+            <button class="history-item" :title="item.title" :aria-current="item.id === activeConversationId ? 'true' : undefined" @click="openConversation(item.id)"><span>{{ item.title }}</span></button>
+            <span class="conversation-tools">
+              <button :aria-label="`重命名 ${item.title}`" @click="beginConversationRename(item)"><Pencil :size="13" /></button>
+              <button :aria-label="`删除 ${item.title}`" @click="removeConversation(item.id)"><Trash2 :size="13" /></button>
+            </span>
           </template>
         </div>
-      </nav>
-      <div class="workspace-main">
+        <p v-if="!visibleConversations.length" class="history-empty">{{ conversationSearch ? '没有匹配的对话' : '暂无对话' }}</p>
+      </div>
+    </template>
+            <template #heading>
+              <div><small>{{ chatExpanded ? '同一个项目，同一段创作对话' : section === 'director' ? '导演工作区' : '项目工作区' }}</small><h2>{{ chatExpanded ? '与 AI 导演协作' : title }}</h2></div>
+              <span v-if="!chatExpanded && section === 'director' && spec" class="node-version">v{{ spec.version }}<span v-if="dirty"> · 未保存修改</span></span>
+              <button v-if="!chatExpanded" class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button>
+            </template>
         <div class="workspace-content">
-            <main class="workspace-stage">
-              <header class="stage-heading">
-                <div><small>{{ chatExpanded ? '同一个项目，同一段创作对话' : section === 'director' ? '导演工作区' : '项目工作区' }}</small><h2>{{ chatExpanded ? '与 AI 导演协作' : title }}</h2></div>
-                <span v-if="!chatExpanded && section === 'director' && spec" class="node-version">v{{ spec.version }}<span v-if="dirty"> · 未保存修改</span></span>
-                <button v-if="!chatExpanded" class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button>
-              </header>
+          <main class="workspace-stage">
+
               <div v-if="!chatExpanded" :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll" aria-label="当前节点工作区">
                 <template v-if="section === 'director'">
+<nav class="director-flow" aria-label="导演流程">
+  <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" :data-status="nodeStatus(String(stage))" @click="visitStage(String(stage))">
+    <span class="flow-marker"><Check v-if="nodeStatus(String(stage)) === 'completed'" :size="11" /></span>
+    <span>{{ label }}<small v-if="mode === 'professional'">{{ nodeState(String(stage)) }}</small></span>
+  </button>
+</nav>
                   <p v-if="restoredSpec && mode === 'professional'" class="pane-note">查看当前保存的版本；节点没有重新执行，不沿用其他版本的执行状态。</p>
                   <p v-if="summary?.mode === 'fast' && mode === 'professional' && selectedStage !== 'director_assemble'" class="pane-note">显示已保存方案的对应内容；此任务未公开逐节点执行记录。</p>
                   <p v-if="selectedStage === 'cinematography' && (spec?.cinematography as { status?: string })?.status && (spec?.cinematography as { status?: string })?.status !== 'complete'" class="review-notice">摄影方案待补充或调整。已保留真实草稿，不会自动进入制作。</p>
@@ -493,16 +598,12 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 </template>
               </div>
             <section v-show="chatExpanded" ref="timeline" class="workspace-messages" aria-label="连续创作对话" @scroll="scrollState">
-              <p v-if="!transcript.length && !pendingText" class="conversation-welcome">描述你的故事、人物或希望观众感受到的情绪。我们从创作理解开始，再一起确认导演方案。</p>
-              <article v-for="entry in transcript" :key="entry.execution.run_id" class="creative-turn">
-                <UserMessageBubble v-if="entry.text" :content="entry.text" />
-                <AssistantMessageBlock :content="entry.answer || entry.label" :show-mark="false" />
-                <p v-if="entry.execution.status === 'failed'" role="alert">任务失败 · {{ entry.execution.director_execution_summary.error_id ?? '打开详情查看错误' }}</p>
-                <template v-if="!restoredSpec && entry.execution.run_id === active?.run_id">
-                  <div v-if="entry.execution.director_spec" class="draft-actions"><button class="ui-button sm" @click="openDraft(entry.execution.run_id)">进入导演方案 <ArrowRight :size="15" /></button><span>{{ stale ? '来源已变化' : confirmed ? '已确认' : '待确认草稿' }}</span></div>
-                  <button v-if="entry.execution.recovery_required || summary?.available_actions.includes('resume')" class="ui-button sm" :disabled="busy || hasRunning" @click="resume">恢复原导演任务</button>
-                </template>
+              <p v-if="!chatTurns.length && !pendingText" class="conversation-welcome">描述你的故事、人物或希望观众感受到的情绪。我们从创作理解开始，再一起确认导演方案。</p>
+              <article v-for="turn in chatTurns" :key="turn.id" class="creative-turn">
+                <UserMessageBubble v-if="turn.role === 'user'" :content="turn.content" />
+                <AssistantMessageBlock v-else :content="turn.content" :show-mark="false" />
               </article>
+              <div v-if="!restoredSpec && active?.director_spec" class="draft-actions"><button class="ui-button sm" @click="openDraft(active.run_id)">进入导演方案 <ArrowRight :size="15" /></button><span>{{ stale ? '来源已变化' : confirmed ? '已确认' : '待确认草稿' }}</span></div>
               <UserMessageBubble v-if="pendingText && !transcript.some(entry => !previousRunIds.includes(entry.execution.run_id) && entry.text === pendingText)" :content="pendingText" :pending="busy ? 'replying' : 'failed'" />
               <p v-if="busy && !active" role="status">正在提交创意，等待真实执行状态…</p>
               <p v-if="active?.status === 'cancelled'" class="pane-note" role="status">任务已取消。正在进行的模型请求可能仍需结束，但不会继续下一节点或保存导演方案。</p>
@@ -522,82 +623,108 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <header><strong>节点详情</strong><button class="ui-button quiet sm" aria-label="关闭详情" @click="inspectorOpen = false"><X :size="15" /></button></header>
               <dl><div><dt>方案版本</dt><dd>{{ spec?.version ?? '未生成' }}</dd></div><div><dt>Brief</dt><dd>{{ spec?.creative_brief_version ?? '未关联' }}</dd></div><div v-for="(version, key) in node?.input_versions ?? activeRun?.state.input_versions ?? {}" :key="String(key)"><dt>{{ key }}</dt><dd>v{{ version }}</dd></div><div><dt>来源资产</dt><dd v-for="(version, id) in spec?.asset_versions ?? {}" :key="String(id)">{{ id }} · v{{ version }}</dd><dd v-if="!Object.keys(spec?.asset_versions as object ?? {}).length">未绑定</dd></div><div><dt>知识引用</dt><dd>{{ Array.isArray(spec?.knowledge_refs) ? spec.knowledge_refs.join('、') || '未记录' : '未记录' }}</dd></div><div><dt>Run</dt><dd>{{ activeRun?.id ?? '本版本未关联' }}</dd></div><div><dt>Trace</dt><dd>{{ activeRun?.state.trace_id ?? '本版本未关联' }}</dd></div><div><dt>错误</dt><dd>{{ activeRun?.error ?? summary?.error_id ?? '无' }}</dd></div></dl>
               <details v-if="!restoredSpec"><summary>公开执行事件 · {{ events.length }}</summary><p v-for="event in events" :key="event.id">{{ event.event_type }}</p></details>
+              <section class="inspector-runs" aria-label="任务状态">
+                <strong>任务状态</strong>
+                <div v-if="runHistory.length" class="run-list">
+                  <article v-for="item in runHistory" :key="item.run_id" class="run-row" :data-status="item.status">
+                    <header><span>{{ item.label }}</span><span class="run-status">{{ directorStateLabels[item.status] ?? item.status }}</span></header>
+                    <p v-if="item.error" class="run-error">{{ item.error }}</p>
+                    <p v-if="item.trace" class="run-trace">Trace：{{ item.trace }}</p>
+                    <button v-if="item.resumable" class="ui-button sm" :disabled="busy || hasRunning" @click="resume">重新执行</button>
+                  </article>
+                </div>
+                <p v-else class="inspector-empty">暂无执行记录。</p>
+              </section>
             </aside>
         </div>
-        <footer class="workspace-composer" aria-label="统一创作输入">
+
+        <template #composer>
+<div class="workspace-composer">
           <div class="composer-context"><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ArrowLeft v-if="chatExpanded" :size="15" /><MessageSquareText v-else :size="15" />{{ chatExpanded ? '返回工作区' : '打开创作对话' }}</button><small>{{ revisionVersion !== null ? `修改当前草稿 v${revisionVersion}` : '当前项目的同一个对话' }}</small><button v-if="revisionVersion !== null" class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button><button v-else-if="spec" class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">修改当前方案</button></div>
-          <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击“新作品”进入作品级创作。</p>
+          <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击"新作品"进入作品级创作。</p>
           <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可继续输入</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
           <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
           <MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
           <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '方案先保存为草稿，审核并确认后再进入制作。' }}</small>
-        </footer>
-      </div>
-    </div>
-  </section>
+        </div>
+</template>
+  </ComicWorkspaceShell>
 </template>
 
 <style scoped>
-.director-workspace { display:flex; flex-direction:column; height:100%; min-height:0; background:var(--surface); color:var(--text-primary); }
-.workspace-toolbar { display:flex; align-items:center; gap:12px; flex-wrap:wrap; height:auto; min-height:48px; flex-shrink:0; box-sizing:border-box; padding:10px 16px; border-bottom:1px solid var(--border); font-size:13px; }
-.workspace-toolbar > strong { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:100px; }
-.workspace-toolbar label { display:flex; align-items:center; gap:7px; }
-select { color:var(--text-primary); background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-control); padding:6px; font:inherit; max-width:100%; }
-.workspace-execution { color:var(--text-secondary); font-size:12px; }
-.workspace-body { display:flex; flex:1; min-height:0; }
-.workspace-navigation { width:184px; box-sizing:border-box; flex-shrink:0; padding:10px 8px; border-right:1px solid var(--border); background:var(--canvas); overflow:auto; }
-.workspace-navigation.collapsed { width:46px; padding-inline:4px; }
-.workspace-navigation button { display:flex; align-items:center; gap:10px; width:100%; padding:10px; border:0; border-radius:var(--radius-control); background:transparent; color:var(--text-secondary); font:inherit; font-size:13px; text-align:left; cursor:pointer; }
-.workspace-navigation .navigation-toggle { font-size:12px; color:var(--text-muted); margin-bottom:12px; }
-.workspace-navigation .navigation-entry { margin-block:3px; }
-.workspace-navigation button:hover { background:var(--canvas-inset); color:var(--text-primary); }
-.workspace-navigation button[aria-current] { background:var(--canvas-inset); color:var(--accent); }
-.workspace-navigation button:disabled { color:var(--text-muted); opacity:.5; cursor:not-allowed; }
-.director-flow { position:relative; margin:6px 0 14px 17px; border-left:1px solid var(--border-strong); padding-left:6px; }
-.director-flow button { padding:9px 6px; gap:7px; line-height:1.4; font-size:12px; align-items:flex-start; }
-.director-flow small { display:block; font-size:10px; margin-top:2px; color:var(--text-muted); }
-.flow-marker { display:flex; align-items:center; justify-content:center; width:11px; height:11px; margin-top:3px; border:1px solid var(--border-strong); border-radius:50%; flex-shrink:0; }
-.director-flow button[aria-current] .flow-marker { border-color:var(--accent); background:var(--accent); color:var(--surface); }
-.director-flow button[data-status="completed"] .flow-marker { border-color:var(--text-secondary); }
-.director-flow button[data-status="running"] .flow-marker { border-color:var(--accent); }
-.workspace-main { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; }
-.workspace-content { display:flex; flex:1; min-height:0; min-width:0; }
-.workspace-stage { display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
-.stage-heading { display:flex; align-items:center; gap:10px; padding:12px 28px; flex-shrink:0; border-bottom:1px solid var(--border); }
-.stage-heading > div { flex:1; } .stage-heading small { font-size:11px; color:var(--text-muted); }
-.stage-heading h2 { font-size:16px; margin:3px 0 0; }
+.toolbar-project { flex:1; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; min-width:0; font-size:13px; font-weight:600; }
+.toolbar-mode { display:flex; align-items:center; gap:8px; color:var(--text-secondary); font-size:12px; flex-shrink:0; }
+.toolbar-status { color:var(--text-secondary); font-size:11px; max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.toolbar-new { flex-shrink:0; }
+select { color:var(--text-primary); background:transparent; border:1px solid var(--border-muted); border-radius:8px; padding:5px 8px; font:inherit; cursor:pointer; }
+:deep(.comic-shell-heading) > div:first-child { flex:1; min-width:0; }
+:deep(.comic-shell-heading) small { font-size:11px; color:var(--text-muted); }
+:deep(.comic-shell-heading) h2 { font-size:16px; font-weight:600; margin:3px 0 0; }
 .node-version { font-size:11px; color:var(--text-muted); }
-.stage-scroll { flex:1; min-height:0; overflow:auto; padding:28px max(28px, calc((100% - 780px) / 2)); font-size:14px; line-height:1.65; animation:node-enter 140ms ease-out; }
-@keyframes node-enter { from { opacity:0; transform:translateY(3px); } to { opacity:1; transform:translateY(0); } }
+.history-search { flex-shrink:0; width:100%; padding:7px 10px; margin-bottom:6px; border:0; border-radius:7px; background:transparent; color:var(--text-primary); font:inherit; font-size:12px; }
+.history-search:focus { background:var(--surface); }
+.history-list { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; }
+.conversation-row { position:relative; display:flex; align-items:center; min-height:34px; border-radius:7px; }
+.conversation-row:hover, .conversation-row.active { background:var(--sidebar-selected); }
+.history-item { flex:1; min-width:0; padding:9px 10px; border:0; background:transparent; color:var(--text-primary); font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.history-item span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+.conversation-tools { display:none; gap:2px; flex-shrink:0; padding-right:6px; }
+.conversation-row:hover .conversation-tools, .conversation-row:focus-within .conversation-tools { display:flex; }
+.conversation-tools button { display:grid; place-items:center; width:22px; height:24px; border:0; border-radius:5px; background:transparent; color:var(--text-secondary); cursor:pointer; }
+.conversation-tools button:hover { background:var(--surface); }
+.conversation-row > input { margin:0; }
+.history-empty { padding:6px 10px; color:var(--text-muted); font-size:12px; }
+.workspace-content { display:flex; flex:1; min-width:0; min-height:0; }
+.workspace-stage { display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
+.stage-scroll { flex:1; min-height:0; overflow:auto; padding:18px max(32px, calc((100% - 760px) / 2)); font-size:14px; line-height:1.65; animation:node-enter 140ms ease-out; }
+.stage-scroll h3 { font-size:15px; font-weight:600; margin:24px 0 16px; }
+@keyframes node-enter { from { opacity:0; transform:translateY(4px); } to { opacity:1; transform:translateY(0); } }
 @media(prefers-reduced-motion:reduce) { .stage-scroll { animation:none; } }
-.stage-scroll h3 { font-size:15px; }
-.stage-scroll details { padding:12px 0; border-bottom:1px solid var(--border); }
-.stage-scroll summary { cursor:pointer; } .stage-scroll dd { margin:4px 0 14px; white-space:pre-wrap; }
-.workspace-inspector { width:240px; box-sizing:border-box; padding:14px; border-left:1px solid var(--border); overflow:auto; font-size:12px; background:var(--canvas); }
-.workspace-inspector header { display:flex; justify-content:space-between; align-items:center; }
-.workspace-inspector dd { margin:4px 0 14px; overflow-wrap:anywhere; color:var(--text-secondary); }
-.workspace-messages { flex:1; min-height:0; overflow:auto; padding:18px max(20px, calc((100% - 820px) / 2)); }
-.creative-turn { margin-bottom:24px; } .conversation-welcome { color:var(--text-secondary); font-size:14px; line-height:1.8; max-width:650px; }
-.workspace-composer { padding:8px max(24px, calc((100% - 820px) / 2)) 12px; flex-shrink:0; border-top:1px solid var(--border); background:var(--surface); }
-.composer-context { display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:7px; }
-.composer-context small { color:var(--text-muted); font-size:11px; }
-.workspace-composer > small { display:block; margin-top:6px; color:var(--text-muted); font-size:11px; }
+.director-flow { display:flex; flex-wrap:wrap; gap:6px; margin:0 0 24px; }
+.director-flow button { display:flex; align-items:center; gap:7px; padding:7px 10px; border:0; border-radius:7px; background:transparent; color:var(--text-secondary); font:inherit; font-size:12px; text-align:left; cursor:pointer; }
+.director-flow button:hover { background:var(--surface-subtle); }
+.director-flow button[aria-current] { color:var(--accent); background:var(--accent-soft); }
+.director-flow small { display:block; font-size:10px; color:var(--text-muted); margin-top:2px; }
+.flow-marker { display:grid; place-items:center; flex-shrink:0; width:12px; height:12px; border:1px solid var(--border-strong); border-radius:50%; }
+.director-flow button[aria-current] .flow-marker { border-color:var(--accent); }
+.workspace-inspector { width:220px; padding:16px; overflow:auto; border-left:1px solid var(--border-muted); font-size:12px; background:var(--surface-subtle); }
+.workspace-inspector header { display:flex; justify-content:space-between; align-items:center; margin-bottom:12px; }
+.workspace-inspector dt { color:var(--text-secondary); margin-top:12px; }
+.workspace-inspector dd { margin:4px 0 0; overflow-wrap:anywhere; }
+.inspector-runs { margin-top:18px; display:grid; gap:6px; }
+.inspector-runs > strong { font-size:11px; color:var(--text-secondary); }
+.run-list { display:grid; gap:6px; }
+.run-row { padding:8px 0; display:grid; gap:4px; }
+.run-row header { display:flex; justify-content:space-between; gap:8px; font-size:12px; }
+.run-status { font-size:11px; color:var(--text-secondary); }
+.run-row[data-status="failed"] .run-status, .run-error { color:var(--danger); }
+.run-error { margin:0; font-size:11px; }
+.run-trace { margin:0; font-size:10px; color:var(--text-muted); overflow-wrap:anywhere; }
+.workspace-messages { flex:1; min-height:0; overflow:auto; padding:20px max(24px, calc((100% - 760px) / 2)); }
+.creative-turn { margin-bottom:28px; }
+.conversation-welcome { color:var(--text-secondary); font-size:14px; line-height:1.8; max-width:600px; padding:40px 0; }
+.workspace-composer { background:transparent; }
+.composer-context { display:flex; align-items:center; justify-content:space-between; gap:8px; min-height:28px; margin-bottom:6px; }
+.composer-context small, .workspace-composer > small { color:var(--text-muted); font-size:11px; }
+.workspace-composer > small { display:block; margin-top:8px; text-align:center; }
 .execution-controls, .queued-note { display:flex; align-items:center; justify-content:space-between; gap:8px; color:var(--text-secondary); font-size:12px; }
-.execution-controls { margin-bottom:6px; }
-.queued-note { justify-content:flex-end; margin:6px 0 16px; }
-.draft-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:12px 0; font-size:12px; }
+.execution-controls { margin-bottom:8px; }
+.queued-note { justify-content:flex-end; margin:8px 0 16px; }
+.draft-actions { display:flex; gap:8px; align-items:center; flex-wrap:wrap; margin:16px 0; font-size:12px; }
 .draft-actions span { display:flex; gap:5px; align-items:center; color:var(--text-secondary); }
-.final-approval { margin-top:24px; padding-top:14px; border-top:1px solid var(--border); }
-.final-approval > p { color:var(--text-secondary); font-size:13px; margin:0; }
-.asset-group, .shot-row, .history-row { padding-bottom:14px; margin-bottom:18px; border-bottom:1px solid var(--border); }
+.final-approval { margin-top:24px; padding:20px 0; }
+.final-approval > p { color:var(--text-secondary); font-size:13px; margin:0 0 12px; }
+.final-approval .draft-actions { margin:0; }
+.asset-group, .shot-row, .history-row { padding-bottom:16px; margin-bottom:20px; border-bottom:1px solid var(--border-muted); }
+.asset-group h3 { margin-top:0; }
 .history-row header { display:flex; gap:12px; align-items:center; justify-content:space-between; }
-.history-row small { display:block; color:var(--text-muted); font-size:11px; }
-.history-task { display:block; background:transparent; color:var(--text-primary); border:0; padding:10px 0; width:100%; text-align:left; }
-.history-task small { display:block; color:var(--text-muted); overflow-wrap:anywhere; }
-.review-notice { color:var(--text-secondary); border-left:2px solid var(--accent); padding-left:12px; }
-.workspace-error { color:var(--danger); overflow-wrap:anywhere; }
-button:focus-visible, select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
-@media(max-width:1100px) { .workspace-navigation { width:164px; } .workspace-inspector { width:180px; } .stage-heading { padding:12px 20px; } }
-@media(max-width:800px) { .workspace-toolbar { gap:6px; } .workspace-execution { display:none; } .stage-scroll { padding:20px; } .workspace-inspector { width:160px; } }
-@media(max-width:600px) { .workspace-toolbar > strong { flex-basis:100%; } .workspace-navigation { width:128px; padding-inline:4px; } .director-flow { margin-left:4px; padding-left:3px; } .workspace-inspector { width:140px; } .stage-scroll, .workspace-messages { padding:12px; } .workspace-composer { padding:6px 12px; } .workspace-composer > small, .composer-context > small, .stage-heading small, .node-version { display:none; } .stage-heading { padding:10px 12px; flex-wrap:wrap; } }
+.history-row small { display:block; color:var(--text-muted); font-size:11px; margin-top:4px; }
+.history-task { display:block; background:transparent; color:var(--text-primary); border:0; border-radius:8px; padding:12px 10px; margin:4px 0; width:100%; text-align:left; cursor:pointer; }
+.history-task:hover { background:var(--surface-subtle); }
+.history-task small { display:block; color:var(--text-muted); margin-top:4px; overflow-wrap:anywhere; }
+.review-notice { color:var(--text-secondary); border-left:2px solid var(--accent); padding:8px 14px; margin:16px 0; }
+.workspace-error { color:var(--danger); overflow-wrap:anywhere; margin:8px 0; }
+button:focus-visible, select:focus-visible, textarea:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+@media(max-width:900px) { .toolbar-status { display:none; } .workspace-inspector { width:180px; } .stage-scroll { padding-inline:24px; } }
+@media(max-width:600px) { .toolbar-mode > span, .toolbar-new, .composer-context > small, .node-version { display:none; } .stage-scroll, .workspace-messages { padding-inline:16px; } .workspace-inspector { width:140px; } .director-flow { gap:2px; } .director-flow button { padding:6px; } }
 </style>

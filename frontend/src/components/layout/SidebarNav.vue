@@ -20,7 +20,7 @@ import { domains, type DomainDefinition } from '../../domains'
 import StatusBadge from '../StatusBadge.vue'
 import KantokuMark from '../brand/KantokuMark.vue'
 
-defineProps<{ routeName: string; activeDomainId: string; taskCount: number; collapsed: boolean }>()
+defineProps<{ routeName: string; activeDomainId: string; taskCount: number; collapsed: boolean; rail?: boolean }>()
 const emit = defineEmits<{ navigate: [path: string]; domain: [domain: DomainDefinition]; toggle: [] }>()
 
 const navItems: { name: string; label: string; path: string; icon: FunctionalComponent; match: string[] }[] = [
@@ -34,7 +34,7 @@ const domainIcons: Record<string, FunctionalComponent> = { comic: BookOpen, comm
 </script>
 
 <template>
-  <aside class="app-sidebar" :class="{ collapsed }">
+  <aside class="app-sidebar" :class="{ collapsed, 'global-icon-rail': rail }" aria-label="全局导航">
     <div class="sidebar-brand-row"><button class="product-brand" title="Kantoku" @click="emit('navigate', '/')"><KantokuMark /><span class="brand-copy"><strong>Kantoku</strong><small>PRODUCTION WORKSPACE</small></span></button><button class="sidebar-toggle" :title="collapsed ? '展开侧栏' : '折叠侧栏'" @click="emit('toggle')"><ChevronsLeft v-if="!collapsed" :size="13" /><ChevronsRight v-else :size="13" /></button></div>
     <nav class="nav-group" aria-label="产品导航"><span class="nav-label">创作</span><button v-for="item in navItems" :key="item.name" :class="{ active: item.match.includes(routeName) }" :title="item.label" @click="emit('navigate', item.path)"><i><component :is="item.icon" :size="15" :stroke-width="1.8" /></i><span>{{ item.label }}</span><em v-if="item.name === 'runs' && taskCount">{{ taskCount }}</em></button></nav>
     <nav class="nav-group domain-nav" aria-label="Domain 导航"><span class="nav-label">创作域</span><button v-for="domain in domains" :key="domain.id" :class="{ active: ['workspace', 'workspace_run'].includes(routeName) && activeDomainId === domain.id }" :title="`${domain.name} ${domain.label}`" @click="emit('domain', domain)"><i><component :is="domainIcons[domain.id]" :size="15" :stroke-width="1.8" /></i><span>{{ domain.name }} <small>{{ domain.label }}</small></span><StatusBadge v-if="domain.status !== 'available' && !collapsed" :status="domain.status" /></button></nav>

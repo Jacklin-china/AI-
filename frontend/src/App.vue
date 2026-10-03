@@ -20,6 +20,7 @@ const commandOpen = ref(false)
 let timer: number | undefined
 
 const activeDomain = computed(() => route.value.domain ?? 'studio')
+const comicWorkspace = computed(() => ['workspace', 'workspace_run'].includes(route.value.name) && route.value.domain === 'comic')
 
 const titles: Record<string, string> = {
   home: '首页',
@@ -69,18 +70,19 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <div class="kantoku-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed }">
+  <div class="kantoku-shell" :class="{ 'sidebar-collapsed': sidebarCollapsed || comicWorkspace, 'comic-app-shell': comicWorkspace }">
     <SidebarNav
       :route-name="route.name"
       :active-domain-id="activeDomain"
       :task-count="runs.filter((item) => ['pending', 'running', 'waiting'].includes(item.status)).length"
-      :collapsed="sidebarCollapsed"
+      :collapsed="sidebarCollapsed || comicWorkspace"
+      :rail="comicWorkspace"
       @navigate="go"
       @domain="openDomain"
       @toggle="sidebarCollapsed = !sidebarCollapsed"
     />
     <section class="app-stage">
-      <TopBar :title="title" :busy="false" @command="commandOpen = true" />
+      <TopBar v-if="!comicWorkspace" :title="title" :busy="false" @command="commandOpen = true" />
       <HomeView
         v-if="route.name === 'home'"
         :runs="runs"

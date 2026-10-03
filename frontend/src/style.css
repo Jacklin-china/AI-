@@ -2,6 +2,16 @@
 .kantoku-shell { display: grid; grid-template-columns: var(--sidebar-width) minmax(0, 1fr); min-height: 100vh; transition: grid-template-columns var(--motion-med); }
 .kantoku-shell.sidebar-collapsed { grid-template-columns: var(--sidebar-collapsed) minmax(0, 1fr); }
 .app-stage { min-width: 0; }
+.comic-app-shell { height:100dvh; min-height:0; overflow:hidden; }
+.comic-app-shell .app-stage { height:100%; min-height:0; }
+.comic-app-shell .domain-workspace.comic-workspace { height:100%; min-height:0; background:var(--surface); }
+.comic-app-shell .global-icon-rail { height:100%; background:var(--surface-subtle); border-right:0; }
+.global-icon-rail .sidebar-toggle, .global-icon-rail .domain-nav, .global-icon-rail .core-health { display:none; }
+.global-icon-rail .nav-group { gap:8px; }
+.global-icon-rail .nav-group > button, .global-icon-rail .sidebar-bottom > button { min-height:38px; border-radius:9px; }
+.global-icon-rail .nav-group button > i, .global-icon-rail .sidebar-bottom button > i { width:20px; flex-basis:20px; }
+.global-icon-rail .nav-group button svg, .global-icon-rail .sidebar-bottom button svg { width:18px; height:18px; }
+.global-icon-rail .sidebar-bottom { border-top:0; }
 /* Compatibility preview for existing production Runs; asset drawers were removed. */
 .comic-preview { display:flex; flex-direction:column; min-height:160px; }
 .comic-preview-header { display:flex; justify-content:space-between; gap:12px; }

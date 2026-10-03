@@ -10,6 +10,7 @@ const brief = { version: 1, original_request: '一个少女站在树梢看村庄
 const assets = [{ asset_id: 'qa-character', name: '少女', version: 1, pinned_version: 1, state: 'active', details: { kind: 'character', appearance: '东方少女，保持角色身份', clothing: '白色古装' }, fixed_constraints: ['保持角色身份'], reference_artifact_ids: [] }]
 const stages = ['creative_understanding', 'visual_direction', 'cinematography', 'director_critic', 'director_assemble']
 const runs = []; const tasks = []; const versions = []
+const conversations = Array.from({ length: 24 }, (_, index) => ({ id: index ? `qa-chat-${index}` : 'qa-conversation', title: index ? `创作对话 ${index} · 场景与人物` : '树梢上的守望', domain: 'comic', interaction_mode: 'guided', created_at: new Date().toISOString(), updated_at: new Date().toISOString(), messages: [] }))
 const port = Number(process.env.KANTOKU_QA_PORT ?? 8765)
 function newSpec() {
   return { schema_version: 2, spec_id: 'qa-director', project_id: project.project_id, version: versions.length + 1, creative_brief_version: 1, asset_versions: { 'asset:qa-character': 1 }, created_at: new Date().toISOString(),
@@ -48,7 +49,9 @@ createServer(async (request, response) => {
     }
     if (/^\/api\/runs\/[^/]+\/events$/.test(path)) return json(response, { events: [{ id: 1, run_id: path.split('/')[3], sequence: 1, event_type: 'director_spec_created', created_at: new Date().toISOString(), payload: {} }] })
     if (path.startsWith('/api/runs/')) return json(response, runs.find(run => run.id === path.split('/')[3]))
-    if (path === '/api/conversations' && request.method === 'POST') return json(response, { id: 'qa-conversation' })
+    if (path === '/api/conversations' && request.method === 'POST') { const created = { ...conversations[0], id: `qa-new-${conversations.length}`, title: '新对话', messages: [] }; conversations.unshift(created); return json(response, created) }
+    if (path === '/api/conversations') return json(response, { conversations })
+    if (path.startsWith('/api/conversations/')) return json(response, conversations.find(item => item.id === path.split('/')[3]))
     if (path === '/api/comic/projects' && request.method === 'POST') { project.title = body.title; brief.original_request = body.brief.original_request; return json(response, { project, creative_brief: brief }) }
     if (path === '/api/comic/projects/qa-project') return json(response, { project, creative_brief: brief })
     if (path.endsWith('/assets')) return json(response, { assets })
