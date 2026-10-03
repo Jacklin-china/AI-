@@ -8,7 +8,7 @@ const source = readFileSync(new URL('../src/router.ts', import.meta.url), 'utf8'
 let popstate
 const paths = []
 globalThis.window = {
-  location: { pathname: '/' },
+  location: { pathname: '/', search: '' },
   history: {
     pushState(_state, _title, path) { paths.push(path); window.location.pathname = path },
     replaceState(_state, _title, path) { window.location.pathname = path },
@@ -24,6 +24,12 @@ test('all director nodes have independent refreshable URLs bound to the same Run
     assert.equal(href(target), `/workspace/comic/run/run%201/director/${slug}`)
     assert.deepEqual(parse(href(target)), target)
   }
+})
+
+test('Conversation selection survives refresh on every node URL', () => {
+  const target = { name: 'workspace_run', domain: 'comic', runId: 'old-run', workspacePage: 'director', directorStage: 'cinematography', conversationId: 'new chat' }
+  assert.deepEqual(parse(href(target)), target)
+  assert.deepEqual(parse('/?conversation=home-chat'), { name: 'home', conversationId: 'home-chat' })
 })
 test('project pages and legacy workspace URLs remain compatible', () => {
   for (const workspacePage of ['conversation', 'assets', 'storyboard', 'prompt', 'history']) {

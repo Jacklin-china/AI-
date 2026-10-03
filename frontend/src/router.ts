@@ -18,6 +18,7 @@ export interface Route {
   tab?: string
   workspacePage?: string
   directorStage?: string
+  conversationId?: string
 }
 
 export const directorStagePaths: Record<string, string> = {
@@ -30,9 +31,14 @@ function workspaceSuffix(next: Route): string {
   return `/${next.workspacePage}${next.workspacePage === 'director' ? `/${directorStagePaths[next.directorStage ?? 'director_assemble'] ?? 'plan'}` : ''}`
 }
 
-export const route = ref<Route>(parse(window.location.pathname))
+export const route = ref<Route>(parse(window.location.pathname + (window.location.search ?? '')))
 
 export function parse(path: string): Route {
+  if (path.includes('?')) {
+    const [pathname, query] = path.split('?')
+    const conversationId = new URLSearchParams(query).get('conversation')
+    return { ...parse(pathname!), ...(conversationId ? { conversationId } : {}) }
+  }
   const clean = path.replace(/\/+$/, '') || '/'
   const parts = clean.split('/').filter(Boolean)
   if (parts.length === 0) return { name: 'home' }
@@ -82,6 +88,9 @@ export function parse(path: string): Route {
 }
 
 export function href(next: Route): string {
+  return hrefPath(next) + (next.conversationId ? `?conversation=${encodeURIComponent(next.conversationId)}` : '')
+}
+function hrefPath(next: Route): string {
   switch (next.name) {
     case 'home':
       return '/'
@@ -104,7 +113,7 @@ export function href(next: Route): string {
 
 export function navigate(next: Route, replace = false): void {
   const path = href(next)
-  if (window.location.pathname !== path) {
+  if (window.location.pathname + (window.location.search ?? '') !== path) {
     if (replace) window.history.replaceState({}, '', path)
     else window.history.pushState({}, '', path)
   }
@@ -117,5 +126,5 @@ export function openRun(domain: string, runId: string): void {
 }
 
 window.addEventListener('popstate', () => {
-  route.value = parse(window.location.pathname)
+  route.value = parse(window.location.pathname + (window.location.search ?? ''))
 })

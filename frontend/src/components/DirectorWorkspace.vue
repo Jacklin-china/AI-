@@ -1,20 +1,22 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelRight, ArrowLeft, ArrowRight, X, Check, Pencil, Trash2 } from 'lucide-vue-next'
+import { Clapperboard, Layers, History, FileText, Film, MessageSquareText, PanelRight, ArrowLeft, ArrowRight, X, Check } from 'lucide-vue-next'
 import MessageComposer from './chat/MessageComposer.vue'
 import UserMessageBubble from './chat/UserMessageBubble.vue'
 import AssistantMessageBlock from './chat/AssistantMessageBlock.vue'
-import ComicWorkspaceShell from './layout/ComicWorkspaceShell.vue'
+import WorkspaceShell from './layout/WorkspaceShell.vue'
+import ConversationHistory from './chat/ConversationHistory.vue'
+import { conversationTaskTitle, ownsConversationRun } from './chat/conversationPresentation'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import { navigate, route } from '../router'
-import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey, workspaceProjectTitle } from '../domains/comic/directorPresentation'
-import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getCurrentDirector, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey } from '../domains/comic/directorPresentation'
+import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage } from '../types'
 import type { CoreRun } from '../types'
 
 const props = defineProps<{ initialRunId?: string }>()
-const emit = defineEmits<{ newProject: [] }>()
+defineEmits<{ newProject: [] }>()
 const legacyOnly = ref(false)
 const project = ref<ComicProjectContext | null>(null)
 const mode = ref<CreationMode>('fast')
@@ -49,7 +51,6 @@ const drafts = ref<Record<string, Record<string, string>>>({})
 const revisionVersion = ref<number | null>(null)
 const restoredSpec = ref<Record<string, unknown> | null>(null)
 const events = ref<RuntimeEvent[]>([])
-const conversationId = ref('')
 const compiling = ref(false)
 const stageScroll = ref<HTMLElement | null>(null)
 const scrollPositions = new Map<string, number>()
@@ -61,6 +62,7 @@ let disposed = false
 let refreshing = false
 let applyingRoute = false
 let pageRequest = 0
+let conversationEpoch = 0
 const navigation = [
   { id: 'conversation', label: '对话', icon: MessageSquareText },
   { id: 'director', label: '导演', icon: Clapperboard },
@@ -71,9 +73,6 @@ const navigation = [
 ]
 /* 对话线程与工作流执行记录是两类数据：左侧只列用户 ↔ AI 的聊天线程。 */
 const conversations = ref<Conversation[]>([])
-const conversationSearch = ref('')
-const editingConversation = ref('')
-const conversationTitle = ref('')
 const conversationBusy = ref(false)
 const activeConversationId = ref('')
 /* Conversation（用户 ↔ AI 聊天）与 Run History（执行记录）是两套数据，这里只装聊天。 */
@@ -82,38 +81,32 @@ interface ChatTurn { id: string; role: 'user' | 'assistant'; content: string }
 async function loadConversationMessages(id: string): Promise<void> {
   if (!id) { conversationMessages.value = []; return }
   const loaded = await getConversation(id).catch(() => null)
+  if (activeConversationId.value !== id) return
   conversationMessages.value = (loaded?.messages ?? []).filter(item => item.role !== 'system' && item.content.trim())
 }
 const chatTurns = computed<ChatTurn[]>(() => {
   const turns: ChatTurn[] = conversationMessages.value.map(item => ({ id: item.id, role: item.role === 'user' ? 'user' : 'assistant', content: item.content }))
-  const known = new Set(turns.map(item => item.content.trim()))
+  const knownRuns = new Set(conversationMessages.value.map(item => item.run_id).filter(Boolean))
   for (const entry of transcript.value) {
-    if (entry.text && !known.has(entry.text.trim())) { turns.push({ id: `run-user-${entry.execution.run_id}`, role: 'user', content: entry.text }); known.add(entry.text.trim()) }
+    if (knownRuns.has(entry.execution.run_id)) continue
+    if (entry.text) turns.push({ id: `run-user-${entry.execution.run_id}`, role: 'user', content: entry.text })
     const answer = entry.answer || entry.label
-    if (answer && !known.has(answer.trim())) { turns.push({ id: `run-ai-${entry.execution.run_id}`, role: 'assistant', content: answer }); known.add(answer.trim()) }
+    if (answer) turns.push({ id: `run-ai-${entry.execution.run_id}`, role: 'assistant', content: answer })
   }
   return turns
 })
 
-const visibleConversations = computed(() => {
-  const keyword = conversationSearch.value.trim().toLowerCase()
-  if (!keyword) return conversations.value
-  return conversations.value.filter((item) => item.title.toLowerCase().includes(keyword))
-})
-
 async function loadConversations(): Promise<void> {
-  conversations.value = await getConversations('comic').catch(() => [])
+  conversations.value = (await getConversations('comic')).filter(item => item.interaction_mode === 'guided')
 }
 async function startConversation(): Promise<void> {
   if (conversationBusy.value) return
   conversationBusy.value = true
   try {
     const created = await createConversation('guided', 'comic')
-    activeConversationId.value = created.id
-    conversationMessages.value = []
+    conversations.value.unshift(created)
+    await openConversation(created.id)
     await loadConversations()
-    chatExpanded.value = true
-    inspectorOpen.value = false
   } catch (failure) {
     error.value = failureText(failure)
   } finally {
@@ -122,30 +115,53 @@ async function startConversation(): Promise<void> {
 }
 
 async function openConversation(id: string): Promise<void> {
+  const epoch = ++conversationEpoch
+  resetConversationView()
   activeConversationId.value = id
+  localStorage.setItem('kantoku-comic-active-conversation', id)
+  navigate({ ...route.value, conversationId: id, workspacePage: 'conversation', directorStage: undefined }, true)
   chatExpanded.value = true
   inspectorOpen.value = false
-  await loadConversationMessages(id)
+  loading.value = true
+  try {
+    const detail = await getConversation(id)
+    if (epoch !== conversationEpoch || disposed) return
+    if (!detail) throw new Error('无法读取这条对话，请重试')
+    conversationMessages.value = (detail.messages ?? []).filter(item => item.role !== 'system')
+    const related = await Promise.all((detail.related_run_ids ?? []).map(getRun))
+    if (epoch !== conversationEpoch || disposed) return
+    const owned = related.filter((run): run is CoreRun => !!run && ownsConversationRun(run, id))
+    const latest = owned.find(run => run.state.project_id && run.workflow.startsWith('comic.director'))
+    if (latest) {
+      const context = await getComicProject(String(latest.state.project_id))
+      if (epoch !== conversationEpoch || disposed) return
+      project.value = context
+      await refresh()
+      if (epoch !== conversationEpoch || disposed) return
+      selectedRun.value = executions.value[0]?.run_id ?? ''
+      mode.value = active.value?.director_execution_summary.mode ?? 'fast'
+    }
+    await nextTick()
+    if (epoch === conversationEpoch) composer.value?.fill('')
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) loading.value = false }
 }
 
-function beginConversationRename(item: Conversation): void {
-  editingConversation.value = item.id
-  conversationTitle.value = item.title
-}
-
-async function finishConversationRename(): Promise<void> {
-  const id = editingConversation.value
-  const title = conversationTitle.value.trim()
-  editingConversation.value = ''
-  if (!id || !title) return
+async function finishConversationRename(id: string, title: string): Promise<void> {
   await renameConversation(id, title).catch((failure) => { error.value = failureText(failure) })
   await loadConversations()
 }
 
 async function removeConversation(id: string): Promise<void> {
-  await deleteConversation(id).catch((failure) => { error.value = failureText(failure) })
-  if (activeConversationId.value === id) { activeConversationId.value = ''; conversationMessages.value = [] }
-  await loadConversations()
+  if (!window.confirm('删除这条对话？关联作品、任务、产物和费用记录会保留。')) return
+  try {
+    await deleteConversation(id)
+    await loadConversations()
+    if (activeConversationId.value === id) {
+      if (conversations.value[0]) await openConversation(conversations.value[0].id)
+      else await startConversation()
+    }
+  } catch (failure) { error.value = failureText(failure) }
 }
 const assetFieldLabels: Record<string, string> = {
   appearance: '外观', clothing: '服装', traits: '特征', location: '地点', time: '时间', weather: '天气',
@@ -167,7 +183,7 @@ const confirmable = computed(() => canConfirmDirector(restoredSpec.value ? 'comp
 const confirmed = computed(() => confirmable.value && spec.value?.user_confirmed === true)
 const editable = computed(() => spec.value?.schema_version === 2 ? !stale.value && editableDirectorNode(selectedStage.value) : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const visibleNodes = computed(() => mode.value === 'fast' ? fastDirectorNodeLabels : directorNodeLabels)
-const projectTitle = computed(() => workspaceProjectTitle(project.value?.project.title ?? '', project.value?.creative_brief.original_request ?? ''))
+const projectTitle = computed(() => conversations.value.find(item => item.id === activeConversationId.value)?.title ?? '新对话')
 const title = computed(() => section.value === 'director' ? visibleNodes.value[selectedStage.value] : navigation.find(item => item.id === section.value)?.label)
 const activeNavigation = computed(() => chatExpanded.value ? 'conversation' : section.value)
 const activeRun = computed(() => !restoredSpec.value && active.value ? runs.value[active.value.run_id] : null)
@@ -207,9 +223,14 @@ function failureText(failure: unknown): string {
 async function confirm(): Promise<void> {
   if (!confirmable.value || !project.value || !spec.value) return
   busy.value = true
-  try { restoredSpec.value = await confirmDirectorVersion(project.value.project.project_id, Number(spec.value.version), project.value.project.current_version); await refresh() }
-  catch (failure) { error.value = failureText(failure) }
-  finally { busy.value = false }
+  const epoch = conversationEpoch
+  try {
+    const saved = await confirmDirectorVersion(project.value.project.project_id, Number(spec.value.version), project.value.project.current_version)
+    if (epoch !== conversationEpoch) return
+    restoredSpec.value = saved; await refresh()
+  }
+  catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) busy.value = false }
 }
 function invalidate(): void { revisionVersion.value = null }
 function beginEdit(): void {
@@ -235,18 +256,22 @@ function reviseByInstruction(): void {
 async function saveFinal(instruction?: string): Promise<void> {
   if (!project.value || !spec.value || busy.value || hasRunning.value) return
   const key = draftKey.value
+  const epoch = conversationEpoch
+  const owner = activeConversationId.value
   busy.value = true; error.value = ''
   try {
-    restoredSpec.value = await saveDirectorDraft(project.value.project.project_id, {
+    const saved = await saveDirectorDraft(project.value.project.project_id, {
       expected_project_version: project.value.project.current_version,
       expected_director_version: instruction ? revisionVersion.value : spec.value.version,
-      conversation_id: await ensureConversation(),
+      conversation_id: owner,
       ...(instruction ? { revision_instruction: instruction } : { draft: editableDirectorDraft(spec.value, fields.value) }),
     })
+    if (epoch !== conversationEpoch) return
+    restoredSpec.value = saved
     delete drafts.value[key]; revisionVersion.value = null
     await refresh()
-  } catch (failure) { error.value = failureText(failure) }
-  finally { busy.value = false }
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) busy.value = false }
 }
 async function reviewFinal(): Promise<void> {
   if (!spec.value || dirty.value) return
@@ -274,60 +299,61 @@ async function refresh(): Promise<void> {
   if (!project.value || refreshing) return
   refreshing = true
   const id = project.value.project.project_id
+  const epoch = conversationEpoch
+  const owner = activeConversationId.value
   try {
     const [context, tasks, nextAssets] = await Promise.all([getComicProject(id), getDirectorExecutions(id), getComicAssets(id)])
-    if (disposed || id !== project.value?.project.project_id) return
+    if (disposed || epoch !== conversationEpoch || id !== project.value?.project.project_id) return
     if (context) project.value = context
-    executions.value = tasks; assets.value = nextAssets
-    const records = await Promise.all(tasks.filter(item => !runs.value[item.run_id] || runs.value[item.run_id]!.status !== item.status || ['pending', 'running'].includes(item.status)).map(item => getRun(item.run_id)))
-    if (disposed || id !== project.value?.project.project_id) return
+    const records = await Promise.all(tasks.map(item => getRun(item.run_id)))
+    if (disposed || epoch !== conversationEpoch || id !== project.value?.project.project_id) return
     records.forEach(run => { if (run) runs.value[run.id] = run })
-    const latestVersion = context?.project.director_version
-    if (!busy.value && !hasRunning.value && latestVersion && !tasks.some(item => item.director_spec?.version === latestVersion) && restoredSpec.value?.version !== latestVersion) {
-      const current = await getCurrentDirector(id)
-      if (!disposed && id === project.value?.project.project_id) restoredSpec.value = current
+    executions.value = tasks.filter(item => runs.value[item.run_id] && ownsConversationRun(runs.value[item.run_id]!, owner))
+    assets.value = nextAssets
+    await loadConversationMessages(owner)
+    if (inspectorOpen.value && active.value) {
+      const loadedEvents = await getEvents(active.value.run_id)
+      if (epoch === conversationEpoch) events.value = loadedEvents
     }
-    const associated = Object.values(runs.value).find(run => run.state.conversation_id)?.state.conversation_id
-    if (associated && !conversationId.value) conversationId.value = String(associated)
-    if (inspectorOpen.value && active.value) events.value = await getEvents(active.value.run_id)
-  } finally { refreshing = false }
-}
-async function ensureConversation(): Promise<string> {
-  const id = project.value!.project.project_id
-  if (!conversationId.value) conversationId.value = localStorage.getItem(`kantoku-comic-conversation:${id}`) ?? ''
-  if (!conversationId.value) conversationId.value = (await createConversation('guided', 'comic')).id
-  localStorage.setItem(`kantoku-comic-conversation:${id}`, conversationId.value)
-  return conversationId.value
+  } finally { if (epoch === conversationEpoch) refreshing = false }
 }
 async function execute(text: string, options: Record<string, unknown> = {}, selectedMode: CreationMode = mode.value): Promise<void> {
   if (busy.value || hasRunning.value || (!project.value && !text.trim())) { composer.value?.fill(text); return }
   const editingKey = draftKey.value
+  const epoch = conversationEpoch
+  const owner = activeConversationId.value
+  const sourceProject = project.value
+  if (!owner) { error.value = '请先打开或创建对话'; return }
   busy.value = true; pendingText.value = text; previousRunIds.value = executions.value.map(item => item.run_id); error.value = ''; invalidate()
   restoredSpec.value = null
   try {
-    if (!project.value) {
-      project.value = await createComicProject(text)
-      localStorage.setItem('kantoku-comic-project', project.value.project.project_id)
-    }
-    await refresh()
-    const conversation = await ensureConversation()
-    const result = await createDirectorExecution(project.value.project.project_id, {
-      expected_project_version: project.value.project.current_version, creation_mode: selectedMode,
+    // Navigation detaches the view, not the already submitted request's ownership.
+    const target = sourceProject
+      ? await getComicProject(sourceProject.project.project_id) ?? sourceProject
+      : await createComicProject(text)
+    if (epoch === conversationEpoch && !disposed) project.value = target
+    const conversation = owner
+    const result = await createDirectorExecution(target.project.project_id, {
+      expected_project_version: target.project.current_version, creation_mode: selectedMode,
       creative_operation: 'new',
       conversation_id: conversation,
       ...('previous_run_id' in options || 'resume_run_id' in options ? {} : { task: text || null }), ...options,
     })
-    if (disposed) return
+    if (disposed || epoch !== conversationEpoch || owner !== activeConversationId.value) return
     selectedRun.value = result.run_id; restoredSpec.value = null
     if ('stage_edits' in options) delete drafts.value[editingKey]
     await refresh()
+    if (epoch !== conversationEpoch || disposed) return
     pendingText.value = ''
+    await loadConversations()
   } catch (failure) {
+    if (epoch !== conversationEpoch || disposed) return
     error.value = failureText(failure)
     await refresh().catch(() => undefined)
+    if (epoch !== conversationEpoch || disposed) return
     const failedRun = selectDirectorExecution(executions.value, '', true, previousRunIds.value)
     if (failedRun) { selectedRun.value = failedRun.run_id; pendingText.value = '' }
-  } finally { busy.value = false }
+  } finally { if (epoch === conversationEpoch) busy.value = false }
 }
 function sendInput(text: string): void {
   if (!text.trim()) return
@@ -341,14 +367,15 @@ function sendInput(text: string): void {
   }
   void execute(text)
 }
-/* 新对话默认标题是占位名：用户发出第一条创作需求后，用需求本身命名，历史才可读。 */
+/* Title belongs to the sending conversation, never to Project or the selected Run. */
 async function titleConversation(text: string): Promise<void> {
   const id = activeConversationId.value
   const current = conversations.value.find(item => item.id === id)
   if (!id || !current || !/^新对话$/.test(current.title)) return
-  const title = text.trim().replace(/\s+/g, ' ').slice(0, 24)
+  const title = conversationTaskTitle(text)
   if (!title) return
-  await renameConversation(id, title).catch(() => {})
+  current.title = title
+  await renameConversation(id, title).catch((failure) => { if (activeConversationId.value === id) error.value = failureText(failure) })
   await loadConversations()
 }
 async function dispatchQueued(explicit = false): Promise<void> {
@@ -360,10 +387,11 @@ async function dispatchQueued(explicit = false): Promise<void> {
 async function cancelExecution(): Promise<void> {
   const task = runningExecution.value
   if (!task || cancelling.value) return
+  const epoch = conversationEpoch
   cancelling.value = true
-  try { await cancelRun(task.run_id); await refresh() }
-  catch (failure) { error.value = failureText(failure) }
-  finally { cancelling.value = false }
+  try { await cancelRun(task.run_id); if (epoch === conversationEpoch) await refresh() }
+  catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) cancelling.value = false }
 }
 async function rerun(save = false): Promise<void> {
   if (!active.value || !node.value || !summary.value) return
@@ -405,6 +433,7 @@ async function loadPage(): Promise<void> {
 }
 async function loadShots(): Promise<void> {
   const id = selectedBoard.value
+  const epoch = conversationEpoch
   if (!id) { shots.value = []; return }
   try {
     const next = await getComicShots(id)
@@ -412,45 +441,59 @@ async function loadShots(): Promise<void> {
     shots.value = next
     if (!next.some(item => item.shot_id === selectedShot.value)) selectedShot.value = next[0]?.shot_id ?? ''
     if (section.value === 'prompt') await loadPrompts()
-  } catch (failure) { error.value = failureText(failure) }
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
 }
 async function loadPrompts(): Promise<void> {
   const id = selectedShot.value
+  const epoch = conversationEpoch
   prompts.value = []
   if (!id) return
   try {
     const next = await getComicPromptVersions(id)
     if (id === selectedShot.value && !disposed) prompts.value = next
-  } catch (failure) { error.value = failureText(failure) }
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
 }
 async function compilePrompt(): Promise<void> {
   const shot = shots.value.find(item => item.shot_id === selectedShot.value)
   const board = boards.value.find(item => item.storyboard_id === selectedBoard.value)
   if (!project.value || !shot || !confirmed.value || board?.director_spec_version !== spec.value?.version || compiling.value || busy.value || hasRunning.value) return
+  const epoch = conversationEpoch
   compiling.value = true; error.value = ''
   try {
     await compileComicPrompt(shot.shot_id, project.value.project.current_version, shot.version)
-    await refresh(); await loadPrompts()
-  } catch (failure) { error.value = failureText(failure) }
-  finally { compiling.value = false }
+    if (epoch !== conversationEpoch) return
+    await refresh()
+    if (epoch === conversationEpoch) await loadPrompts()
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) compiling.value = false }
 }
 async function restore(version: number): Promise<void> {
   if (!project.value || busy.value || hasRunning.value) return
   busy.value = true; invalidate()
+  const epoch = conversationEpoch
   try {
-    restoredSpec.value = await restoreDirectorVersion(project.value.project.project_id, version, project.value.project.current_version)
-    await refresh(); await loadPage(); section.value = 'director'; selectedStage.value = 'director_assemble'
-  } catch (failure) { error.value = failureText(failure) }
-  finally { busy.value = false; restoreChoice.value = null }
+    const restored = await restoreDirectorVersion(project.value.project.project_id, version, project.value.project.current_version)
+    if (epoch !== conversationEpoch) return
+    restoredSpec.value = restored
+    await refresh()
+    if (epoch !== conversationEpoch) return
+    await loadPage()
+    if (epoch === conversationEpoch) { section.value = 'director'; selectedStage.value = 'director_assemble' }
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) { busy.value = false; restoreChoice.value = null } }
 }
 function newProject(): void {
   if (busy.value || hasRunning.value || ((Object.keys(drafts.value).length || queuedInputs.value.length) && !window.confirm('放弃未保存的修改和待发送补充并新建作品？'))) return
-  queuedInputs.value = []
+  void startConversation()
+}
+function resetConversationView(): void {
+  refreshing = false
+  busy.value = false; cancelling.value = false; compiling.value = false; legacyOnly.value = false
+  queuedInputs.value = []; previousRunIds.value = []; events.value = []; restoreChoice.value = null
+  conversationMessages.value = []; composer.value?.fill(''); scrollPositions.clear()
   pageRequest++; project.value = null; executions.value = []; runs.value = {}; assets.value = []; boards.value = []; shots.value = []; versions.value = []; prompts.value = []
-  selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; conversationId.value = ''; revisionVersion.value = null; error.value = ''; pendingText.value = ''
+  selectedRun.value = ''; restoredSpec.value = null; drafts.value = {}; revisionVersion.value = null; error.value = ''; pendingText.value = ''
   section.value = 'director'; selectedStage.value = 'director_assemble'; chatExpanded.value = true; inspectorOpen.value = false; restoreChoice.value = null
-  localStorage.removeItem('kantoku-comic-project')
-  if (props.initialRunId) emit('newProject')
 }
 function visitStage(stage: string): void { section.value = 'director'; selectedStage.value = stage; chatExpanded.value = false }
 function openSection(id: string): void {
@@ -496,36 +539,42 @@ watch(() => `${project.value?.project.project_id}:${mode.value}:${section.value}
   await nextTick()
   if (stageScroll.value) stageScroll.value.scrollTop = scrollPositions.get(key) ?? 0
 })
-watch(inspectorOpen, async open => { if (open && active.value) { try { events.value = await getEvents(active.value.run_id) } catch (failure) { error.value = failureText(failure) } } })
+watch(inspectorOpen, async open => {
+  if (!open || !active.value) return
+  const epoch = conversationEpoch
+  try {
+    const loaded = await getEvents(active.value.run_id)
+    if (epoch === conversationEpoch) events.value = loaded
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+})
 watch(() => transcript.value.map(item => `${item.execution.run_id}:${item.execution.status}`).join('|') + pendingText.value + queuedInputs.value.length, async () => { if (!nearBottom.value) return; await nextTick(); timeline.value?.scrollTo({ top: timeline.value.scrollHeight, behavior: 'auto' }) })
 onMounted(async () => {
   try {
-    const legacy = props.initialRunId ? await getRun(props.initialRunId) : null
-    legacyOnly.value = !!legacy && !legacy.state.project_id
-    const id = String(legacy ? legacy.state.project_id ?? '' : localStorage.getItem('kantoku-comic-project') ?? '')
-    if (id) {
-      project.value = await getComicProject(id); await refresh()
-      if (project.value) localStorage.setItem('kantoku-comic-project', id)
-      selectedRun.value = executions.value.find(item => item.director_spec?.version === project.value?.project.director_version)?.run_id
-        ?? (legacy?.workflow === 'comic.director' ? legacy.id : '')
-      const viewMode = sessionStorage.getItem(`kantoku-comic-view-mode:${id}`)
-      mode.value = viewMode === 'professional' || viewMode === 'fast' ? viewMode : active.value?.director_execution_summary.mode ?? 'fast'
-      if (mode.value === 'fast' && selectedStage.value === 'director_critic') navigate({ ...route.value, directorStage: 'director_assemble' }, true)
-    }
-    if (legacy && legacy.workflow !== 'comic.director') { section.value = 'assets'; chatExpanded.value = false }
-    await loadPage()
     await loadConversations()
-    activeConversationId.value = conversations.value[0]?.id ?? ''
-    await loadConversationMessages(activeConversationId.value)
+    const legacy = props.initialRunId ? await getRun(props.initialRunId) : null
+    const requestedPage = route.value.workspacePage
+    const requestedStage = route.value.directorStage
+    const stored = localStorage.getItem('kantoku-comic-active-conversation')
+    const id = route.value.conversationId ?? (typeof legacy?.state.conversation_id === 'string' ? legacy.state.conversation_id : null)
+      ?? (conversations.value.some(item => item.id === stored) ? stored : null) ?? conversations.value[0]?.id
+    if (id) await openConversation(id)
+    else await startConversation()
+    if (requestedPage && requestedPage !== 'conversation') {
+      section.value = requestedPage; selectedStage.value = requestedStage ?? 'director_assemble'; chatExpanded.value = false
+      await loadPage()
+    }
   } catch (failure) { error.value = failureText(failure) }
   finally { loading.value = false }
-  timer = setInterval(() => { void refresh().catch(failure => { error.value = failureText(failure) }) }, 2000)
+  timer = setInterval(() => {
+    const epoch = conversationEpoch
+    void refresh().catch(failure => { if (epoch === conversationEpoch) error.value = failureText(failure) })
+  }, 2000)
 })
 onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval(timer); Object.values(referenceUrls.value).forEach(url => URL.revokeObjectURL(url)) })
 </script>
 
 <template>
-  <ComicWorkspaceShell v-model:navigation-open="navOpen" :navigation="navigation" :active-page="activeNavigation" :creating-conversation="conversationBusy" @select-page="openSection" @new-conversation="startConversation">
+  <WorkspaceShell v-model:navigation-open="navOpen" :hide-heading="chatExpanded" :navigation="navigation" :active-page="activeNavigation" :creating-conversation="conversationBusy" @select-page="openSection" @new-conversation="startConversation">
     <template #toolbar>
       <strong class="toolbar-project">{{ projectTitle }}</strong>
       <label class="toolbar-mode"><span>创作模式</span>
@@ -536,24 +585,9 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
       <span class="toolbar-status" role="status">{{ busy || hasRunning ? summary?.status_label ?? '正在生成' : '' }}</span>
       <button class="ui-button quiet sm toolbar-new" :disabled="busy || hasRunning" @click="newProject">新作品</button>
     </template>
-    <template #recent>
-      <input v-model="conversationSearch" class="history-search" type="search" placeholder="搜索对话" aria-label="搜索对话" />
-      <div class="history-list" tabindex="0" aria-label="最近对话列表">
-        <div v-for="item in visibleConversations" :key="item.id" class="conversation-row" :class="{ active: item.id === activeConversationId }">
-          <input v-if="editingConversation === item.id" v-model="conversationTitle" class="history-search" aria-label="重命名对话" @keyup.enter="finishConversationRename" @keyup.esc="editingConversation = ''" />
-          <template v-else>
-            <button class="history-item" :title="item.title" :aria-current="item.id === activeConversationId ? 'true' : undefined" @click="openConversation(item.id)"><span>{{ item.title }}</span></button>
-            <span class="conversation-tools">
-              <button :aria-label="`重命名 ${item.title}`" @click="beginConversationRename(item)"><Pencil :size="13" /></button>
-              <button :aria-label="`删除 ${item.title}`" @click="removeConversation(item.id)"><Trash2 :size="13" /></button>
-            </span>
-          </template>
-        </div>
-        <p v-if="!visibleConversations.length" class="history-empty">{{ conversationSearch ? '没有匹配的对话' : '暂无对话' }}</p>
-      </div>
-    </template>
+    <template #recent><ConversationHistory list-only :conversations="conversations" :active-id="activeConversationId" :busy="conversationBusy" @select="openConversation" @rename="finishConversationRename" @remove="removeConversation" /></template>
             <template #heading>
-              <div><small>{{ chatExpanded ? '同一个项目，同一段创作对话' : section === 'director' ? '导演工作区' : '项目工作区' }}</small><h2>{{ chatExpanded ? '与 AI 导演协作' : title }}</h2></div>
+              <div><small>{{ chatExpanded ? 'AI 导演助手' : section === 'director' ? '导演工作区' : '项目工作区' }}</small><h2>{{ chatExpanded ? projectTitle : title }}</h2></div>
               <span v-if="!chatExpanded && section === 'director' && spec" class="node-version">v{{ spec.version }}<span v-if="dirty"> · 未保存修改</span></span>
               <button v-if="!chatExpanded" class="ui-button quiet sm" :aria-expanded="inspectorOpen" @click="inspectorOpen = !inspectorOpen"><PanelRight :size="15" /> 详情</button>
             </template>
@@ -640,15 +674,15 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
 
         <template #composer>
 <div class="workspace-composer">
-          <div class="composer-context"><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ArrowLeft v-if="chatExpanded" :size="15" /><MessageSquareText v-else :size="15" />{{ chatExpanded ? '返回工作区' : '打开创作对话' }}</button><small>{{ revisionVersion !== null ? `修改当前草稿 v${revisionVersion}` : '当前项目的同一个对话' }}</small><button v-if="revisionVersion !== null" class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button><button v-else-if="spec" class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">修改当前方案</button></div>
+          <div class="composer-context"><button class="ui-button quiet sm" :aria-expanded="chatExpanded" @click="chatExpanded = !chatExpanded"><ArrowLeft v-if="chatExpanded" :size="15" /><MessageSquareText v-else :size="15" />{{ chatExpanded ? '返回工作区' : '打开创作对话' }}</button><small>{{ revisionVersion !== null ? `修改当前草稿 v${revisionVersion}` : '当前对话' }}</small><button v-if="revisionVersion !== null" class="ui-button quiet sm" @click="revisionVersion = null">取消修改</button><button v-else-if="spec" class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">修改当前方案</button></div>
           <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击"新作品"进入作品级创作。</p>
           <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ summary?.status_label ?? '正在生成导演方案' }} · 可继续输入</span><button v-if="runningExecution" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
           <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
-          <MessageComposer ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
+          <MessageComposer :key="activeConversationId" ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
           <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '方案先保存为草稿，审核并确认后再进入制作。' }}</small>
         </div>
 </template>
-  </ComicWorkspaceShell>
+  </WorkspaceShell>
 </template>
 
 <style scoped>
@@ -661,19 +695,6 @@ select { color:var(--text-primary); background:transparent; border:1px solid var
 :deep(.comic-shell-heading) small { font-size:11px; color:var(--text-muted); }
 :deep(.comic-shell-heading) h2 { font-size:16px; font-weight:600; margin:3px 0 0; }
 .node-version { font-size:11px; color:var(--text-muted); }
-.history-search { flex-shrink:0; width:100%; padding:7px 10px; margin-bottom:6px; border:0; border-radius:7px; background:transparent; color:var(--text-primary); font:inherit; font-size:12px; }
-.history-search:focus { background:var(--surface); }
-.history-list { flex:1; min-height:0; overflow-y:auto; overscroll-behavior:contain; scrollbar-width:thin; }
-.conversation-row { position:relative; display:flex; align-items:center; min-height:34px; border-radius:7px; }
-.conversation-row:hover, .conversation-row.active { background:var(--sidebar-selected); }
-.history-item { flex:1; min-width:0; padding:9px 10px; border:0; background:transparent; color:var(--text-primary); font:inherit; font-size:12px; text-align:left; cursor:pointer; }
-.history-item span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-.conversation-tools { display:none; gap:2px; flex-shrink:0; padding-right:6px; }
-.conversation-row:hover .conversation-tools, .conversation-row:focus-within .conversation-tools { display:flex; }
-.conversation-tools button { display:grid; place-items:center; width:22px; height:24px; border:0; border-radius:5px; background:transparent; color:var(--text-secondary); cursor:pointer; }
-.conversation-tools button:hover { background:var(--surface); }
-.conversation-row > input { margin:0; }
-.history-empty { padding:6px 10px; color:var(--text-muted); font-size:12px; }
 .workspace-content { display:flex; flex:1; min-width:0; min-height:0; }
 .workspace-stage { display:flex; flex:1; min-width:0; min-height:0; flex-direction:column; }
 .stage-scroll { flex:1; min-height:0; overflow:auto; padding:18px max(32px, calc((100% - 760px) / 2)); font-size:14px; line-height:1.65; animation:node-enter 140ms ease-out; }

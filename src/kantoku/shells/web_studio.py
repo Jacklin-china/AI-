@@ -823,6 +823,10 @@ class StudioApplication:
             job.model_dump(mode="json")
             for job in self.runtime_store.list_media_jobs(conversation_id)
         ]
+        # Recover only explicit conversation bindings, never infer from project/title.
+        result["related_run_ids"] = [
+            run.id for run in self.runtime_store.list_runs(conversation_id=conversation_id)
+        ]
         return result
 
     def stream_conversation(

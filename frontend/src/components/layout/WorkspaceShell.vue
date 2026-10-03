@@ -7,6 +7,10 @@ defineProps<{
   activePage: string
   navigationOpen: boolean
   creatingConversation: boolean
+  identity?: string
+  subtitle?: string
+  hideHeading?: boolean
+  workspaceLabel?: string
 }>()
 const emit = defineEmits<{
   'update:navigationOpen': [open: boolean]
@@ -27,9 +31,9 @@ onBeforeUnmount(() => observer?.disconnect())
 </script>
 
 <template>
-  <section class="comic-shell" aria-label="AI 导演工作台" :style="{ '--comic-composer-space': `${composerSpace}px` }">
-    <aside v-show="navigationOpen" class="comic-shell-sidebar" aria-label="Comic 工作区侧栏">
-      <div class="comic-shell-identity"><strong>Comic Workspace</strong><span>漫剧创作</span></div>
+  <section class="comic-shell" :aria-label="workspaceLabel ?? 'AI 导演工作台'" :style="{ '--comic-composer-space': `${composerSpace}px` }">
+    <aside v-show="navigationOpen" class="comic-shell-sidebar" aria-label="会话工作区侧栏">
+      <div class="comic-shell-identity"><strong>{{ identity ?? 'Comic Workspace' }}</strong><span>{{ subtitle ?? '漫剧创作' }}</span></div>
       <button class="comic-shell-new" :disabled="creatingConversation" @click="emit('newConversation')"><Plus :size="17" /> 新建对话</button>
       <nav class="comic-shell-pages" aria-label="创作导航">
         <span class="comic-shell-label">工作区</span>
@@ -47,7 +51,7 @@ onBeforeUnmount(() => observer?.disconnect())
         <button class="comic-shell-toggle" :aria-expanded="navigationOpen" :aria-label="navigationOpen ? '收起导航' : '展开导航'" @click="emit('update:navigationOpen', !navigationOpen)"><PanelLeft :size="18" /></button>
         <slot name="toolbar" />
       </div>
-      <div class="comic-shell-heading"><slot name="heading" /></div>
+      <div v-if="!hideHeading" class="comic-shell-heading"><slot name="heading" /></div>
       <div class="comic-shell-content"><slot /></div>
       <div ref="composerHost" class="comic-shell-composer" aria-label="统一创作输入"><slot name="composer" /></div>
     </div>
@@ -56,11 +60,11 @@ onBeforeUnmount(() => observer?.disconnect())
 
 <style scoped>
 .comic-shell { display:flex; height:100%; min-height:0; min-width:0; color:var(--text-primary); background:var(--surface); }
-.comic-shell-sidebar { display:flex; flex-direction:column; flex:0 0 228px; min-height:0; min-width:0; padding:18px 12px 12px; background:var(--surface-subtle); }
+.comic-shell-sidebar { display:flex; flex-direction:column; flex:0 0 228px; min-height:0; min-width:0; padding:18px 12px 12px; background:var(--surface-subtle); border-right:1px solid var(--border-muted); }
 .comic-shell-identity { display:grid; gap:3px; padding:0 10px 16px; }
 .comic-shell-identity strong { font-size:13px; font-weight:600; }
 .comic-shell-identity span { font-size:11px; color:var(--text-muted); }
-.comic-shell-new, .comic-shell-pages button { display:flex; align-items:center; gap:10px; min-height:36px; padding:8px 10px; border:0; border-radius:8px; background:transparent; color:var(--text-primary); text-align:left; font:inherit; font-size:13px; cursor:pointer; }
+.comic-shell-new, .comic-shell-pages button { display:flex; align-items:center; gap:10px; min-height:36px; padding:8px 10px; border:0; border-radius:12px; background:transparent; color:var(--text-primary); text-align:left; font:inherit; font-size:13px; cursor:pointer; }
 .comic-shell-new { flex-shrink:0; margin-bottom:20px; }
 .comic-shell-pages { display:grid; gap:2px; flex-shrink:0; }
 .comic-shell-label { display:block; padding:6px 10px 10px; font-size:11px; color:var(--text-muted); }
@@ -71,7 +75,7 @@ onBeforeUnmount(() => observer?.disconnect())
 .comic-shell-recent { display:flex; flex-direction:column; flex:1; min-height:0; padding-top:24px; }
 .comic-shell-main { position:relative; display:flex; flex:1; flex-direction:column; min-width:0; min-height:0; }
 .comic-shell-top { display:flex; align-items:center; flex-shrink:0; gap:12px; height:60px; padding:10px 24px; background:transparent; }
-.comic-shell-toggle { display:grid; place-items:center; flex:0 0 30px; width:30px; height:32px; border:0; border-radius:7px; background:transparent; color:var(--text-secondary); cursor:pointer; }
+.comic-shell-toggle { display:grid; place-items:center; flex:0 0 30px; width:30px; height:32px; border:0; border-radius:10px; background:transparent; color:var(--text-secondary); cursor:pointer; }
 .comic-shell-toggle:hover { background:var(--surface-subtle); }
 .comic-shell-heading { display:flex; align-items:center; flex-shrink:0; gap:12px; height:62px; padding:8px 32px 16px; background:transparent; }
 .comic-shell-content { display:flex; flex:1; min-height:0; min-width:0; }
@@ -81,8 +85,11 @@ onBeforeUnmount(() => observer?.disconnect())
   scroll-padding-bottom:var(--comic-composer-space);
   mask-image:linear-gradient(to bottom, black calc(100% - var(--comic-composer-space)), transparent calc(100% - var(--comic-composer-space) + 16px));
 }
+.comic-shell-content :deep(.home-message-scroller) { padding-bottom:var(--comic-composer-space); scroll-padding-bottom:var(--comic-composer-space); }
 :deep(.message-composer) { border-radius:18px; box-shadow:var(--shadow-card); }
 :deep(.message-composer footer > span) { min-width:0; overflow-wrap:anywhere; }
+:deep(.message-composer button), :deep(select) { border-radius:10px; }
+:deep(.composer-domain-menu), :deep(.composer-domain-chip) { border-radius:14px; }
 button:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
 @media(max-width:1000px) { .comic-shell-sidebar { flex-basis:204px; } .comic-shell-top { padding-inline:16px; gap:8px; } .comic-shell-heading { padding-inline:24px; } }
 @media(max-width:600px) { .comic-shell-sidebar { flex-basis:180px; padding-inline:8px; } .comic-shell-top { padding-inline:10px; gap:6px; } .comic-shell-heading { padding:8px 16px 12px; } .comic-shell-composer { bottom:10px; width:calc(100% - 24px); } }

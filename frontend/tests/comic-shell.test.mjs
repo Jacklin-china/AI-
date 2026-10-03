@@ -6,7 +6,7 @@ import { compileScript, parse } from '@vue/compiler-sfc'
 import { createSSRApp, h } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 
-const source = readFileSync(new URL('../src/components/layout/ComicWorkspaceShell.vue', import.meta.url), 'utf8')
+const source = readFileSync(new URL('../src/components/layout/WorkspaceShell.vue', import.meta.url), 'utf8')
 const { descriptor, errors } = parse(source)
 assert.deepEqual(errors, [])
 const script = compileScript(descriptor, { id: 'comic-shell-contract', inlineTemplate: true }).content

@@ -804,10 +804,14 @@ class RuntimeStore:
         domain: str | None = None,
         status: ExecutionStatus | None = None,
         interaction_mode: InteractionMode | None = None,
+        conversation_id: str | None = None,
     ) -> list[RunRecord]:
         """按更新时间倒序列出 Run，可按领域与状态过滤。"""
         clauses: list[str] = []
         params: list[object] = []
+        if conversation_id is not None:
+            clauses.append("json_extract(state_json, '$.conversation_id')=?")
+            params.append(conversation_id)
         if domain:
             clauses.append("domain=?")
             params.append(domain)

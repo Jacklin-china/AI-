@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { History } from 'lucide-vue-next'
+import { History, MessageSquareText } from 'lucide-vue-next'
+import WorkspaceShell from '../components/layout/WorkspaceShell.vue'
+import { conversationTaskTitle } from '../components/chat/conversationPresentation'
 import ApprovalCard from '../components/approval/ApprovalCard.vue'
 import ChatMessageList from '../components/chat/ChatMessageList.vue'
 import ConversationHistory from '../components/chat/ConversationHistory.vue'
@@ -8,7 +10,7 @@ import MessageComposer from '../components/chat/MessageComposer.vue'
 import { visibleFastDomain, type FastDomain } from '../components/chat/fastDomainSelection'
 import SystemStatusInline from '../components/chat/SystemStatusInline.vue'
 import { presenterFor } from '../domains/presenters'
-import { navigate } from '../router'
+import { navigate, route } from '../router'
 import { createConversation, decideApproval, decideMediaCost, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, setConversationFastDomain, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../types'
 
@@ -16,6 +18,10 @@ const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreAppro
 const emit = defineEmits<{ refresh: []; runCreated: [run: CoreRun]; chatting: [active: boolean] }>()
 const conversations = ref<Conversation[]>([])
 const historyOpen = ref(false)
+const navOpen = ref(!window.matchMedia('(max-width: 600px)').matches)
+const creatingConversation = ref(false)
+const navigation = [{ id: 'conversation', label: '对话', icon: MessageSquareText }]
+const conversationTitle = computed(() => conversations.value.find(item => item.id === conversationId.value)?.title ?? '新对话')
 const conversationId = ref('')
 const messages = ref<ConversationMessage[]>([])
 const mediaJobs = ref<MediaJob[]>([])
@@ -38,7 +44,7 @@ const localApprovals = ref<CoreApproval[]>([])
 const lastContent = ref('')
 const imageUrl = ref('')
 interface InlineRunState { run: CoreRun; activities: RuntimeEvent[]; approval: CoreApproval | null; artifact: CoreArtifact | null; imageUrl: string; videoUrl: string }
-interface QueuedMessage { id: string; conversationId: string; content: string; domainHint: string | null; onBound?: () => void }
+interface QueuedMessage { id: string; conversationId: string; content: string; domainHint: string | null; title?: string; onBound?: () => void }
 const inlineRuns = ref<Record<string, InlineRunState>>({})
 const pendingMessages = ref<Record<string, 'queued' | 'replying' | 'failed'>>({})
 const activityByMessage = ref<Record<string, string>>({})
@@ -83,6 +89,16 @@ async function refreshFastDomain(ownerId: string): Promise<void> {
 
 async function selectConversation(id: string): Promise<void> {
   const currentSelection = ++selectionVersion
+  conversationId.value = id
+  if (!props.domain) {
+    localStorage.setItem('kantoku-home-active-conversation', id)
+    navigate({ name: 'home', conversationId: id }, true)
+  }
+  messages.value = []
+  activeRun.value = null
+  error.value = ''; errorMessageId.value = ''; activities.value = []; streaming.value = ''
+  fastDomain.value = null; domainHint.value = props.domain ?? null; fastDomainTaskId.value = null
+  composer.value?.fill('')
   if (mediaPollTimer) { clearInterval(mediaPollTimer); mediaPollTimer = null }
   stopEvents?.(); stopEvents = null
   for (const stop of homeStops.values()) stop()
@@ -217,9 +233,14 @@ async function loadMessageMedia(message: ConversationMessage, ownerId: string): 
 }
 
 async function newConversation(): Promise<void> {
-  const created = await createConversation(props.domain ? 'guided' : 'autonomous', props.domain)
-  await refreshConversations()
-  await selectConversation(created.id)
+  if (creatingConversation.value) return
+  creatingConversation.value = true
+  try {
+    const created = await createConversation(props.domain ? 'guided' : 'autonomous', props.domain)
+    await selectConversation(created.id)
+    await refreshConversations()
+  } catch (failure) { error.value = failure instanceof Error ? failure.message : '新建对话失败' }
+  finally { creatingConversation.value = false }
 }
 
 async function selectFastDomain(domain: FastDomain | null): Promise<void> {
@@ -257,7 +278,9 @@ async function removeChat(id: string): Promise<void> {
 async function initialize(): Promise<void> {
   try {
     await refreshConversations()
-    const conversation = conversations.value.find((item) => item.active_run_id === props.initialRunId) ?? conversations.value[0]
+    const storedId = route.value.conversationId ?? localStorage.getItem('kantoku-home-active-conversation')
+    const conversation = (!props.domain ? conversations.value.find(item => item.id === storedId) : null)
+      ?? conversations.value.find((item) => !!props.initialRunId && item.active_run_id === props.initialRunId) ?? conversations.value[0]
     if (conversation) await selectConversation(conversation.id)
     else await newConversation()
     if (props.initialRunId && activeRun.value?.id !== props.initialRunId) {
@@ -359,6 +382,7 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
   let persistedUserMessageId: string | null = null
   let bound = false
   try {
+    if (task.title) await renameConversation(task.conversationId, task.title)
     await streamConversationMessage(task.conversationId, task.content, task.domainHint, {
         onIntent: (plan) => {
           persistedUserMessageId = plan.user_message_id ?? null
@@ -475,6 +499,12 @@ async function send(content: string): Promise<void> {
     if (!conversationId.value) await initialize()
     if (!conversationId.value) return
     const ownerId = conversationId.value
+    const current = conversations.value.find(item => item.id === ownerId)
+    let taskTitle: string | undefined
+    if (current?.title === '新对话') {
+      taskTitle = conversationTaskTitle(content)
+      current.title = taskTitle
+    }
     const selectedDomain = fastDomain.value
     const earlierDispatch = pendingFastDispatches.get(ownerId)
     const id = `local-${Date.now()}-${++localMessageCounter}`
@@ -513,7 +543,7 @@ async function send(content: string): Promise<void> {
         return
       }
     }
-    void runHomeMessage({ id, content, conversationId: ownerId, domainHint: selectedDomain, onBound })
+    void runHomeMessage({ id, content, conversationId: ownerId, domainHint: selectedDomain, title: taskTitle, onBound })
     return
   }
   if (sending.value) return
@@ -626,8 +656,11 @@ watch(
 </script>
 
 <template>
-  <main class="chat-shell" :class="{ embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }">
-    <ConversationHistory v-if="!studioFocus || historyOpen" :conversations="conversations" :active-id="conversationId" :busy="!!domain && sending" @create="newConversation" @select="(id) => { void selectConversation(id); if (studioFocus) historyOpen = false }" @rename="renameChat" @remove="removeChat" />
+  <component :is="domain ? 'main' : WorkspaceShell" :class="domain ? ['chat-shell', { embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }] : 'home-workspace'" v-bind="domain ? {} : { navigation, activePage: 'conversation', navigationOpen: navOpen, creatingConversation, identity: 'Kantoku', subtitle: '对话工作区', workspaceLabel: '首页对话工作台', hideHeading: true }" @update:navigation-open="navOpen = $event" @new-conversation="newConversation">
+    <template #toolbar><strong class="home-conversation-title">{{ conversationTitle }}</strong></template>
+    <template #recent><ConversationHistory list-only :conversations="conversations" :active-id="conversationId" :busy="creatingConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" /></template>
+    <template #composer><MessageComposer :key="conversationId" ref="composer" fast-domains :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p class="home-composer-hint">{{ fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接提问或描述创意，结果会保留在当前对话。' }}</p></template>
+    <ConversationHistory v-if="domain && (!studioFocus || historyOpen)" :conversations="conversations" :active-id="conversationId" :busy="sending" @create="newConversation" @select="(id) => { void selectConversation(id); if (studioFocus) historyOpen = false }" @rename="renameChat" @remove="removeChat" />
     <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
     <header v-if="domain" class="chat-home-head">
       <div v-if="studioFocus"><h1>AI 导演</h1></div>
@@ -638,7 +671,13 @@ watch(
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
     <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :public-activities="publicActivities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
     <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
-    <div class="composer-dock"><MessageComposer ref="composer" :disabled="!!domain && sending" :fast-domains="!domain" :fast-domain="fastDomain" :fast-domain-busy="!!fastDomainTaskId || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p><label v-if="domain" class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>{{ domain ? '勾选后先优化提示词，再进入专业制作流程。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接描述想画什么；单图会在后台生成并回到当前聊天。' }}</p></div>
+    <div v-if="domain" class="composer-dock"><MessageComposer ref="composer" :disabled="sending" @send="send" /><p><label class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>勾选后先优化提示词，再进入专业制作流程。</p></div>
     </div>
-  </main>
+  </component>
 </template>
+
+<style scoped>
+.home-workspace .chat-home { height:100%; min-height:0; width:100%; }
+.home-conversation-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; font-weight:600; }
+.home-composer-hint { margin:8px 0 0; color:var(--text-muted); font-size:11px; text-align:center; }
+</style>

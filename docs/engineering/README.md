@@ -305,4 +305,24 @@ Runtime 架构或 PromptCompiler 改动；离线解析/恢复测试不代表真�
 
 ## 交付检查
 
+### Conversation Workspace 隔离与共享外壳
+
+首页与 Comic 共用 `WorkspaceShell.vue` 和 `ConversationHistory.vue`。节点导航与最近
+Conversation 分别管理，切换节点只替换中央内容；标题来自 Conversation，不取 Project
+标题或 Run 错误。首次输入的短标题仅用于导航，不改变用户原始需求；用户重命名后不覆盖。
+
+新建必须先创建真实 Conversation，再立即清空当前消息、选中 Run、草稿、失败状态和输入框。
+发送时捕获所属 Conversation，异步返回用选择版本校验，不得把旧响应写入新聊天。
+切换视图不会取消已提交的后台任务。恢复只认 Run 中显式的 `conversation_id`；同 Project
+不代表同 Conversation。现有 Conversation 详情通过 `related_run_ids` 返回绑定 Run，
+过滤在数据库查询的 limit 之前执行；不改 Director、审批、Provider 或数据表。
+
+路由查询参数 `conversation` 保留当前会话，刷新后恢复同一会话。Comic 历史任务通过
+绑定 Run 的真实公开输入/结果投影恢复，不把 Run/节点/错误记录单独列成历史聊天。
+
+`scripts/verify_conversation_workspace.py` 可启动独立 HTTP/SQLite 浏览器验收环境，复用
+现有应用和测试夹具；离线文本替身明确标识，禁止生图及外部模型调用，不访问生产数据库。
+须实际验证：旧聊天 → 新建立即为空 → 新任务短标题 → 返回旧内容 → 返回新内容 → 刷新，
+以及执行中切换、搜索、重命名持久化。截图、数据库和日志仅留在忽略的 `data/qa/`。
+
 在根目录执行 `uv run python scripts/check_structure.py`、`uv run ruff check .`、`uv run pytest`；在 `frontend/` 执行 `npm run build` 和 `npx vue-tsc --noEmit`。检查 `git diff --check`、待提交文件与忽略规则，确认没有密钥、日志、数据库、运行时图片后按 Conventional Commits 提交并推送，不使用 force push。涉及付费供应商的实测须单独确认预算与凭据，离线测试不冒充真实账单验收。

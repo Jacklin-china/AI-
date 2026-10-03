@@ -232,6 +232,7 @@ export interface Conversation {
   created_at: string
   updated_at: string
   messages?: ConversationMessage[]
+  related_run_ids?: string[]
   media_jobs?: MediaJob[]
 }
 
