@@ -167,6 +167,8 @@ function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
   if (run.status === 'waiting' && approvalKind === 'creative_review') return '画面已生成，等待你审核'
   if (run.status === 'waiting') return '等待你确认'
   const labels: Record<string, string> = {
+    director: '正在理解创意与设计视觉方案', director_gate: '正在校验导演方案',
+    storyboard: '正在规划关键画面', prompt: '正在准备制作提示',
     prepare: '正在准备画面', generate: '正在生成图片', video: '正在生成视频',
     qc: '正在检查画面', archive: '正在保存结果', rework: '正在修改画面',
     requirement: '正在理解需求', source_search: '正在收集资料',

@@ -68,7 +68,8 @@ class StudioComicServices:
         if task is None:
             raise ToolError("找不到 Comic 生成任务", detail=state.request_id)
         try:
-            result = execute_task(task, provider=self.provider, confirmed=state.confirmed)
+            result = execute_task(task, provider=self.provider, confirmed=state.confirmed,
+                                  conversation_id=state.conversation_id)
         except Exception:
             reservation = budget.get_reservation(state.request_id)
             if reservation is not None and reservation.status == "reserved":

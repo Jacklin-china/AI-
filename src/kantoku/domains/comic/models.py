@@ -17,6 +17,12 @@ class ComicState(RunState):
     project: str
     prompt: str
     execution_mode: Literal["fast", "professional"] = "professional"
+    conversation_id: str | None = None
+    message_id: str | None = None
+    trace_id: str | None = None
+    # Existing Run/checkpoint payload, not a second project or runtime store.
+    quick_creation: dict[str, Any] | None = None
+    total_estimate_fen: int | None = Field(default=None, gt=0)
     shot_no: int = Field(gt=0)
     estimate_fen: int = Field(gt=0)
     image_count: int = Field(default=1, ge=1, le=20)

@@ -326,3 +326,13 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 以及执行中切换、搜索、重命名持久化。截图、数据库和日志仅留在忽略的 `data/qa/`。
 
 在根目录执行 `uv run python scripts/check_structure.py`、`uv run ruff check .`、`uv run pytest`；在 `frontend/` 执行 `npm run build` 和 `npx vue-tsc --noEmit`。检查 `git diff --check`、待提交文件与忽略规则，确认没有密钥、日志、数据库、运行时图片后按 Conventional Commits 提交并推送，不使用 force push。涉及付费供应商的实测须单独确认预算与凭据，离线测试不冒充真实账单验收。
+
+## 首页 Quick Domain 真实执行入口（2026-10-03）
+
+- 首页提交显式 `selected_domain` 与 `execution_mode=fast`；普通下一条显式传 `selected_domain=null`，避免持久化的待完成技能污染新消息。旧客户端只允许消费尚未绑定任务的选择。`visual` 是 `studio` 的入口别名；专业会话拒绝首页快速模式参数。
+- 同一个 `conversation_router` 优先处理本条手动域选择：Comic/Commerce 进入现有领域 Graph，视觉进入共享 Image/Video Capability。不能再让通用 Chat/Image Planner 覆盖手动选择，也不能在 `stream_conversation` 中复制领域流程。
+- Comic 快捷任务在已有 `comic.production.v1` 增量接入导演、审核门、分镜、Prompt 节点，复用 ComicDirectorCoordinator、作品存储、Prompt Compiler、Studio Image/QC/Artifact；旧专业任务没有快捷上下文时仍沿用原图。首页单镜头生产不自动开启视频，也不宣称已制作整部多镜头作品。
+- 每条快捷 Comic 任务使用独立的 Project/Brief，输入只含本条需求和显式资产；生产 Run 保存 conversation/message/trace 与 `quick_creation` 中的 Brief、Director Run、分镜、镜头、Prompt Artifact 绑定。导演审核失败保留真实输出，等待修订或返回失败，禁止回退普通聊天、默认方案或未经审核的生图。
+- 同一消息的顺序或并发重试复用原生产 Run；进程内分配保护只覆盖创建/提交，不锁住导演执行。`domain_dispatch` 事件必须在 Worker 启动前写入，避免同一 Run 的并发事件序号冲突；恢复生产节点时复用明确绑定的 Director Run，不自动重提未知账单模型请求。
+- 费用门放在任何付费导演/图片调用之前，按配置估算整个任务（文本、图片、视觉检查及重试）；已知预计费用不超过首页配置限额时自动执行，超过则使用原 Core Approval。未配置价格必须公开标明未计价模型，不假报零成本。专业模式原审批不变。Commerce 继续公开标记现有 Mock 数据源/Marketplace，不假装已连接真实商品平台。
+- 测试必须等待所有已提交 Worker 结束后才撤销离线替身，并显式禁止真实模型客户端；否则异常退出后的线程可能使用恢复的生产配置。离线回归与付费验收分开执行。

@@ -367,7 +367,27 @@ def build_commerce_workflow(
         )
         return {"marketplace_draft": payload}
 
+    def approve_cost(_state: CommerceState, context: RuntimeContext) -> dict[str, Any]:
+        decision = context.approval_decision
+        return {
+            "confirmed": decision in {None, ApprovalDecision.APPROVE},
+            "cost_decision": decision.value if decision else "approve",
+        }
+
     nodes = {
+        "cost_approval": WorkflowNode(
+            "cost_approval",
+            approve_cost,
+            requires_approval=True,
+            approval_when=lambda state: not state.confirmed,
+            approval_request=lambda state: {
+                "kind": "cost_approval",
+                "total_fen": state.total_estimate_fen,
+                "estimate_fen": state.total_estimate_fen,
+                "unpriced_models": state.unpriced_models,
+                "message": "批准后才会执行付费文本能力；未配置价格的模型须先核实费用。",
+            },
+        ),
         "requirement": WorkflowNode("requirement", requirement),
         "source_search": WorkflowNode("source_search", source_search),
         "candidate_analysis": WorkflowNode("candidate_analysis", candidate_analysis),
@@ -407,7 +427,18 @@ def build_commerce_workflow(
         "publish_draft": WorkflowNode("publish_draft", publish_draft),
     }
     edges = {
-        START: "requirement",
+        START: ConditionalEdge(
+            lambda state: (
+                "quick"
+                if state.conversation_id and state.execution_mode == "fast" and not state.confirmed
+                else "normal"
+            ),
+            {"quick": "cost_approval", "normal": "requirement"},
+        ),
+        "cost_approval": ConditionalEdge(
+            lambda state: state.cost_decision or "reject",
+            {"approve": "requirement", "reject": END},
+        ),
         "requirement": "source_search",
         "source_search": "candidate_analysis",
         "candidate_analysis": "candidate_approval",

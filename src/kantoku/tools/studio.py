@@ -137,6 +137,7 @@ def execute_task(
     *,
     provider: ImageProvider,
     confirmed: bool = False,
+    conversation_id: str | None = None,
 ) -> ImageGenerationResult:
     """真实生成始终经过已有预算控制器，重复执行不会重复提交。"""
     if confirmed is not True:
@@ -151,6 +152,7 @@ def execute_task(
         client_request_id=task.request_id,
         provider=provider,
         est_fen=task.estimate_fen,
+        conversation_id=conversation_id,
     )
 
 

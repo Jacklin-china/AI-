@@ -130,6 +130,13 @@ class CommerceState(RunState):
     """Commerce Pack v0.1 的完整可恢复状态。"""
 
     requirement: str
+    conversation_id: str | None = None
+    message_id: str | None = None
+    trace_id: str | None = None
+    total_estimate_fen: int = Field(default=0, ge=0)
+    unpriced_models: list[str] = Field(default_factory=list)
+    confirmed: bool = True
+    cost_decision: str | None = None
     execution_mode: Literal["fast", "professional"] = "professional"
     data_mode: Literal["demo", "production"] = "demo"
     locale: Literal["zh-CN", "ru-RU"] = "zh-CN"

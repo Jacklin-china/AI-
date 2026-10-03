@@ -412,12 +412,13 @@ export async function streamConversationMessage(
   dataMode?: 'demo' | 'production',
   enhancePrompt?: boolean,
   generationRequestId?: string,
+  executionContext?: { selected_domain: string | null; execution_mode: 'fast' | 'normal' },
 ): Promise<void> {
   await ensureToken()
   const response = await fetch(api(`/api/conversations/${encodeURIComponent(id)}/messages/stream`), {
     method: 'POST',
     headers: { 'Content-Type': 'application/json', 'X-Studio-Token': token },
-    body: JSON.stringify({ content, domain_hint: domainHint, data_mode: dataMode, enhance_prompt: enhancePrompt === true, generation_request_id: generationRequestId }),
+    body: JSON.stringify({ content, domain_hint: domainHint, data_mode: dataMode, enhance_prompt: enhancePrompt === true, generation_request_id: generationRequestId, ...executionContext }),
   })
   if (!response.ok || !response.body) {
     throw await apiFailure(response, '消息发送失败')

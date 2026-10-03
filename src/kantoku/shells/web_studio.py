@@ -43,7 +43,7 @@ from kantoku.capabilities.creative import (
 from kantoku.capabilities.image import ConversationImageService
 from kantoku.capabilities.video import MockVideoProvider, VideoService
 from kantoku.capabilities.web_search import plan_web_search, search_web, visit_search_result
-from kantoku.config import KantokuError, ToolError, get_settings
+from kantoku.config import ExternalJobPending, KantokuError, ToolError, get_settings
 from kantoku.config.logging_setup import redact_secrets
 from kantoku.config.observability import (
     current_run_id,
@@ -75,7 +75,7 @@ from kantoku.core.conversations import (
 )
 from kantoku.core.llm import chat, stream_chat
 from kantoku.core.runtime.batch import BatchService
-from kantoku.core.runtime.graph import GraphRuntime
+from kantoku.core.runtime.graph import GraphRuntime, RuntimeContext
 from kantoku.core.runtime.models import (
     TERMINAL_STATUSES,
     ApprovalDecision,
@@ -148,7 +148,11 @@ from kantoku.perception.review import (
     record_qc_prediction,
 )
 from kantoku.schemas.qc import HumanQcLabel, QcResult
-from kantoku.shells.conversation_router import ConversationAction, route_conversation
+from kantoku.shells.conversation_router import (
+    ConversationAction,
+    route_conversation,
+    selected_fast_domain,
+)
 from kantoku.shells.image_cli import _money_fen, _provider
 from kantoku.tools.archive import archive_reviewed_image, search_archived_images
 from kantoku.tools.studio import (
@@ -432,6 +436,7 @@ class StudioApplication:
             StudioComicServices(image_provider),
             video_service=video,
             video_enabled=video_settings.enabled,
+            creation_step=self._comic_fast_creation_step,
         ))
         commerce_llm = (
             CommerceLlmAdapter() if commerce_settings.text_mode == "real" else None
@@ -457,6 +462,8 @@ class StudioApplication:
         self.runner = TaskRunner(max_workers=2)
         self._media_futures: dict[str, Any] = {}
         self._media_futures_lock = threading.Lock()
+        # Only serialize duplicate request allocation, never domain execution.
+        self._workflow_dispatch_locks = [threading.Lock() for _ in range(64)]
         self._media_poll_at: dict[str, float] = {}
         self.intent_planner = IntentPlanner()
         self._legacy_home_run_ids: set[str] | None = None
@@ -829,6 +836,239 @@ class StudioApplication:
         ]
         return result
 
+    def _start_conversation_workflow(
+        self, domain: str, requirement: str, conversation: ConversationRecord,
+        message_id: str, data: dict[str, Any], *, trace_id: str,
+        selected_domain: str | None,
+    ) -> dict[str, Any]:
+        """Bind an entry point to existing domain graphs, never a prompt-only chat."""
+        index = hash((conversation.id, message_id)) % len(self._workflow_dispatch_locks)
+        with self._workflow_dispatch_locks[index]:
+            return self._create_conversation_workflow(
+                domain, requirement, conversation, message_id, data,
+                trace_id=trace_id, selected_domain=selected_domain,
+            )
+
+    def _create_conversation_workflow(
+        self, domain: str, requirement: str, conversation: ConversationRecord,
+        message_id: str, data: dict[str, Any], *, trace_id: str,
+        selected_domain: str | None,
+    ) -> dict[str, Any]:
+        """Allocate once before submitting background work, including simultaneous retries."""
+        existing = next((run for run in self.runtime_store.list_runs(
+            conversation_id=conversation.id,
+        ) if run.state.get("message_id") == message_id
+            and run.workflow in {COMIC_WORKFLOW_ID, COMMERCE_WORKFLOW_ID}), None)
+        if existing:
+            if existing.domain != domain:
+                raise ToolError("本条任务已绑定其他创作域，不能用同一请求 ID 重提")
+            return self._run_payload(existing.id)
+        guided = conversation.interaction_mode is InteractionMode.GUIDED
+        identity = {"conversation_id": conversation.id, "message_id": message_id,
+                    "trace_id": trace_id}
+        if domain == "commerce":
+            requested_mode = "demo" if not guided else str(
+                data.get("data_mode") or self.commerce_settings.data_mode,
+            )
+            if requested_mode not in {"demo", "production"}:
+                raise ToolError("电商数据模式无效")
+            if not guided and self.commerce_settings.image_mode != "mock":
+                raise ToolError("电商快速体验暂不支持自动执行真实付费生图")
+            state: dict[str, Any] = {
+                **identity, "requirement": requirement, "locale": "ru-RU",
+                "data_mode": requested_mode,
+                "execution_mode": "professional" if guided else "fast",
+            }
+            if not guided and self.commerce_settings.text_mode == "real":
+                total, unpriced = self._quick_creation_cost(
+                    0, text_calls=2 * (self.runtime_settings.max_reworks + 1), vision=False,
+                )
+                state.update(total_estimate_fen=total, unpriced_models=unpriced,
+                             confirmed=not unpriced and total <= int(
+                                 get_settings().budget.autonomous_image_auto_cny * 100,
+                             ))
+        elif domain == "comic":
+            count = _image_count(requirement)
+            state = {
+                **identity, "project": conversation.title,
+                "execution_mode": "professional" if guided else "fast",
+                "prompt": requirement, "shot_no": 1,
+                "estimate_fen": budget.estimate_image_fen(), "image_count": count,
+                "confirmed": not guided and budget.estimate_image_fen(count=count)
+                <= int(get_settings().budget.autonomous_image_auto_cny * 100),
+            }
+            if selected_domain == "comic" and not guided:
+                # A new task gets its own creative root, not an old title/failed Brief.
+                snapshot = self.comic_projects.create(ComicProjectInput.model_validate({
+                    "title": requirement[:200], "brief": {"original_request": requirement},
+                }))
+                total, unpriced = self._quick_creation_cost(count)
+                state.update(
+                    project=snapshot.project.project_id, total_estimate_fen=total,
+                    confirmed=not unpriced and total <= int(
+                        get_settings().budget.autonomous_image_auto_cny * 100,
+                    ),
+                    quick_creation={"project_id": snapshot.project.project_id,
+                                    "original_request": requirement,
+                                    "input_brief_id": snapshot.creative_brief.brief_id,
+                                    "input_brief_version": snapshot.creative_brief.version,
+                                    "unpriced_models": unpriced},
+                )
+            elif _wants_prompt_enhancement(data):
+                state["prompt"] = _enhance_prompt(requirement, trace_id)
+        else:
+            raise ToolError("不支持的创作域", detail=domain)
+        coordinator = "ComicDirectorCoordinator" if state.get("quick_creation") else (
+            COMMERCE_WORKFLOW_ID if domain == "commerce" else COMIC_WORKFLOW_ID
+        )
+        payload = {**identity, "selected_domain": selected_domain,
+                   "execution_mode": state["execution_mode"],
+                   "resolved_intent": f"{domain}_production",
+                   "selected_coordinator": coordinator}
+        return self.enqueue_core_run({
+            "domain": domain, "state": state,
+            "interaction_mode": conversation.interaction_mode.value,
+        }, dispatch=payload)
+
+    @staticmethod
+    def _quick_creation_cost(
+        count: int, *, text_calls: int = 8, vision: bool = True,
+    ) -> tuple[int, list[str]]:
+        """Conservative task quote from configuration, not a fabricated provider bill."""
+        from decimal import ROUND_CEILING, Decimal
+
+        llm = get_settings().llm
+        prices = getattr(llm, "pricing_cny_per_million_by_model", {})
+        total = Decimal(budget.estimate_image_fen(count=count) if count else 0)
+        unpriced: list[str] = []
+        # Three director stages, critic + at most one repair/review, storyboard,
+        # compiler. Include configured retries and the larger fallback rate.
+        text_models = {llm.model_chat, getattr(llm, "fallback_model_chat", llm.model_chat)}
+        for model in text_models | ({llm.model_vision} if vision else set()):
+            if model not in prices:
+                unpriced.append(model)
+        known = [prices[model] for model in text_models if model in prices]
+        attempts = 1 + getattr(llm, "retry", 0)
+        if known:
+            total += attempts * text_calls * (max(p.input_cny for p in known) * 50000
+                                    + max(p.output_cny for p in known)
+                                    * getattr(llm, "max_tokens", 4096)) / 10000
+        if vision and (vision_price := prices.get(llm.model_vision)):
+            total += attempts * (vision_price.input_cny * 50000 + vision_price.output_cny
+                                 * getattr(llm, "vision_max_tokens", 512)) / 10000
+        return int(total.to_integral_value(rounding=ROUND_CEILING)), sorted(unpriced)
+
+    def _comic_fast_creation_step(
+        self, step: str, state: ComicState, context: RuntimeContext,
+    ) -> dict[str, Any]:
+        """Reuse the workspace Coordinator, stores and compiler from production graph nodes."""
+        creation = dict(state.quick_creation or {})
+        project_id = creation["project_id"]
+        request = creation["original_request"]
+        with request_trace(state.trace_id or f"trace-{context.run_id}"):
+            if step == "director":
+                existing = next((run for run in self.runtime_store.list_runs(
+                    conversation_id=state.conversation_id,
+                ) if run.workflow == "comic.director"
+                    and run.state.get("project_id") == project_id
+                    and run.state.get("trace_id") == state.trace_id), None)
+                try:
+                    # Interrupted parent nodes query their bound child instead of
+                    # implicitly resubmitting a possibly billed model request.
+                    result = self._comic_director_result(existing) if existing else \
+                        self.create_comic_director(project_id, {
+                        "expected_project_version": self.comic_projects.get(
+                            project_id,
+                        ).project.current_version,
+                        "creation_mode": "fast", "creative_operation": "new",
+                        "task": request, "conversation_id": state.conversation_id,
+                        "asset_ids": [],
+                    })
+                except Exception:
+                    # The Coordinator has already recorded its real failed Run.
+                    # Link that exact fresh project/trace, never retry with old context.
+                    failed = next((run for run in self.runtime_store.list_runs(
+                        conversation_id=state.conversation_id,
+                    ) if run.workflow == "comic.director"
+                        and run.state.get("project_id") == project_id
+                        and run.state.get("trace_id") == state.trace_id
+                        and run.status is ExecutionStatus.FAILED), None)
+                    if failed is None:
+                        raise
+                    result = self._comic_director_result(failed)
+                creation.update(director_run_id=result["run_id"],
+                                director_status=result["status"])
+                context.store.append_event(
+                    context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                    payload={"director_run_id": result["run_id"],
+                             "status": result["status"], "project_id": project_id},
+                )
+                spec = result.get("director_spec")
+                if state.conversation_id and spec:
+                    summary = "\n\n".join([
+                        "创意理解：" + spec["creative_decision"]["intent_summary"],
+                        "导演方案：" + spec["director_plan"]["visual_strategy"],
+                        "摄影方案：" + (spec["cinematography"].get("public_decision")
+                                       or spec["camera_language"]),
+                    ])
+                    message = self.runtime_store.add_conversation_message(
+                        state.conversation_id, role=MessageRole.ASSISTANT,
+                        type=MessageType.PLAN, content=summary, run_id=context.run_id,
+                        event_id=f"quick-director:{context.run_id}",
+                    )
+                    context.store.append_event(
+                        context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                        payload={"kind": "director_output",
+                                 "message": message.model_dump(mode="json")},
+                    )
+                return {"quick_creation": creation}
+            if step == "director_gate":
+                director_run = self.runtime_store.get_run(creation["director_run_id"])
+                if director_run.status is ExecutionStatus.FAILED:
+                    raise ToolError("导演执行失败，未进入制作", detail=director_run.error)
+                if director_run.status is not ExecutionStatus.COMPLETED:
+                    raise ExternalJobPending("导演草稿需要修订；原方案和 Trace 已保存，未调用生图")
+                spec = self.comic_projects.get_director(project_id)
+                self.confirm_comic_director(project_id, {
+                    "version": spec.version,
+                    "expected_project_version": self.comic_projects.get(
+                        project_id,
+                    ).project.current_version,
+                })
+                creation["director_spec_version"] = spec.version
+                context.store.append_event(
+                    context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                    payload={"kind": "fast_policy_authorized", "director_version": spec.version,
+                             "authorization": "one_shot_user_request", "human_review": False},
+                )
+                return {"quick_creation": creation}
+            if step == "storyboard":
+                result = self.create_comic_storyboard(project_id, {
+                    "expected_project_version": self.comic_projects.get(
+                        project_id,
+                    ).project.current_version,
+                    "generate": True,
+                    "task": "依据当前 Brief 和导演方案，规划本次轻量图片任务的一个关键画面。",
+                    "asset_ids": [],
+                })
+                shots = result["shots"]
+                if len(shots) != 1:
+                    raise ToolError("轻量单镜头任务的分镜数量不匹配，未调用生图")
+                creation.update(storyboard_id=result["storyboard"]["storyboard_id"],
+                                shot_id=shots[0]["shot_id"])
+                return {"quick_creation": creation}
+            if step == "prompt":
+                shot = self.comic_storyboards.get_shot(creation["shot_id"])
+                prompt = self.compile_comic_prompt(shot.shot_id, {
+                    "expected_project_version": self.comic_projects.get(
+                        project_id,
+                    ).project.current_version, "expected_shot_version": shot.version,
+                })
+                creation.update(prompt_artifact_id=prompt["artifact_id"],
+                                prompt_version=prompt["version"])
+                return {"quick_creation": creation, "prompt": prompt["positive_prompt"]}
+        raise ToolError("未知制作阶段", detail=step)
+
     def stream_conversation(
         self, conversation_id: str, data: dict[str, Any]
     ) -> Any:
@@ -843,14 +1083,13 @@ class StudioApplication:
                 and content.strip().rstrip("。！! ") in {"继续任务", "继续生图", "继续刚才的任务"}):
             yield from self._resume_home_image(conversation_id, content)
             return
-        selected_domain = (
-            conversation.domain
-            if conversation.interaction_mode is InteractionMode.AUTONOMOUS
-            and conversation.fast_domain_task_id is None else None
-        )
+        selected_domain = selected_fast_domain(conversation, data)
         hint = selected_domain if conversation.interaction_mode is InteractionMode.AUTONOMOUS \
             else str(data.get("domain_hint") or conversation.domain or "") or None
-        if conversation.fast_domain_task_id:
+        if conversation.interaction_mode is InteractionMode.AUTONOMOUS:
+            # A previous selection/run is not the context of this message.
+            conversation = conversation.model_copy(update={"domain": selected_domain})
+        elif conversation.fast_domain_task_id:
             conversation = conversation.model_copy(update={"domain": None})
         conversation_history = self.runtime_store.list_conversation_messages(conversation_id)
         history_before = conversation_history[-16:]
@@ -862,7 +1101,12 @@ class StudioApplication:
         )
         creative_decision: CreativeDecision | None = None
         prior_image: CreativeContext | None = None
-        if conversation.interaction_mode == InteractionMode.AUTONOMOUS:
+        if selected_domain in {"comic", "commerce"}:
+            # A deliberate quick-domain selection is already an execution decision.
+            # Do not let a second image/chat planner reinterpret it or load old image context.
+            plan = IntentPlan(intent=f"{selected_domain}_production", needs_execution=True,
+                              confidence=1.0, suggested_domain=selected_domain)
+        elif conversation.interaction_mode == InteractionMode.AUTONOMOUS:
             prior_image = self._recent_image_context(conversation_id)
             creative_decision = plan_creative_turn(
                 content, prior_image, trace_id=trace_id,
@@ -901,13 +1145,15 @@ class StudioApplication:
             )
         guided = conversation.interaction_mode == InteractionMode.GUIDED
         confirmed = guided and _is_execution_confirmed(content, history_before)
-        route = route_conversation(conversation, plan, confirmed=confirmed)
+        route = route_conversation(conversation, plan, confirmed=confirmed,
+                                   selected_domain=selected_domain)
         action = route.action
         generation_request_id = str(
             data.get("generation_request_id") or f"generation-{uuid4().hex}"
         )
         if (
-            action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT}
+            action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT,
+                       ConversationAction.WORKFLOW_START}
             and not _SAFE_TRACE.fullmatch(generation_request_id)
         ):
             raise ToolError("生成请求 ID 格式无效")
@@ -917,12 +1163,17 @@ class StudioApplication:
         user_message = self.runtime_store.add_conversation_message(
             conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
             content=content,
-            event_id=(f"generation-user:{generation_request_id}" if image_action else None),
+            event_id=(f"generation-user:{generation_request_id}" if image_action else
+                      f"workflow-user:{generation_request_id}"
+                      if action is ConversationAction.WORKFLOW_START else None),
         )
         if user_message.content != content:
             raise ToolError("生成请求 ID 已用于不同内容")
-        selected_task_id = user_message.id if selected_domain else None
+        selected_task_id = user_message.id if (
+            selected_domain and conversation.fast_domain_task_id is None
+        ) else None
         if selected_task_id:
+            self.runtime_store.set_conversation_domain(conversation_id, selected_domain)
             self.runtime_store.bind_fast_domain_task(conversation_id, selected_task_id)
         if conversation.title == "新对话":
             self.runtime_store.update_conversation(
@@ -932,6 +1183,7 @@ class StudioApplication:
             **plan.model_dump(mode="json"), "tool": action.value,
             "trace_id": trace_id, "domain": route.domain,
             "execution_mode": route.execution_mode.value,
+            "selected_domain": selected_domain,
             "user_message_id": user_message.id,
         }
         if not guided:
@@ -1201,47 +1453,10 @@ class StudioApplication:
         run: dict[str, Any] | None = None
         if execute and target_domain:
             requirement = _guided_requirement(history) if guided else content
-            if target_domain == "commerce":
-                requested_mode = (
-                    "demo" if not guided else
-                    str(data.get("data_mode") or self.commerce_settings.data_mode)
-                )
-                if requested_mode not in {"demo", "production"}:
-                    raise ToolError("电商数据模式无效")
-                if not guided and self.commerce_settings.image_mode != "mock":
-                    raise ToolError("电商快速体验暂不支持自动执行真实付费生图")
-                state: dict[str, Any] = {
-                    "requirement": requirement, "locale": "ru-RU",
-                    "data_mode": requested_mode,
-                    "execution_mode": "professional" if guided else "fast",
-                }
-                domain = "commerce"
-            else:
-                prompt = requirement
-                if _wants_prompt_enhancement(data):
-                    prompt = _enhance_prompt(requirement, trace_id)
-                state = {
-                    "project": (
-                        conversation.title if conversation.title != "新对话" else "Kantoku Chat"
-                    ),
-                    "execution_mode": route.execution_mode.value,
-                    "prompt": prompt, "shot_no": 1,
-                    "estimate_fen": budget.estimate_image_fen(),
-                    "image_count": _image_count(requirement),
-                    # Comic Graph is a professional multi-step production, not
-                    # the single-image home capability. Its paid step still
-                    # needs the existing cost approval in either mode.
-                    "confirmed": (
-                        not guided and budget.estimate_image_fen(
-                            count=_image_count(requirement),
-                        ) <= int(get_settings().budget.autonomous_image_auto_cny * 100)
-                    ),
-                }
-                domain = "comic"
-            run = self.enqueue_core_run({
-                "domain": domain, "state": state,
-                "interaction_mode": "guided" if guided else "autonomous",
-            })
+            run = self._start_conversation_workflow(
+                target_domain, requirement, conversation, user_message.id, data,
+                trace_id=trace_id, selected_domain=selected_domain,
+            )
             if selected_task_id:
                 self.runtime_store.transfer_fast_domain_task(
                     conversation_id, selected_task_id, str(run["id"]),
@@ -1249,6 +1464,7 @@ class StudioApplication:
             self.runtime_store.update_conversation(
                 conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
             )
+            self._reconcile_fast_domain(conversation_id)
             yield "run", run
         model_history = history[-1:] if execute else history
         if execute and not guided:
@@ -2281,9 +2497,16 @@ class StudioApplication:
             "expected_version": expected_version,
             "worker_instance_id": self._instance_id,
         }
+        parent_id = current_run_id()
+        parent = self.runtime_store.get_run(parent_id) if parent_id else None
+        if parent and parent.state.get("quick_creation"):
+            state.update(parent_run_id=parent.id,
+                         conversation_id=parent.state.get("conversation_id"),
+                         message_id=parent.state.get("message_id"), execution_mode="fast")
         run = self.runtime_store.create_run(
             "comic", f"comic.{task_type}", state, task_type,
-            interaction_mode=InteractionMode.GUIDED,
+            interaction_mode=InteractionMode.AUTONOMOUS
+            if state.get("execution_mode") == "fast" else InteractionMode.GUIDED,
         )
         self.runtime_store.append_event(
             run.id, RuntimeEventType.RUN_STARTED, node_id=task_type,
@@ -2689,7 +2912,9 @@ class StudioApplication:
             raise ToolError("不支持的 Domain Pack", detail=domain)
         return self._run_payload(run.id)
 
-    def enqueue_core_run(self, data: dict[str, Any]) -> dict[str, Any]:
+    def enqueue_core_run(
+        self, data: dict[str, Any], *, dispatch: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
         """Create a visible Run immediately and execute it on the bounded worker pool."""
         domain = str(data.get("domain", "")).strip().lower()
         interaction_mode = InteractionMode(str(data.get("interaction_mode", "guided")))
@@ -2709,9 +2934,26 @@ class StudioApplication:
         else:
             raise ToolError("不支持的 Domain Pack", detail=domain)
 
+        # Publish the entry-point binding before the worker can append events.
+        if dispatch is not None:
+            payload = {**dispatch, "run_id": run.id}
+            logger.bind(
+                trace_id=payload.get("trace_id"),
+                conversation_id=payload.get("conversation_id"),
+            ).info("quick domain dispatch {}", payload)
+            self.runtime_store.append_event(
+                run.id, RuntimeEventType.NODE_PROGRESS,
+                payload={"kind": "domain_dispatch", **payload},
+            )
+
         def execute() -> None:
             try:
-                self.runtime.resume(run.id)
+                with request_trace(run.state.get("trace_id") or f"trace-{run.id}"):
+                    final = self.runtime.resume(run.id)
+                if final.status in TERMINAL_STATUSES and (
+                    conversation_id := final.state.get("conversation_id")
+                ):
+                    self.runtime_store.finish_fast_domain_task(conversation_id, run.id)
             except Exception as error:
                 public_error(error, component="runtime-worker", run_id=run.id)
 

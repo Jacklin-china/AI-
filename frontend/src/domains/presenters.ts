@@ -35,6 +35,10 @@ const commerceLabels: Record<string, string> = {
 }
 
 const comicLabels: Record<string, string> = {
+  director: '创意理解与导演设计',
+  director_gate: '导演方案校验',
+  storyboard: '关键画面规划',
+  prompt: '编译制作提示',
   prepare: '创建制作任务',
   cost_approval: '费用确认',
   generate: '图片生成',

@@ -366,6 +366,10 @@ function followHomeRun(run: CoreRun, anchor: string): void {
     onEvent: (event) => {
       if (event.sequence <= lastSeen) return
       lastSeen = event.sequence
+      const message = event.payload.message as ConversationMessage | undefined
+      if (message?.conversation_id === conversationId.value && !messages.value.some(item => item.id === message.id)) {
+        messages.value.push(message)
+      }
       const current = inlineRuns.value[runAnchors.get(run.id) ?? '']
       if (current) updateInline(run.id, { activities: [...current.activities.filter((item) => item.sequence !== event.sequence), event].sort((a, b) => a.sequence - b.sequence) })
       void refreshInlineRun(run.id, ['approval_required', 'approval_resolved', 'artifact_created', 'run_completed', 'run_failed', 'run_cancelled'].includes(event.event_type)).catch(() => {})
@@ -464,7 +468,9 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
             } }
           }
         },
-      }, task.domainHint === 'commerce' ? 'demo' : dataMode.value, enhancePrompt.value, task.id)
+      }, task.domainHint === 'commerce' ? 'demo' : dataMode.value, enhancePrompt.value, task.id, {
+        selected_domain: task.domainHint, execution_mode: task.domainHint ? 'fast' : 'normal',
+      })
     const next = { ...pendingMessages.value }; delete next[task.id]; pendingMessages.value = next
   } catch (taskError) {
     const imageStarted = imagePhases.value[task.id]?.status === 'prepared' || imagePhases.value[task.id]?.status === 'generating'
