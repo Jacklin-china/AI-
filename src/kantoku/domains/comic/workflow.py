@@ -31,6 +31,7 @@ def build_comic_workflow(
     video_service: VideoService | None = None,
     video_enabled: bool = False,
     creation_step: Callable[[str, ComicState, RuntimeContext], dict[str, Any]] | None = None,
+    director_review_request: Callable[[ComicState], dict[str, Any]] | None = None,
 ) -> WorkflowDefinition[ComicState]:
     """构建复用现有生产能力的 Comic Workflow。"""
 
@@ -119,7 +120,18 @@ def build_comic_workflow(
 
     nodes = {
         "director": WorkflowNode("director", lambda s, c: plan("director", s, c)),
-        "director_gate": WorkflowNode("director_gate", lambda s, c: plan("director_gate", s, c)),
+        "director_gate": WorkflowNode(
+            "director_gate", lambda s, c: plan("director_gate", s, c),
+            requires_approval=True,
+            approval_when=lambda state: bool(state.quick_creation)
+            and state.quick_creation.get("director_status") != "failed",
+            approval_request=director_review_request or (lambda state: {
+                "kind": "director_review",
+                "director_version": (state.quick_creation or {}).get("director_spec_version"),
+                "ready": (state.quick_creation or {}).get("director_status") == "completed",
+                "message": "导演方案已整理。确认后将生成当前画面，也可以先补充修改方向。",
+            }),
+        ),
         "storyboard": WorkflowNode("storyboard", lambda s, c: plan("storyboard", s, c)),
         "prompt": WorkflowNode("prompt", lambda s, c: plan("prompt", s, c)),
         "prepare": WorkflowNode("prepare", lambda s, c: call("prepare", s, c)),
@@ -172,7 +184,10 @@ def build_comic_workflow(
             {"quick": "cost_approval", "legacy": "prepare"},
         ),
         "director": "director_gate",
-        "director_gate": "storyboard",
+        "director_gate": ConditionalEdge(
+            lambda state: (state.quick_creation or {}).get("director_decision", "approve"),
+            {"approve": "storyboard", "revise": "director_gate", "reject": END},
+        ),
         "storyboard": "prompt",
         "prompt": "prepare",
         "prepare": ConditionalEdge(

@@ -437,6 +437,7 @@ class StudioApplication:
             video_service=video,
             video_enabled=video_settings.enabled,
             creation_step=self._comic_fast_creation_step,
+            director_review_request=self._comic_fast_director_review,
         ))
         commerce_llm = (
             CommerceLlmAdapter() if commerce_settings.text_mode == "real" else None
@@ -958,6 +959,21 @@ class StudioApplication:
                                  * getattr(llm, "vision_max_tokens", 512)) / 10000
         return int(total.to_integral_value(rounding=ROUND_CEILING)), sorted(unpriced)
 
+    def _comic_fast_director_review(self, state: ComicState) -> dict[str, Any]:
+        """Read the explicitly bound draft, including checkpoints from before the UI gate."""
+        creation = state.quick_creation or {}
+        child = self.runtime_store.get_run(creation["director_run_id"])
+        if (child.state.get("project_id") != creation["project_id"]
+                or child.state.get("conversation_id") != state.conversation_id):
+            raise ToolError("导演任务绑定不一致，未进入生图")
+        result = self._comic_director_result(child)
+        spec = result.get("director_spec") or {}
+        return {"kind": "director_review", "director_version": spec.get("version"),
+                "ready": result["status"] == "completed",
+                "message": "导演方案已整理。确认后将生成当前画面，也可以先补充修改方向。"
+                if result["status"] == "completed" else
+                "导演方案需要调整，尚未生图。请补充修改方向后重新审核。"}
+
     def _comic_fast_creation_step(
         self, step: str, state: ComicState, context: RuntimeContext,
     ) -> dict[str, Any]:
@@ -1004,13 +1020,12 @@ class StudioApplication:
                              "status": result["status"], "project_id": project_id},
                 )
                 spec = result.get("director_spec")
+                if spec:
+                    creation.update(director_spec=spec, director_spec_version=spec.get("version"))
                 if state.conversation_id and spec:
-                    summary = "\n\n".join([
-                        "创意理解：" + spec["creative_decision"]["intent_summary"],
-                        "导演方案：" + spec["director_plan"]["visual_strategy"],
-                        "摄影方案：" + (spec["cinematography"].get("public_decision")
-                                       or spec["camera_language"]),
-                    ])
+                    # Presentation belongs to the client; persist the public structured result.
+                    summary = json.dumps({"director_spec": spec, "status": result["status"]},
+                                         ensure_ascii=False)
                     message = self.runtime_store.add_conversation_message(
                         state.conversation_id, role=MessageRole.ASSISTANT,
                         type=MessageType.PLAN, content=summary, run_id=context.run_id,
@@ -1023,12 +1038,63 @@ class StudioApplication:
                     )
                 return {"quick_creation": creation}
             if step == "director_gate":
+                if context.approval_decision is ApprovalDecision.REJECT:
+                    creation["director_decision"] = "reject"
+                    return {"quick_creation": creation}
+                if context.approval_decision is ApprovalDecision.REQUEST_REVISION:
+                    instruction = str(context.approval_response.get(
+                        "revision_instruction", "",
+                    )).strip()
+                    if not instruction:
+                        raise ToolError("请填写希望修改的方向；未进入生图")
+                    snapshot = self.comic_projects.get(project_id)
+                    approval = context.store.approval_for_node(context.run_id, step)
+                    self.create_comic_director(project_id, {
+                        "expected_project_version": snapshot.project.current_version,
+                        "expected_director_version": approval.request["director_version"],
+                        "revision_instruction": instruction,
+                        "conversation_id": state.conversation_id,
+                    })
+                    revised = self.create_comic_director(project_id, {
+                        "expected_project_version": self.comic_projects.get(
+                            project_id).project.current_version,
+                        "expected_director_version": self.comic_projects.get_director(
+                            project_id).version,
+                        "creation_mode": "fast", "review_current": True,
+                        "conversation_id": state.conversation_id,
+                    })
+                    spec = revised.get("director_spec")
+                    creation.update(director_run_id=revised["run_id"],
+                                    director_status=revised["status"], director_decision="revise")
+                    if spec:
+                        creation.update(director_spec=spec,
+                                        director_spec_version=spec.get("version"))
+                        message = context.store.add_conversation_message(
+                            state.conversation_id, role=MessageRole.ASSISTANT,
+                            type=MessageType.PLAN,
+                            content=json.dumps({"director_spec": spec,
+                                                "status": revised["status"]}, ensure_ascii=False),
+                            run_id=context.run_id,
+                            event_id=f"quick-director:{context.run_id}:{spec.get('version')}",
+                        )
+                        context.store.append_event(
+                            context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                            payload={"kind": "director_output",
+                                     "message": message.model_dump(mode="json")},
+                        )
+                    return {"quick_creation": creation}
                 director_run = self.runtime_store.get_run(creation["director_run_id"])
                 if director_run.status is ExecutionStatus.FAILED:
                     raise ToolError("导演执行失败，未进入制作", detail=director_run.error)
                 if director_run.status is not ExecutionStatus.COMPLETED:
                     raise ExternalJobPending("导演草稿需要修订；原方案和 Trace 已保存，未调用生图")
+                if context.approval_decision is not ApprovalDecision.APPROVE:
+                    raise ExternalJobPending("等待确认当前导演方案，未调用生图")
                 spec = self.comic_projects.get_director(project_id)
+                approval = context.store.approval_for_node(context.run_id, step)
+                if (approval and approval.request.get("kind") == "director_review"
+                        and approval.request.get("director_version") != spec.version):
+                    raise ToolError("导演方案版本已变化，请重新核对后确认，未调用生图")
                 self.confirm_comic_director(project_id, {
                     "version": spec.version,
                     "expected_project_version": self.comic_projects.get(
@@ -1036,10 +1102,11 @@ class StudioApplication:
                     ).project.current_version,
                 })
                 creation["director_spec_version"] = spec.version
+                creation["director_decision"] = "approve"
                 context.store.append_event(
                     context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
-                    payload={"kind": "fast_policy_authorized", "director_version": spec.version,
-                             "authorization": "one_shot_user_request", "human_review": False},
+                    payload={"kind": "director_confirmed", "director_version": spec.version,
+                             "authorization": "user_confirmation", "human_review": True},
                 )
                 return {"quick_creation": creation}
             if step == "storyboard":
@@ -1461,8 +1528,11 @@ class StudioApplication:
                 self.runtime_store.transfer_fast_domain_task(
                     conversation_id, selected_task_id, str(run["id"]),
                 )
+                # The Run owns its mode; the next message must not inherit the selection.
+                self.runtime_store.finish_fast_domain_task(conversation_id, str(run["id"]))
             self.runtime_store.update_conversation(
-                conversation_id, domain=conversation.domain, active_run_id=str(run["id"]),
+                conversation_id, domain=conversation.domain if guided else None,
+                active_run_id=str(run["id"]),
             )
             self._reconcile_fast_domain(conversation_id)
             yield "run", run
@@ -3041,6 +3111,20 @@ class StudioApplication:
         except KeyError:
             raise ToolError("审批操作无效", detail=action) from None
         approval_before = self.runtime_store.get_approval(approval_id)
+        if approval_before.request.get("kind") == "director_review":
+            if decision is ApprovalDecision.REQUEST_REVISION and not str(
+                data.get("response", data).get("revision_instruction", "")
+            ).strip():
+                raise ToolError("请填写希望修改的方向；未进入生图")
+            if decision is ApprovalDecision.APPROVE:
+                parent = self.runtime_store.get_run(approval_before.run_id)
+                creation = parent.state.get("quick_creation") or {}
+                child = self.runtime_store.get_run(creation["director_run_id"])
+                spec = self.comic_projects.get_director(creation["project_id"])
+                if child.status is not ExecutionStatus.COMPLETED:
+                    raise ToolError("导演方案尚需修订，不能确认生图")
+                if spec.version != approval_before.request.get("director_version"):
+                    raise ToolError("导演方案版本已变化，不能确认旧方案")
         run = self.approvals.decide_and_resume(
             approval_id, decision, data.get("response", data)
         )

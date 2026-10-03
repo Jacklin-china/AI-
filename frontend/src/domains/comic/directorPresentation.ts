@@ -81,6 +81,55 @@ export function directorConversationSummary(spec: Record<string, unknown> | null
   const state = typeof spec.version === 'number' ? '导演方案草稿已保存，可以进入工作区查看和修改。' : '已整理导演草稿，尚未保存为正式版本。'
   return `**我理解你的创意**\n\n${understanding.intent_summary}${mood}\n\n${state}`
 }
+
+// Homepage display adapter. Only public creative fields become readable Markdown.
+function readableDirectorValue(value: unknown, depth = 0): string {
+  if (depth > 5 || value == null) return ''
+  if (typeof value === 'string') {
+    const text = value.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```$/, '')
+    if (/^[\[{]/.test(text)) {
+      try { return readableDirectorValue(JSON.parse(text), depth + 1) }
+      catch { return '这部分方案需要重新整理。' }
+    }
+    return text
+  }
+  if (Array.isArray(value)) return value.map(item => readableDirectorValue(item, depth + 1)).filter(Boolean).map(item => `- ${item}`).join('\n')
+  if (typeof value !== 'object') return ''
+  return Object.entries(value as Record<string, unknown>).flatMap(([key, item]) => {
+    const label = directorFieldLabels[key]
+    const body = readableDirectorValue(item, depth + 1)
+    if (label && body) return [`**${label}**：${body.startsWith('- ') ? `\n\n${body}` : body}`]
+    if (['structured_plan', 'creative_decision', 'director_plan', 'cinematography'].includes(key)) return body ? [body] : []
+    return [] // IDs, status codes, provider options and private reasoning never leak.
+  }).join('\n\n')
+}
+
+export function quickDirectorMessage(content: string): string {
+  const normalized = content.trim().replace(/^```(?:json)?\s*\n?/i, '').replace(/\n?```$/, '')
+  try {
+    const parsed = JSON.parse(normalized)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return '方案数据需要重新整理，暂未进入生图。'
+    const spec = parsed.director_spec ?? parsed
+    const sections = [
+      ['creative_decision', '创意理解'], ['director_plan', '导演方案'], ['cinematography', '摄影 / 画面建议'],
+    ].flatMap(([key, title]) => {
+      const body = readableDirectorValue(spec[key!])
+      return body ? [`### ${title}\n\n${body}`] : []
+    })
+    if (!sections.length) return '方案数据需要重新整理，暂未进入生图。'
+    const waiting = parsed.status && parsed.status !== 'completed'
+    const review = spec.critic_result
+    const suggestions = readableDirectorValue(review?.public_summary) + (Array.isArray(review?.findings)
+      ? review.findings.map((item: Record<string, unknown>) => readableDirectorValue(item.suggested_action)).filter(Boolean).map((text: string) => `\n- ${text}`).join('') : '')
+    const state = waiting ? '当前方案需要调整，**暂未进入生图**。请补充修改方向后重新审核。' : '方案已整理。**确认方案并生成**后，将制作当前画面；也可以先补充修改方向。'
+    return [...sections, `### 当前状态\n\n${state}${waiting && suggestions ? `\n\n${suggestions}` : ''}`].join('\n\n')
+  } catch {
+    // Legacy persisted messages used headings followed by unformatted model strings.
+    if (/^[\[{]/.test(normalized)) return '方案数据需要重新整理，暂未进入生图。'
+    return content.replace(/(^|\n\n)(创意理解|导演方案|摄影方案)：([^]*?)(?=\n\n(?:创意理解|导演方案|摄影方案)：|$)/g,
+      (_match, space, title, body) => `${space}### ${title}\n\n${readableDirectorValue(body)}`)
+  }
+}
 export function workspaceProjectTitle(title: string | undefined, request: string | undefined): string {
   // 自动生成的原话标题已在对话中出现，不再把长需求复制到工具栏。
   return !title || request?.startsWith(title) ? '漫剧作品' : title

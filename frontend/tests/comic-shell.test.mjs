@@ -6,7 +6,11 @@ import { compileScript, parse } from '@vue/compiler-sfc'
 import { createSSRApp, h } from 'vue'
 import { renderToString } from '@vue/server-renderer'
 
-const source = readFileSync(new URL('../src/components/layout/WorkspaceShell.vue', import.meta.url), 'utf8')
+// Test the shell actually imported by the workspace, including directory refactors.
+const workspaceUrl = new URL('../src/components/DirectorWorkspace.vue', import.meta.url)
+const shellImport = readFileSync(workspaceUrl, 'utf8').match(/import WorkspaceShell from ['"]([^'"]+)['"]/)?.[1]
+assert.ok(shellImport, 'DirectorWorkspace must reuse the shared WorkspaceShell')
+const source = readFileSync(new URL(shellImport, workspaceUrl), 'utf8')
 const { descriptor, errors } = parse(source)
 assert.deepEqual(errors, [])
 const script = compileScript(descriptor, { id: 'comic-shell-contract', inlineTemplate: true }).content

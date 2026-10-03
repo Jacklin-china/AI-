@@ -21,7 +21,7 @@ const listing = computed(() => (props.approval.request?.listing ?? {}) as Record
 const qc = computed(() => (props.approval.request?.qc ?? null) as Record<string, unknown> | null)
 const image = computed(() => (props.approval.request?.image ?? null) as Record<string, unknown> | null)
 const isMock = computed(() => props.approval.request?.origin === 'mock' || Boolean(props.approval.request?.mock))
-const title = computed(() => presenter.value.approvalTitle(kind.value || null))
+const title = computed(() => kind.value === 'director_review' ? '确认导演方案' : presenter.value.approvalTitle(kind.value || null))
 
 const decisionLabel: Record<string, string> = {
   approve: '已批准',
@@ -35,12 +35,14 @@ function money(fen: number): string {
 
 function submit(action: 'approve' | 'reject' | 'revise'): void {
   if (resolved.value || submitting.value) return
+  if (action === 'approve' && kind.value === 'director_review' && props.approval.request.ready === false) return
   submitting.value = action
   const response: Record<string, unknown> = {}
   if (action === 'approve' && kind.value === 'candidate_approval') {
     response.candidate_id = selected.value || candidates.value[0]?.id || null
   }
   if (action === 'revise') response.revision_instruction = reviseNote.value.trim()
+  if (action === 'revise' && kind.value === 'director_review' && !reviseNote.value.trim()) { submitting.value = null; return }
   emit('decide', action, response)
 }
 
@@ -106,7 +108,7 @@ watch(() => props.busy, (value) => { if (!value) submitting.value = null })
 
     <label v-if="!resolved" class="revise-field">
       <span>希望修改什么？（可选，用于「要求修改」）</span>
-      <input v-model="reviseNote" class="ui-input" type="text" placeholder="例如：优先选择采购成本低于 ¥15 的商品" />
+      <input v-model="reviseNote" class="ui-input" type="text" :placeholder="kind === 'director_review' ? '例如：保持人物不变，让背景更简洁' : '例如：优先选择采购成本低于 ¥15 的商品'" />
     </label>
 
     <footer>
@@ -115,9 +117,9 @@ watch(() => props.busy, (value) => { if (!value) submitting.value = null })
       </template>
       <template v-else>
         <button class="ui-button sm" :disabled="busy || submitting !== null" @click="submit('reject')">拒绝</button>
-        <button class="ui-button sm" :disabled="busy || submitting !== null" @click="submit('revise')">要求修改</button>
-        <button class="ui-button sm primary" :disabled="busy || submitting !== null" @click="submit('approve')">
-          {{ submitting === 'approve' ? '提交中……' : '批准并继续' }}
+        <button class="ui-button sm" :disabled="busy || submitting !== null || (kind === 'director_review' && !reviseNote.trim())" @click="submit('revise')">要求修改</button>
+        <button class="ui-button sm primary" :disabled="busy || submitting !== null || (kind === 'director_review' && approval.request.ready === false)" @click="submit('approve')">
+          {{ submitting === 'approve' ? '提交中……' : kind === 'director_review' ? '确认方案并生成' : '批准并继续' }}
         </button>
       </template>
       <button v-if="!homeMode" class="text-action" @click="showRaw = !showRaw">{{ showRaw ? '隐藏' : '查看' }}原始数据</button>

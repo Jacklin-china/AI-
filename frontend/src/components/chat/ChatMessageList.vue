@@ -12,6 +12,9 @@ import ErrorRecoveryPanel from './ErrorRecoveryPanel.vue'
 import UserMessageBubble from './UserMessageBubble.vue'
 import WorkflowActivity from './WorkflowActivity.vue'
 import KantokuMark from '../brand/KantokuMark.vue'
+import { quickDirectorMessage } from '../../domains/comic/directorPresentation'
+import { comicProductionProgress } from '../../domains/comic/productionProgress'
+import ImageGenerationPlaceholder from './ImageGenerationPlaceholder.vue'
 interface InlineRunState {
   run: CoreRun
   activities: RuntimeEvent[]
@@ -159,12 +162,16 @@ function imagePlaceholderRatio(requestId: string): string {
 }
 
 function homeStatus(run: CoreRun, approval: CoreApproval | null): string {
+  if ((run.state.quick_creation as Record<string, unknown> | undefined)?.director_decision === 'reject') return '已停止，未生成图片'
   if (run.status === 'completed') return run.domain === 'commerce' && run.state.execution_mode === 'fast' ? '模拟电商草稿已完成' : '已完成'
   if (run.status === 'failed') return '这次没有完成'
   if (run.status === 'cancelled') return '已取消'
   const approvalKind = String(approval?.request.kind ?? '')
   if (run.status === 'waiting' && approvalKind === 'cost_approval') return '等待费用确认'
   if (run.status === 'waiting' && approvalKind === 'creative_review') return '画面已生成，等待你审核'
+  if (run.status === 'waiting' && approvalKind === 'director_review') return approval?.request.ready === false ? '方案需要调整，尚未开始生图' : '等待确认导演方案'
+  if (run.status === 'waiting' && run.domain === 'comic' && run.current_node === 'generate') return '正在生成图片，等待供应商结果'
+  if (run.status === 'waiting' && run.domain === 'comic' && ['director', 'director_gate'].includes(run.current_node)) return '方案需要调整，尚未开始生图'
   if (run.status === 'waiting') return '等待你确认'
   const labels: Record<string, string> = {
     director: '正在理解创意与设计视觉方案', director_gate: '正在校验导演方案',
@@ -193,6 +200,7 @@ function activityLabel(messageId: string, item: { kind: string; label: string })
 }
 
 function runActivityTitle(run: CoreRun): string {
+  if ((run.state.quick_creation as Record<string, unknown> | undefined)?.director_decision === 'reject') return '漫剧创作已停止'
   const domain = ({ comic: '漫剧创作', commerce: '电商创作', studio: '视觉创作' } as Record<string, string>)[run.domain]
     ?? '创作任务'
   if (run.status === 'completed') return `已完成${domain}`
@@ -339,11 +347,11 @@ function activityText(event: RuntimeEvent): string {
           </div>
           <template v-else-if="['pending', 'generating'].includes(mediaJobForUser(message)!.status)">
             <div class="chat-image-wave" role="status" :aria-label="mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片'"><span v-for="(character, position) in (mediaJobForUser(message)!.status === 'generating' ? '正在生图' : '正在准备图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span></div>
-            <div class="chat-image-skeleton" role="img" aria-label="图片生成中"></div>
+            <ImageGenerationPlaceholder />
           </template>
           <p v-else-if="mediaJobForUser(message)!.status === 'failed' && !hasFailureMessage(mediaJobForUser(message)!.generation_request_id)" class="chat-inline-error" role="alert">{{ mediaJobForUser(message)!.error_message }}</p>
         </div>
-        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="message.content" :show-mark="!homeMode" />
+        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="homeMode && message.event_id?.startsWith('quick-director:') ? quickDirectorMessage(message.content) : message.content" :show-mark="!homeMode" />
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
           <div v-if="awaitingCost(imageRequestId(message)!)" class="chat-cost-card">
             <strong>本次生图需要确认费用</strong>
@@ -359,7 +367,7 @@ function activityText(event: RuntimeEvent): string {
             <div class="chat-image-wave" role="status" :aria-label="imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片'">
               <span v-for="(character, position) in (imagePhases?.[imageRequestId(message)!]?.status === 'generating' ? '正在生图' : '正在载入图片')" :key="position" :style="{ animationDelay: `${position * 0.12}s` }" aria-hidden="true">{{ character }}</span>
             </div>
-            <div class="chat-image-skeleton" :style="{ aspectRatio: imagePlaceholderRatio(imageRequestId(message)!) }" role="img" aria-label="图片生成中"></div>
+            <ImageGenerationPlaceholder :ratio="imagePlaceholderRatio(imageRequestId(message)!)" />
           </template>
           <p v-else-if="imagePhases?.[imageRequestId(message)!]?.status === 'failed' && !hasFailureMessage(imageRequestId(message)!)" class="chat-inline-error" role="alert">{{ mediaJobs?.find((job) => job.generation_request_id === imageRequestId(message))?.error_message ?? '图片生成未完成，请查看错误记录。' }}</p>
         </div>
@@ -397,7 +405,8 @@ function activityText(event: RuntimeEvent): string {
           <p v-if="fastCommerceSummary(inlineRuns[message.id].run)" class="chat-inline-qc">{{ fastCommerceSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>
-          <figure v-if="inlineRuns[message.id].imageUrl && (inlineRuns[message.id].run.status === 'completed' || inlineRuns[message.id].approval?.request.kind === 'creative_review')" class="chat-generated-image"><img :src="inlineRuns[message.id].imageUrl" alt="生成的图片" /><figcaption>{{ inlineRuns[message.id].run.status === 'completed' ? '图片已保存' : '画面已生成，等待审核' }}</figcaption></figure>
+          <ImageGenerationPlaceholder v-if="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, !!inlineRuns[message.id].imageUrl).visible" :percent="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, false).percent" :label="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, false).label" :started-at="inlineRuns[message.id].activities.find(item => item.node_id === 'generate' && item.event_type === 'node_started')?.created_at" />
+          <ChatImageAttachment v-if="inlineRuns[message.id].imageUrl" :media="{ url: inlineRuns[message.id].imageUrl, filename: `kantoku-${inlineRuns[message.id].run.id}.png` }" @open="openImage" />
           <figure v-if="inlineRuns[message.id].videoUrl && inlineRuns[message.id].run.status === 'completed'" class="chat-generated-image"><video :src="inlineRuns[message.id].videoUrl" controls preload="metadata" /><figcaption>视频已保存</figcaption></figure>
           <p v-else-if="inlineRuns[message.id].run.status === 'completed' && inlineRuns[message.id].artifact?.type === 'video'" class="chat-inline-status">视频已保存，预览暂不可用。</p>
           <ApprovalCard v-if="inlineRuns[message.id].approval" :approval="inlineRuns[message.id].approval!" :domain="inlineRuns[message.id].run.domain" :busy="approvalBusy ?? false" :image-url="inlineRuns[message.id].imageUrl" home-mode @decide="(action, response) => $emit('decideInline', message.id, action, response)" />

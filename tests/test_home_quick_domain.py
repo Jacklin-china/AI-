@@ -51,6 +51,12 @@ def production(
 
     def director(messages: list[dict[str, str]]) -> str:
         instruction = messages[0]["content"]
+        if "根据用户修改指令编辑当前导演草稿" in instruction:
+            calls.append("revision")
+            payload = json.loads(messages[1]["content"])
+            draft = payload["current_draft"]
+            draft["director_plan"]["composition_strategy"] = payload["revision_instruction"]
+            return json.dumps(draft, ensure_ascii=False)
         for skill, name in zip(
             SKILLS[:3],
             (
@@ -178,19 +184,31 @@ def _run(events: list) -> dict[str, Any]:
     return next(data for event, data in events if event == "run")
 
 
+def _confirm(app: web_studio.StudioApplication, run: dict[str, Any]) -> dict[str, Any]:
+    approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    assert approval and approval.request["kind"] == "director_review"
+    app.decide_core_approval(approval.id, "approve", {})
+    return app._run_payload(run["id"])
+
+
 def test_comic_selection_enters_coordinator_and_real_shared_production(
     app: web_studio.StudioApplication,
     production: list[str],
 ) -> None:
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     events = _send(app, cid)
+    waiting = _run(events)
+    assert waiting["status"] == "waiting"
+    assert production == SKILLS[:4]
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+    run = _confirm(app, waiting)
     intent = next(data for event, data in events if event == "intent")
     assert (intent["domain"], intent["execution_mode"], intent["tool"]) == (
         "comic",
         "fast",
         "workflow.start",
     )
-    run = app.runtime_store.get_run(_run(events)["id"])
+    run = app.runtime_store.get_run(run["id"])
     assert run.status is ExecutionStatus.COMPLETED
     assert run.workflow == "comic.production.v1"
     assert run.state["conversation_id"] == cid
@@ -278,8 +296,8 @@ def test_each_selected_task_binds_only_its_fresh_brief(
     user_request: str,
 ) -> None:
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
-    old = _run(_send(app, cid, content="旧创意：穷奇悬崖"))
-    new = _run(_send(app, cid, content=user_request))
+    old = _confirm(app, _run(_send(app, cid, content="旧创意：穷奇悬崖")))
+    new = _confirm(app, _run(_send(app, cid, content=user_request)))
     assert old["status"] == new["status"] == "completed"
     previous, current = old["state"]["quick_creation"], new["state"]["quick_creation"]
     assert previous["project_id"] != current["project_id"]
@@ -304,6 +322,7 @@ def test_high_cost_waits_before_director_then_resumes_same_run(
     assert approval.request["total_fen"] > 10
     assert approval.request["estimate_fen"] == approval.request["total_fen"]
     app.decide_core_approval(approval.id, "approve", {})
+    _confirm(app, run)
     assert app.runtime_store.get_run(run["id"]).status is ExecutionStatus.COMPLETED
     assert production == SKILLS[:4] + ["storyboard", "prompt"]
 
@@ -357,6 +376,11 @@ def test_critic_revision_keeps_draft_and_never_calls_image(
     assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
     director = app.runtime_store.get_run(run["state"]["quick_creation"]["director_run_id"])
     assert director.state["director_candidate"]
+    approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    assert approval.request["ready"] is False
+    with pytest.raises(ToolError, match="尚需修订"):
+        app.decide_core_approval(approval.id, "approve", {})
+    assert app.runtime_store.get_approval(approval.id).decision.value == "pending"
 
 
 def test_selected_commerce_runs_existing_graph_not_normal_chat(
@@ -424,7 +448,9 @@ def test_stream_http_payload_reaches_director_with_real_run_and_trace(
         ]
         assert len(runs) == 1
         stored = app.runtime_store.get_run(runs[0]["id"])
-        assert stored.status is ExecutionStatus.COMPLETED
+        assert stored.status is ExecutionStatus.WAITING
+        _confirm(app, {"id": stored.id})
+        assert app.runtime_store.get_run(stored.id).status is ExecutionStatus.COMPLETED
         director = app.runtime_store.get_run(stored.state["quick_creation"]["director_run_id"])
         assert director.state["conversation_id"] == cid
         assert director.state["trace_id"] == response.getheader("X-Trace-ID")
@@ -464,7 +490,7 @@ def test_home_twenty_yuan_boundary(
     monkeypatch.setattr(app, "_quick_creation_cost", lambda _count: (total, []))
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     run = _run(_send(app, cid))
-    assert (run["status"] == "completed") is automatic
+    assert (run["current_node"] == "director_gate") is automatic
     approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
     assert (approval is None) is automatic
 
@@ -509,8 +535,8 @@ def test_other_conversation_and_normal_chat_are_not_blocked_by_director(
     finally:
         release.set()
         app.runner.close()
-    assert app.runtime_store.get_run(first["id"]).status is ExecutionStatus.COMPLETED
-    assert app.runtime_store.get_run(second["id"]).status is ExecutionStatus.COMPLETED
+    assert app.runtime_store.get_run(first["id"]).status is ExecutionStatus.WAITING
+    assert app.runtime_store.get_run(second["id"]).status is ExecutionStatus.WAITING
 
 
 def test_restarted_parent_reuses_director_run_without_resubmitting_models(
@@ -583,3 +609,110 @@ def test_simultaneous_retries_allocate_one_production_run(
     assert len(submissions) == 1
     assert len(app.runtime_store.list_runs(conversation_id=conversation.id)) == 1
     assert production == []
+
+
+def test_director_rejection_never_submits_image(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    app.decide_core_approval(approval.id, "reject", {})
+    assert production == SKILLS[:4]
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+    assert app.runtime_store.get_run(run["id"]).state["quick_creation"][
+        "director_decision"
+    ] == "reject"
+
+
+def test_revision_saves_new_draft_then_requires_fresh_confirmation(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    with pytest.raises(ToolError, match="填写"):
+        app.decide_core_approval(approval.id, "revise", {})
+    app.decide_core_approval(approval.id, "revise", {
+        "revision_instruction": "让人物与背景分开，保留电话动作",
+    })
+    revised = app.runtime_store.get_run(run["id"])
+    assert revised.status is ExecutionStatus.WAITING
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+    current = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    assert current.id != approval.id
+    assert current.request["director_version"] > approval.request["director_version"]
+    assert "revision" in production
+    messages = app.conversation(cid)["messages"]
+    drafts = [item for item in messages if (item.get("event_id") or "").startswith(
+        "quick-director:"
+    )]
+    assert len(drafts) == 2
+    assert json.loads(drafts[-1]["content"])["director_spec"]["director_plan"][
+        "composition_strategy"
+    ] == "让人物与背景分开，保留电话动作"
+    _confirm(app, run)
+    assert app.runtime_store.get_run(run["id"]).status is ExecutionStatus.COMPLETED
+    assert len(app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)) == 1
+
+
+def test_restart_preserves_confirmation_and_continues_same_image_task(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    restarted = web_studio.StudioApplication()
+    monkeypatch.setattr(restarted, "_comic_director_model", app._comic_director_model)
+    monkeypatch.setattr(restarted, "_comic_storyboard_model", app._comic_storyboard_model)
+    monkeypatch.setattr(restarted.runner, "submit", lambda execute: execute())
+    try:
+        before = list(production)
+        _confirm(restarted, run)
+        assert production[:len(before)] == before
+        assert production[len(before):] == ["storyboard", "prompt"]
+        assert restarted.runtime_store.get_run(run["id"]).status is ExecutionStatus.COMPLETED
+        assert len(restarted.runtime_store.list_artifacts(type=ArtifactType.IMAGE)) == 1
+        assert all(item["run_id"] == run["id"] for item in restarted.conversation(cid)[
+            "messages"
+        ] if (item.get("event_id") or "").startswith("quick-director:"))
+    finally:
+        restarted.runner.close()
+
+
+def test_outdated_confirmation_cannot_generate_a_changed_director(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    project_id = run["state"]["quick_creation"]["project_id"]
+    snapshot = app.comic_projects.get(project_id)
+    spec = app.get_comic_director(project_id)
+    from kantoku.domains.comic.models import DirectorSpecDraft
+
+    draft = {key: spec[key] for key in DirectorSpecDraft.model_fields if key in spec}
+    draft["critic_result"] = None
+    app.create_comic_director(project_id, {
+        "expected_project_version": snapshot.project.current_version, "draft": draft,
+    })
+    approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
+    with pytest.raises(ToolError, match="版本已变化"):
+        app.decide_core_approval(approval.id, "approve", {})
+    assert app.runtime_store.get_approval(approval.id).decision.value == "pending"
+    assert "storyboard" not in production
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+
+
+def test_older_checkpoint_restores_bound_director_before_confirmation(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    state = ComicState.model_validate(run["state"])
+    state.quick_creation.pop("director_spec")
+    state.quick_creation.pop("director_spec_version")
+    before = list(production)
+    request = app._comic_fast_director_review(state)
+    assert request["ready"] is True
+    assert request["director_version"] == run["state"]["quick_creation"]["director_spec_version"]
+    assert production == before  # read-only, no model resubmission

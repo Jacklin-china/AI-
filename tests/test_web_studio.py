@@ -1599,7 +1599,8 @@ def test_selected_fast_domain_does_not_leak_to_next_message(
         for name, payload in first
     )
     run = next(payload for name, payload in first if name == "run")
-    assert app.conversation(conversation_id)["domain"] == "comic"
+    # Selection is consumed at dispatch; the running task retains its own domain.
+    assert app.conversation(conversation_id)["domain"] is None
     second = list(app.stream_conversation(conversation_id, {"content": "你好"}))
     assert next(payload for name, payload in second if name == "intent")["domain"] is None
     app.runtime_store.update_run(
