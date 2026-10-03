@@ -554,11 +554,13 @@ onMounted(async () => {
     const legacy = props.initialRunId ? await getRun(props.initialRunId) : null
     const requestedPage = route.value.workspacePage
     const requestedStage = route.value.directorStage
+    const requestedMode = route.value.creationMode
     const stored = localStorage.getItem('kantoku-comic-active-conversation')
     const id = route.value.conversationId ?? (typeof legacy?.state.conversation_id === 'string' ? legacy.state.conversation_id : null)
       ?? (conversations.value.some(item => item.id === stored) ? stored : null) ?? conversations.value[0]?.id
     if (id) await openConversation(id)
     else await startConversation()
+    if (requestedMode) mode.value = requestedMode
     if (requestedPage && requestedPage !== 'conversation') {
       section.value = requestedPage; selectedStage.value = requestedStage ?? 'director_assemble'; chatExpanded.value = false
       await loadPage()

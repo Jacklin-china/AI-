@@ -31,6 +31,11 @@ test('Conversation selection survives refresh on every node URL', () => {
   assert.deepEqual(parse(href(target)), target)
   assert.deepEqual(parse('/?conversation=home-chat'), { name: 'home', conversationId: 'home-chat' })
 })
+test('explicit professional entry keeps mode and conversation on refresh', () => {
+  const target = { name: 'workspace', domain: 'comic', workspacePage: 'director', directorStage: 'creative_understanding', conversationId: 'home-chat', creationMode: 'professional' }
+  assert.deepEqual(parse(href(target)), target)
+  assert.equal(parse('/workspace/comic?mode=unsafe').creationMode, undefined)
+})
 test('project pages and legacy workspace URLs remain compatible', () => {
   for (const workspacePage of ['conversation', 'assets', 'storyboard', 'prompt', 'history']) {
     const target = { name: 'workspace', domain: 'comic', workspacePage }

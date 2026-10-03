@@ -9,7 +9,7 @@ from pathlib import Path
 import pytest
 
 from kantoku.config import ToolError
-from kantoku.domains.comic.director import plan_director_spec
+from kantoku.domains.comic.director import execute_director_stage, plan_director_spec
 from kantoku.domains.comic.models import (
     ComicProjectInput,
     CreativeBriefUpdate,
@@ -65,6 +65,25 @@ def test_director_uses_only_selected_context_and_keeps_hard_constraints(tmp_path
     assert context["relevant_memory"] == []
     assert "chat_history" not in context
     assert "低机位 + 暗色" not in seen[0][0]["content"]
+
+
+def test_visual_stage_ignores_only_echoed_schema_annotation() -> None:
+    from test_comic_director_coordinator import SKILLS, _parts
+
+    plan = _parts()[SKILLS[1]]["director_plan"]
+    output = execute_director_stage(
+        SKILLS[1], {}, {"context": {}},
+        model_call=lambda _: json.dumps({**plan, "additionalProperties": False}),
+    )
+    assert output["director_plan"]["visual_strategy"] == plan["visual_strategy"]
+    assert "additionalProperties" not in output["director_plan"]
+    for invalid in ({**plan, "additionalProperties": True},
+                    {**plan, "reasoning": "not public"},
+                    {"additionalProperties": False, "properties": {}}):
+        with pytest.raises(ToolError, match="公开决策"):
+            execute_director_stage(
+                SKILLS[1], {}, {"context": {}}, model_call=lambda _, body=invalid: json.dumps(body),
+            )
 
 
 def test_director_versions_are_editable_restorable_and_brief_bound(tmp_path: Path) -> None:

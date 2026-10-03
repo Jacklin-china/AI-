@@ -57,6 +57,9 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
     monkeypatch.setattr(web_studio, "_provider", lambda: provider)
     monkeypatch.setattr(web_studio, "plan_web_search", lambda _content, **_kwargs: None)
     monkeypatch.setattr(web_studio, "_brief_deltas", lambda brief: iter([brief]))
+    # Guided replies are part of these routing tests, not paid model acceptance.
+    # Individual streaming tests replace this stub with their own public deltas.
+    monkeypatch.setattr(web_studio, "stream_chat", lambda *_args, **_kwargs: iter(["离线引导回复"]))
     monkeypatch.setattr(
         web_studio, "_image_result_summary",
         lambda requirement, _prompt, _trace: f"已按你的要求生成一张{requirement}。",
@@ -1855,7 +1858,9 @@ def test_startup_logs_loaded_config_and_image_settings(
 
     assert web_studio.serve(port=8001, open_browser=False) == 0
     assert "config_path=" in messages[0]
-    assert str(web_studio.CONFIG_PATH.resolve()) in messages[0]
+    loaded_config = web_studio.CONFIG_PATH if web_studio.CONFIG_PATH.exists() \
+        else web_studio.EXAMPLE_PATH
+    assert str(loaded_config.resolve()) in messages[0]
     assert "image_provider=alibaba-qwen-image" in messages[0]
     assert f"image_base_url={base_url}" in messages[0]
     assert "image_model=qwen-image-3.0" in messages[0]

@@ -393,6 +393,10 @@ async function runHomeMessage(task: QueuedMessage): Promise<void> {
           bound = true
           task.onBound?.()
           void refreshFastDomain(task.conversationId)
+          if (plan.tool === 'workspace.open' && plan.domain === 'comic' && conversationId.value === task.conversationId) {
+            navigate({ name: 'workspace', domain: 'comic', workspacePage: 'director',
+              directorStage: 'creative_understanding', conversationId: task.conversationId, creationMode: 'professional' })
+          }
         },
         onDelta: (delta) => {
           if (conversationId.value === task.conversationId) {

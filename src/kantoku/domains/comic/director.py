@@ -71,7 +71,17 @@ def execute_director_stage(
         plan, diagnostics = parse_cinematography(raw, model_call=model_call)
         return {"cinematography": plan.model_dump(), "parse_diagnostics": diagnostics}
     try:
-        output = model.model_validate_json(raw)
+        data = json.loads(raw)
+        if isinstance(data, dict) and data.get("additionalProperties") is False:
+            # Some JSON-mode models echo the Schema's validation annotation.
+            # Discard only this exact non-business marker, never unknown fields,
+            # missing decisions, identity changes or private reasoning.
+            data.pop("additionalProperties")
+            logger.bind(skill_id=skill_id, trace_id=context.get("trace_id"),
+                        run_id=context.get("run_id")).warning(
+                "director_schema_annotation_ignored field=additionalProperties"
+            )
+        output = model.model_validate(data)
     except ValidationError as error:
         issues = [{"path": ".".join(map(str, item["loc"])), "type": item["type"]}
                   for item in error.errors(include_input=False, include_context=False,
@@ -80,6 +90,17 @@ def execute_director_stage(
         raise ToolError("导演阶段未返回有效的公开决策", detail=skill_id) from None
     except ValueError:
         raise ToolError("导演阶段未返回有效的公开决策", detail=skill_id) from None
+    if skill_id == "comic.creative_understanding":
+        # These are user-owned input, not a field the model may infer or paraphrase.
+        # In a new quick Brief the raw request is authoritative even when its
+        # structured constraint list is empty. Critic still reviews that request.
+        hard = context["context"]["creative_brief"]["hard_constraints"]
+        if output.hard_constraints != hard:
+            logger.bind(skill_id=skill_id, trace_id=context.get("trace_id"),
+                        run_id=context.get("run_id")).warning(
+                "director_constraint_normalized source=creative_brief"
+            )
+        output = output.model_copy(update={"hard_constraints": list(hard)})
     return {key: output.model_dump()}
 
 

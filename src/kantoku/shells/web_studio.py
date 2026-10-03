@@ -910,6 +910,7 @@ class StudioApplication:
                         get_settings().budget.autonomous_image_auto_cny * 100,
                     ),
                     quick_creation={"project_id": snapshot.project.project_id,
+                                    "auto_create_image": True,
                                     "original_request": requirement,
                                     "input_brief_id": snapshot.creative_brief.brief_id,
                                     "input_brief_version": snapshot.creative_brief.version,
@@ -968,11 +969,16 @@ class StudioApplication:
             raise ToolError("导演任务绑定不一致，未进入生图")
         result = self._comic_director_result(child)
         spec = result.get("director_spec") or {}
+        summary = result["director_execution_summary"]
+        message = "导演方案已整理。确认后将生成当前画面，也可以先补充修改方向。"
+        if result["status"] != "completed":
+            message = f"{summary['status_label']}。尚未生图。"
+            if summary.get("error_id"):
+                message += f" 错误编号：{summary['error_id']}"
         return {"kind": "director_review", "director_version": spec.get("version"),
                 "ready": result["status"] == "completed",
-                "message": "导演方案已整理。确认后将生成当前画面，也可以先补充修改方向。"
-                if result["status"] == "completed" else
-                "导演方案需要调整，尚未生图。请补充修改方向后重新审核。"}
+                "message": message, "error_id": summary.get("error_id"),
+                "trace_id": summary.get("trace_id")}
 
     def _comic_fast_creation_step(
         self, step: str, state: ComicState, context: RuntimeContext,
@@ -1022,7 +1028,7 @@ class StudioApplication:
                 spec = result.get("director_spec")
                 if spec:
                     creation.update(director_spec=spec, director_spec_version=spec.get("version"))
-                if state.conversation_id and spec:
+                if state.conversation_id and spec and not creation.get("auto_create_image"):
                     # Presentation belongs to the client; persist the public structured result.
                     summary = json.dumps({"director_spec": spec, "status": result["status"]},
                                          ensure_ascii=False)
@@ -1088,7 +1094,8 @@ class StudioApplication:
                     raise ToolError("导演执行失败，未进入制作", detail=director_run.error)
                 if director_run.status is not ExecutionStatus.COMPLETED:
                     raise ExternalJobPending("导演草稿需要修订；原方案和 Trace 已保存，未调用生图")
-                if context.approval_decision is not ApprovalDecision.APPROVE:
+                automatic = bool(creation.get("auto_create_image"))
+                if not automatic and context.approval_decision is not ApprovalDecision.APPROVE:
                     raise ExternalJobPending("等待确认当前导演方案，未调用生图")
                 spec = self.comic_projects.get_director(project_id)
                 approval = context.store.approval_for_node(context.run_id, step)
@@ -1100,13 +1107,14 @@ class StudioApplication:
                     "expected_project_version": self.comic_projects.get(
                         project_id,
                     ).project.current_version,
-                })
+                }, automatic_run_id=context.run_id if automatic else None)
                 creation["director_spec_version"] = spec.version
                 creation["director_decision"] = "approve"
                 context.store.append_event(
                     context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
                     payload={"kind": "director_confirmed", "director_version": spec.version,
-                             "authorization": "user_confirmation", "human_review": True},
+                             "authorization": "fast_creation_policy" if automatic
+                             else "user_confirmation", "human_review": not automatic},
                 )
                 return {"quick_creation": creation}
             if step == "storyboard":
@@ -1213,7 +1221,7 @@ class StudioApplication:
         guided = conversation.interaction_mode == InteractionMode.GUIDED
         confirmed = guided and _is_execution_confirmed(content, history_before)
         route = route_conversation(conversation, plan, confirmed=confirmed,
-                                   selected_domain=selected_domain)
+                                   selected_domain=selected_domain, user_request=content)
         action = route.action
         generation_request_id = str(
             data.get("generation_request_id") or f"generation-{uuid4().hex}"
@@ -1493,8 +1501,10 @@ class StudioApplication:
                     conversation_id, selected_task_id,
                 )
             return
-        if action is ConversationAction.CHOOSE_DOMAIN:
+        if action in {ConversationAction.CHOOSE_DOMAIN, ConversationAction.OPEN_WORKSPACE}:
             text = (
+                "已进入专业导演工作台，可以查看、编辑和确认导演方案；本次未自动提交图片。"
+                if action is ConversationAction.OPEN_WORKSPACE else
                 "这项需求不属于当前快捷模式。可在输入框左下角的“+”切换到相应创作域；"
                 "需要逐步控制时再进入专业创作页。"
                 if not guided and conversation.domain else
@@ -1542,7 +1552,7 @@ class StudioApplication:
                 "已在当前聊天启动电商快速体验（Mock 商品与 Marketplace）。"
                 "实际进度和产物会显示在这里。"
                 if target_domain == "commerce" else
-                "已在当前聊天启动漫剧快速创作。实际进度和产物会显示在这里。"
+                "正在分析需求，图片完成后会显示在当前聊天。"
             )
             for delta in _brief_deltas(status):
                 yield "delta", {"content": delta}
@@ -2926,7 +2936,23 @@ class StudioApplication:
             return self._comic_director_bindings(project_id, historical)
         raise ToolError("该导演版本缺少镜头身份绑定，请重新生成，不自动继承历史任务")
 
-    def confirm_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
+    def confirm_comic_director(
+        self, project_id: str, data: dict[str, Any], *, automatic_run_id: str | None = None,
+    ) -> dict[str, Any]:
+        # Internal Fast policy only; HTTP data cannot grant automatic authorization.
+        if automatic_run_id:
+            production = self.runtime_store.get_run(automatic_run_id)
+            creation = production.state.get("quick_creation") or {}
+            if (production.workflow != COMIC_WORKFLOW_ID
+                    or self.runtime_store.get_conversation(
+                        production.state["conversation_id"],
+                    ).interaction_mode is not InteractionMode.AUTONOMOUS
+                    or production.state.get("execution_mode") != "fast"
+                    or not production.state.get("confirmed")
+                    or not creation.get("auto_create_image")
+                    or creation.get("project_id") != project_id
+                    or creation.get("director_spec_version") != data.get("version")):
+                raise ToolError("快速制作授权与当前任务不匹配，未进入生图")
         request = DirectorSpecRestore.model_validate(data)
         spec = self.comic_projects.get_director(project_id)
         self.comic_assets.director_assets(spec)
@@ -2942,6 +2968,7 @@ class StudioApplication:
         return self._comic_director_spec_payload(self.comic_projects.confirm_director(
             project_id, version=request.version,
             expected_project_version=request.expected_project_version,
+            automatic_run_id=automatic_run_id,
         ))
 
     def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:

@@ -54,6 +54,42 @@ def _semantic(
     }, ensure_ascii=False)
 
 
+def test_invalid_review_logs_schema_path_without_raw_private_response() -> None:
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)))
+    try:
+        engine = DirectorCriticEngine(model_call=lambda _: json.dumps({
+            "public_summary": "审核", "confidence": "private-content-do-not-log",
+            "findings": [], "suggested_patches": [],
+        }))
+        with (
+            request_trace("trace-invalid-review-contract"),
+            pytest.raises(ToolError, match="公开审核结构"),
+        ):
+            engine.review(_spec(), _brief())
+    finally:
+        logger.remove(sink)
+    output = "\n".join(lines)
+    assert "confidence" in output and "float_type" in output
+    assert "trace-invalid-review-contract" in output
+    assert "output_sha256=" in output
+    assert "private-content-do-not-log" not in output
+
+
+def test_truncated_review_logs_json_position_without_raw_response() -> None:
+    lines: list[str] = []
+    sink = logger.add(lambda message: lines.append(str(message)))
+    try:
+        engine = DirectorCriticEngine(lambda _: '{"public_summary":"private-fragment')
+        with pytest.raises(ToolError, match="公开审核结构"):
+            engine.review(_spec(), _brief())
+    finally:
+        logger.remove(sink)
+    output = "\n".join(lines)
+    assert "json_invalid" in output and "column" in output and "output_sha256" in output
+    assert "private-fragment" not in output
+
+
 def _finding(spec: DirectorSpecDraft, *, severity: str = "warning") -> dict[str, str]:
     assert spec.director_plan is not None
     return {

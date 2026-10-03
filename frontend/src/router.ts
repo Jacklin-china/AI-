@@ -19,6 +19,7 @@ export interface Route {
   workspacePage?: string
   directorStage?: string
   conversationId?: string
+  creationMode?: 'fast' | 'professional'
 }
 
 export const directorStagePaths: Record<string, string> = {
@@ -37,7 +38,9 @@ export function parse(path: string): Route {
   if (path.includes('?')) {
     const [pathname, query] = path.split('?')
     const conversationId = new URLSearchParams(query).get('conversation')
-    return { ...parse(pathname!), ...(conversationId ? { conversationId } : {}) }
+    const mode = new URLSearchParams(query).get('mode')
+    return { ...parse(pathname!), ...(conversationId ? { conversationId } : {}),
+      ...(mode === 'fast' || mode === 'professional' ? { creationMode: mode } : {}) }
   }
   const clean = path.replace(/\/+$/, '') || '/'
   const parts = clean.split('/').filter(Boolean)
@@ -88,7 +91,10 @@ export function parse(path: string): Route {
 }
 
 export function href(next: Route): string {
-  return hrefPath(next) + (next.conversationId ? `?conversation=${encodeURIComponent(next.conversationId)}` : '')
+  const query = new URLSearchParams()
+  if (next.conversationId) query.set('conversation', next.conversationId)
+  if (next.creationMode) query.set('mode', next.creationMode)
+  return hrefPath(next) + (query.size ? `?${query}` : '')
 }
 function hrefPath(next: Route): string {
   switch (next.name) {

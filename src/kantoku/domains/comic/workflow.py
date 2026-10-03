@@ -84,10 +84,11 @@ def build_comic_workflow(
             context.store.add_conversation_message(
                 state.conversation_id,
                 role=MessageRole.ASSISTANT,
-                type=MessageType.TEXT,
+                type=MessageType.ARTIFACT,
                 content="已生成当前镜头图片。",
                 run_id=context.run_id,
                 event_id=f"quick-image:{context.run_id}",
+                artifact_id=artifact.id,
             )
         return update
 
@@ -124,7 +125,9 @@ def build_comic_workflow(
             "director_gate", lambda s, c: plan("director_gate", s, c),
             requires_approval=True,
             approval_when=lambda state: bool(state.quick_creation)
-            and state.quick_creation.get("director_status") != "failed",
+            and state.quick_creation.get("director_status") != "failed"
+            and (not state.quick_creation.get("auto_create_image")
+                 or state.quick_creation.get("director_status") != "completed"),
             approval_request=director_review_request or (lambda state: {
                 "kind": "director_review",
                 "director_version": (state.quick_creation or {}).get("director_spec_version"),

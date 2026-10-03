@@ -12,8 +12,7 @@ import ErrorRecoveryPanel from './ErrorRecoveryPanel.vue'
 import UserMessageBubble from './UserMessageBubble.vue'
 import WorkflowActivity from './WorkflowActivity.vue'
 import KantokuMark from '../brand/KantokuMark.vue'
-import { quickDirectorMessage } from '../../domains/comic/directorPresentation'
-import { comicProductionProgress } from '../../domains/comic/productionProgress'
+import { comicProductionProgress, isComicFastImage } from '../../domains/comic/productionProgress'
 import ImageGenerationPlaceholder from './ImageGenerationPlaceholder.vue'
 interface InlineRunState {
   run: CoreRun
@@ -152,7 +151,9 @@ function hasFailureMessage(requestId: string): boolean {
 }
 
 function isHomeImageArtifact(message: ConversationMessage): boolean {
-  return message.event_id?.startsWith('generation-artifact:') ?? false
+  return (message.event_id?.startsWith('generation-artifact:') ?? false) ||
+    (!!message.event_id?.startsWith('quick-image:') && Object.values(props.inlineRuns ?? {})
+      .some(item => item.run.id === message.run_id && !!item.imageUrl))
 }
 
 function imagePlaceholderRatio(requestId: string): string {
@@ -351,7 +352,7 @@ function activityText(event: RuntimeEvent): string {
           </template>
           <p v-else-if="mediaJobForUser(message)!.status === 'failed' && !hasFailureMessage(mediaJobForUser(message)!.generation_request_id)" class="chat-inline-error" role="alert">{{ mediaJobForUser(message)!.error_message }}</p>
         </div>
-        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && isHomeImageArtifact(message))" :content="homeMode && message.event_id?.startsWith('quick-director:') ? quickDirectorMessage(message.content) : message.content" :show-mark="!homeMode" />
+        <AssistantMessageBlock v-else-if="message.role === 'assistant' && !(homeMode && (isHomeImageArtifact(message) || message.event_id?.startsWith('quick-director:')))" :content="message.content" :show-mark="!homeMode" />
         <div v-if="homeMode && imageRequestId(message)" class="chat-image-generation" aria-live="polite">
           <div v-if="awaitingCost(imageRequestId(message)!)" class="chat-cost-card">
             <strong>本次生图需要确认费用</strong>
@@ -391,7 +392,7 @@ function activityText(event: RuntimeEvent): string {
         <AssistantStreamingBlock v-if="homeMode && streamingByMessage?.[message.id]" :content="streamingByMessage[message.id]" :show-mark="false" />
         <p v-if="homeMode && errorMessageId === message.id && error" class="chat-inline-error" role="alert">{{ error }}</p>
         <section v-if="homeMode && inlineRuns?.[message.id]" class="chat-inline-activity" aria-live="polite">
-          <div class="chat-public-activity chat-run-feed">
+          <div v-if="!isComicFastImage(inlineRuns[message.id].run)" class="chat-public-activity chat-run-feed">
             <button type="button" class="chat-activity-toggle" :aria-expanded="runExpanded(inlineRuns[message.id].run)" @click="toggleRun(inlineRuns[message.id].run)">
               <span>{{ runActivityTitle(inlineRuns[message.id].run) }}</span><small>{{ homeStatus(inlineRuns[message.id].run, inlineRuns[message.id].approval) }}</small><ChevronDown :size="13" :class="{ expanded: runExpanded(inlineRuns[message.id].run) }" aria-hidden="true" />
             </button>
@@ -403,7 +404,7 @@ function activityText(event: RuntimeEvent): string {
             </template>
           </div>
           <p v-if="fastCommerceSummary(inlineRuns[message.id].run)" class="chat-inline-qc">{{ fastCommerceSummary(inlineRuns[message.id].run) }}</p>
-          <p v-if="qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
+          <p v-if="!isComicFastImage(inlineRuns[message.id].run) && qcSummary(inlineRuns[message.id].run) && !inlineRuns[message.id].approval" class="chat-inline-qc">{{ qcSummary(inlineRuns[message.id].run) }}</p>
           <p v-if="homeError(inlineRuns[message.id])" class="chat-inline-error" role="alert">{{ homeError(inlineRuns[message.id]) }}</p>
           <ImageGenerationPlaceholder v-if="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, !!inlineRuns[message.id].imageUrl).visible" :percent="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, false).percent" :label="comicProductionProgress(inlineRuns[message.id].run, inlineRuns[message.id].activities, false).label" :started-at="inlineRuns[message.id].activities.find(item => item.node_id === 'generate' && item.event_type === 'node_started')?.created_at" />
           <ChatImageAttachment v-if="inlineRuns[message.id].imageUrl" :media="{ url: inlineRuns[message.id].imageUrl, filename: `kantoku-${inlineRuns[message.id].run.id}.png` }" @open="openImage" />

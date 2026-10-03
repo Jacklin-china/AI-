@@ -498,7 +498,7 @@ class ComicProjectStore:
     def director_confirmed(self, spec: DirectorSpec) -> bool:
         """确认只对应一个不可变修订；不继承旧版本的审批。"""
         if spec.schema_version == 1:
-            return True  # 旧生产契约保持兼容；新 v2 一律显式确认。
+            return True  # 旧生产契约保持兼容；v2 需要绑定版本的授权。
         if self.runtime_store is None:
             return False
         return any(
@@ -521,7 +521,8 @@ class ComicProjectStore:
             raise ToolError("请先确认当前导演方案，才能进入下一步")
 
     def confirm_director(self, project_id: str, *, version: int,
-                         expected_project_version: int) -> DirectorSpec:
+                         expected_project_version: int,
+                         automatic_run_id: str | None = None) -> DirectorSpec:
         from .critic import require_approved_director
 
         # 与保存/分叉共用写锁，不能在确认过程中将旧方案标为当前。
@@ -544,13 +545,18 @@ class ComicProjectStore:
         if not self.director_confirmed(spec):
             run = self.runtime_store.create_run(
                 "comic", "comic.director.confirmation", {"project_id": project_id,
-                "director_spec_version": version}, "director_confirmation",
-                interaction_mode=InteractionMode.GUIDED,
+                  "director_spec_version": version}, "director_confirmation",
+                interaction_mode=InteractionMode.AUTONOMOUS if automatic_run_id
+                else InteractionMode.GUIDED,
             )
             approval = self.runtime_store.create_approval(
                 run.id, "director_confirmation", self._confirmation_request(spec),
             )
-            self.runtime_store.decide_approval(approval.id, ApprovalDecision.APPROVE)
+            self.runtime_store.decide_approval(approval.id, ApprovalDecision.APPROVE, {
+                "authorization": "fast_creation_policy" if automatic_run_id
+                else "user_confirmation", "production_run_id": automatic_run_id,
+                "human_review": not bool(automatic_run_id),
+            })
             self.runtime_store.update_run(run.id, status=ExecutionStatus.COMPLETED,
                                           state=run.state, current_node="director_confirmation")
         return spec

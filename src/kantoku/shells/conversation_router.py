@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any
@@ -22,6 +23,7 @@ class ConversationAction(StrEnum):
     VIDEO_GENERATE = "video.generate"
     WORKFLOW_START = "workflow.start"
     CHOOSE_DOMAIN = "choose_domain"
+    OPEN_WORKSPACE = "workspace.open"
 
 
 @dataclass(frozen=True)
@@ -37,11 +39,19 @@ def route_conversation(
     *,
     confirmed: bool,
     selected_domain: str | None = None,
+    user_request: str = "",
 ) -> ConversationRoute:
     """One domain + mode decision for both homepage and professional entry points."""
     mode = conversation.execution_mode
     domain = conversation.domain
     if conversation.interaction_mode is InteractionMode.AUTONOMOUS and selected_domain:
+        # Explicit interaction commands, not inferred emotions or creative templates.
+        if selected_domain == "comic" and re.search(
+            r"(?<!不要)(?<!不用)(?<!不需要)(?:专业导演拆解|修改导演方案|进入专业模式)",
+            user_request,
+        ):
+            return ConversationRoute(ConversationAction.OPEN_WORKSPACE, "comic",
+                                     ExecutionMode.PROFESSIONAL)
         action = (
             ConversationAction.IMAGE_GENERATE
             if selected_domain == "studio"

@@ -438,7 +438,23 @@ class DirectorCriticEngine:
             if not isinstance(raw_patches, list) or len(raw_patches) > 20:
                 raise ValueError("invalid patch collection")
             semantic = SemanticReview.model_validate({**payload, "suggested_patches": []})
-        except (ValueError, ValidationError):
+        except (ValueError, ValidationError) as error:
+            if isinstance(error, ValidationError):
+                issues = [{"path": redact_secrets(".".join(map(str, item["loc"])))[:160],
+                           "type": item["type"]}
+                          for item in error.errors(include_input=False, include_context=False,
+                                                   include_url=False)]
+            elif isinstance(error, json.JSONDecodeError):
+                issues = [{"path": "$", "type": "json_invalid",
+                           "line": error.lineno, "column": error.colno}]
+            else:
+                issues = [{"path": "$", "type": "review_collection_invalid"}]
+            logger.warning(
+                "Director Critic Schema validation failed issues={} output_chars={} "
+                "output_sha256={} trace_id={} run_id={}", issues, len(raw),
+                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                current_trace_id(), current_run_id(),
+            )
             # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
             raise ToolError("导演审核模型未返回有效的公开审核结构") from None
         invalid_patches: list[DirectorCriticFinding] = []
