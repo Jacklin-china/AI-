@@ -71,6 +71,9 @@ llm:
 
 image:
   provider: alibaba-qwen-image
+  # 协议由端点声明，不按 model 猜测；同一协议下换 model 无需改代码。
+  # 原生协议使用 dashscope-multimodal，base_url 设置为 HTTPS /api/v1 根地址。
+  protocol: openai-compatible
   # 将 workspace-id-required 替换成百炼控制台的真实业务空间 ID；通用地址不支持此模型。
   base_url:  https://ws-043re2e5ss4pje8w.cn-beijing.maas.aliyuncs.com/compatible-mode/v1
   model: qwen-image-3.0

@@ -12,6 +12,26 @@
 - Core 不理解领域词或业务流程；Domain 只定义专业 Schema、Policy、Workflow 和 Prompt，不复制 Core。Provider 只实现供应商协议，不决定用户交互、审批或业务流程。前端只调用应用 API，不直接访问 Provider。
 - 禁止伪造 Provider 状态、进度与结果。修 Bug 补回归测试；先收口已有实现，再删除被替代代码，历史由 Git 保存。不得创建 `_new`、`_old`、`_backup`、`_final`、`_v2` 副本。
 
+## 生图模型与协议配置
+
+`image.model` 只从 `config/settings.yaml` 读取，Provider 不维护模型白名单，
+也不按模型名猜测调用协议。`image.protocol` 声明协议：
+
+- `openai-compatible`（旧配置缺省值）：POST `{base_url}/images/generations`。
+- `dashscope-multimodal`：`base_url` 为 HTTPS `/api/v1` 根地址，
+  POST `{base_url}/services/aigc/multimodal-generation/generation`，使用 messages/content。
+
+同一协议下可配置 `qwen-image-3.0`、`qwen-image-2.0-pro` 或后续兼容模型，重启后生效。
+端点、模型、密钥必须与供应商的实际服务匹配；通过配置校验不代表供应商权限已经验证。
+`api_key_env` 可指定任意已配置的密钥变量名，不能在 YAML 存明文 Secret。
+Alibaba 适配器只校验模型非空、端点/协议、认证配置及 Provider 身份；图片尺寸、格式与
+单图生产安全限制在付费提交前校验。未知协议、无密钥和非法地址在提交前拒绝。
+协议切换纳入请求身份；旧 OpenAI-compatible 指纹保持兼容。
+两种协议复用原单次提交、结果保存、查询恢复与日志链路；错误不自动切换协议、不重提生成。
+
+协议依据：[阿里云 Qwen Image API](https://www.alibabacloud.com/help/en/model-studio/qwen-image-api)。
+离线协议测试不等同于真实生图验收，真实调用另需预算授权。
+
 ## 本轮架构审计（2026-09-25）
 
 - `shells/web_studio.py` 的 `stream_conversation` 同时处理意图、首页生图/恢复、预算策略、Guided 任务构造及聊天流，职责明显过重。现有 `core/conversations.py::IntentPlanner`、`capabilities/creative.py::plan_creative_turn` 与 `shells/conversation_router.py::route_conversation` 是相连但分散的决策步骤；未来应在现有调用链中收口为一个编排入口，而非再加一套 Planner。

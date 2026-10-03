@@ -122,6 +122,8 @@ class ImageSettings(BaseModel):
 
     provider: str
     pricing: ImagePricing | None = None
+    # Missing protocol preserves existing OpenAI-compatible configurations.
+    protocol: Literal["openai-compatible", "dashscope-multimodal"] = "openai-compatible"
     base_url: str
     model: str
     region: str = ""

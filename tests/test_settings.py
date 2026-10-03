@@ -105,6 +105,23 @@ def test_qwen_image_settings_need_no_volcengine_signing_fields(tmp_path: Path) -
     assert settings.access_key_env == ""
     assert settings.secret_key_env == ""
     assert settings.api_key_env == "DASHSCOPE_API_KEY"
+    assert settings.protocol == "openai-compatible"
+
+
+@pytest.mark.parametrize("model", ["qwen-image-3.0", "qwen-image-2.0-pro", "future-model"])
+def test_image_protocol_is_explicit_not_inferred_from_model(model: str) -> None:
+    values = {
+        "provider": "alibaba-qwen-image", "model": model,
+        "base_url": "https://dashscope.aliyuncs.com/api/v1",
+        "protocol": "dashscope-multimodal",
+        "width": 2560, "height": 1440, "force_single": True,
+        "prompt_max_chars": 4000, "timeout_s": 600,
+        "query_retry": 2, "query_backoff_s": 2, "output_dir": "data/images",
+    }
+    settings = ImageSettings.model_validate(values)
+    assert settings.model == model and settings.protocol == "dashscope-multimodal"
+    with pytest.raises(ValidationError):
+        ImageSettings.model_validate({**values, "protocol": "unsupported-protocol"})
 
 
 def test_require_env_returns_value_and_rejects_missing(monkeypatch: pytest.MonkeyPatch) -> None:

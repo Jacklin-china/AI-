@@ -11,6 +11,7 @@ from collections.abc import Callable, Mapping, Sequence
 from datetime import UTC, datetime
 from pathlib import Path
 from time import perf_counter
+from types import SimpleNamespace
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 from urllib.request import urlopen
@@ -43,6 +44,9 @@ class _OpenAIClient(Protocol):
     images: _ImagesResource
     models: _ModelsResource
 
+    def post(self, path: str, *, cast_to: Any, body: object,
+             options: Mapping[str, Any]) -> Any: ...
+
 
 class OpenAIImageProvider:
     """以单图、同步、不可自动重提的方式接入 GPT-Image。"""
@@ -57,9 +61,8 @@ class OpenAIImageProvider:
         self.settings = settings or get_settings().image
         self.model_id = self.settings.model
         self.output_dir = self._output_dir(self.settings.output_dir)
-        self._validate_configuration()
-        # Authentication is checked before reservation, not during application startup.
         self._client = client
+        self._validate_configuration()
         self._client_lock = threading.Lock()
         self._trace_writer = write_trace if client is None else trace_writer
 
@@ -80,18 +83,39 @@ class OpenAIImageProvider:
         return configured if configured.is_absolute() else ROOT / configured
 
     def _validate_configuration(self) -> None:
-        endpoint = urlsplit(self.settings.base_url)
+        self._validate_endpoint()
+        if self.settings.protocol != "openai-compatible":
+            raise ConfigError("OpenAI 生图适配器只支持 openai-compatible 协议")
+        self._validate_output_configuration()
+
+    def _validate_endpoint(self) -> None:
+        if not self.model_id.strip():
+            raise ConfigError("生图 model 不能为空")
+        try:
+            endpoint = urlsplit(self.settings.base_url)
+        except ValueError as error:
+            raise ConfigError("生图 API 地址不合法") from error
         if endpoint.scheme not in {"http", "https"} or not endpoint.netloc:
             raise ConfigError("生图 API 地址不合法")
-        if endpoint.username is not None or endpoint.password is not None or endpoint.fragment:
-            raise ConfigError("生图 API 地址不允许包含凭据或片段")
+        if (endpoint.username is not None or endpoint.password is not None
+                or endpoint.fragment or endpoint.query):
+            raise ConfigError("生图 API 地址不允许包含凭据、查询参数或片段")
+        try:
+            if (not endpoint.hostname or endpoint.port == 0
+                    or any(character.isspace() for character in endpoint.hostname)
+                    or "\\" in self.settings.base_url):
+                raise ValueError("invalid host or port")
+        except ValueError as error:
+            raise ConfigError("生图 API 地址不合法") from error
+
+    def _validate_output_configuration(self) -> None:
         width, height = self.settings.width, self.settings.height
         pixels = width * height
         if width % 16 or height % 16:
             raise ConfigError("生图输出宽高必须是 16 的倍数")
         if self.settings.provider == "alibaba-qwen-image":
             if not 512**2 <= pixels <= 2048**2 or not 1 / 8 <= width / height <= 8:
-                raise ConfigError("Qwen-Image-3.0 输出尺寸超出支持范围")
+                raise ConfigError("Qwen 生图输出尺寸超出当前适配器支持范围")
         elif (max(width, height) > _MAX_EDGE
               or not _MIN_PIXELS <= pixels <= _MAX_PIXELS
               or not 1 / 3 <= width / height <= 3):
@@ -105,7 +129,7 @@ class OpenAIImageProvider:
 
     def generation_identity(self) -> Mapping[str, RequestIdentityValue]:
         """让模型、尺寸和质量共同参与本地幂等指纹。"""
-        return {
+        identity: dict[str, RequestIdentityValue] = {
             "provider": self.settings.provider,
             "base_url": self.settings.base_url,
             "model": self.settings.model,
@@ -115,6 +139,10 @@ class OpenAIImageProvider:
             "output_format": self.settings.output_format,
             "force_single": self.settings.force_single,
         }
+        # Keep historical OpenAI fingerprints; a different wire protocol is a new identity.
+        if self.settings.protocol != "openai-compatible":
+            identity["protocol"] = self.settings.protocol
+        return identity
 
     def check_access(self) -> ProviderAccessResult:
         """读取模型信息验证密钥和端点；不调用生成接口。"""
@@ -167,6 +195,30 @@ class OpenAIImageProvider:
         if seed is not None:
             raise ToolError("当前生图接口不支持固定 seed")
 
+    def _generate_response(
+        self, *, prompt: str, reference_urls: Sequence[str], client_request_id: str,
+    ) -> Any:
+        request: dict[str, Any] = {
+            "model": self.model_id,
+            "prompt": prompt.strip(),
+            "n": 1,
+            "size": f"{self.settings.width}x{self.settings.height}",
+            "extra_headers": {"Idempotency-Key": client_request_id},
+        }
+        if self.settings.provider == "alibaba-qwen-image":
+            if reference_urls:
+                request["extra_body"] = {
+                    "image": (reference_urls[0] if len(reference_urls) == 1
+                              else list(reference_urls)),
+                }
+        else:
+            request.update(
+                quality=self.settings.quality,
+                output_format=self.settings.output_format,
+                response_format="b64_json",
+            )
+        return self._client_for_request().images.generate(**request)
+
     def submit(
         self,
         *,
@@ -190,25 +242,9 @@ class OpenAIImageProvider:
         ok = False
         error_name: str | None = None
         try:
-            request: dict[str, Any] = {
-                "model": self.model_id,
-                "prompt": prompt.strip(),
-                "n": 1,
-                "size": f"{self.settings.width}x{self.settings.height}",
-                "extra_headers": {"Idempotency-Key": client_request_id},
-            }
-            if qwen_compatible and reference_urls:
-                request["extra_body"] = {
-                    "image": (reference_urls[0] if len(reference_urls) == 1
-                              else list(reference_urls)),
-                }
-            if not qwen_compatible:
-                request.update(
-                    quality=self.settings.quality,
-                    output_format=self.settings.output_format,
-                    response_format="b64_json",
-                )
-            response = self._client_for_request().images.generate(**request)
+            response = self._generate_response(
+                prompt=prompt, reference_urls=reference_urls, client_request_id=client_request_id,
+            )
             data = getattr(response, "data", None)
             if not isinstance(data, list) or len(data) != 1:
                 raise ToolError("生图接口未返回唯一图片，费用需要人工对账")
@@ -365,18 +401,64 @@ class OpenAIImageProvider:
 
 
 class AlibabaQwenImageProvider(OpenAIImageProvider):
-    """Qwen-Image-3.0 的 OpenAI Images 兼容适配，复用单次提交与本地恢复。"""
+    """按配置协议接入 Qwen 生图，不以模型名决定接口或准入。"""
 
     def _validate_configuration(self) -> None:
-        super()._validate_configuration()
+        self._validate_endpoint()
         if self.settings.provider != "alibaba-qwen-image":
             raise ConfigError("Qwen 生图供应商标识不正确")
-        if self.model_id != "qwen-image-3.0":
-            raise ConfigError("当前 Qwen 适配器只支持 qwen-image-3.0")
-        if urlsplit(self.settings.base_url).path.rstrip("/") != "/compatible-mode/v1":
-            raise ConfigError("Qwen 生图地址必须是 OpenAI 兼容接口 /compatible-mode/v1")
-        if self.settings.api_key_env != "DASHSCOPE_API_KEY":
-            raise ConfigError("Qwen 生图必须使用 DASHSCOPE_API_KEY")
+        endpoint = urlsplit(self.settings.base_url)
+        if endpoint.scheme != "https":
+            raise ConfigError("Qwen 生图需配置有效的 HTTPS base_url")
+        if self.settings.protocol not in {"openai-compatible", "dashscope-multimodal"}:
+            raise ConfigError("Qwen 生图协议不受支持")
+        # base_url is the configured API root, not a model-specific hardcoded endpoint.
+        if (self.settings.protocol == "dashscope-multimodal"
+                and endpoint.path.rstrip("/") != "/api/v1"):
+            raise ConfigError("dashscope-multimodal base_url 必须以 /api/v1 结尾")
+        if not self.settings.api_key_env.strip():
+            raise ConfigError("Qwen 生图 API Key 环境变量未配置")
+        if self._client is None:
+            self.settings.api_key()
+
+    def _generate_response(
+        self, *, prompt: str, reference_urls: Sequence[str], client_request_id: str,
+    ) -> Any:
+        if self.settings.protocol == "openai-compatible":
+            return super()._generate_response(
+                prompt=prompt, reference_urls=reference_urls, client_request_id=client_request_id,
+            )
+        content = [{"image": reference} for reference in reference_urls]
+        content.append({"text": prompt.strip()})
+        response = self._client_for_request().post(
+            "/services/aigc/multimodal-generation/generation",
+            cast_to=dict[str, Any],
+            body={
+                "model": self.model_id,
+                "input": {"messages": [{"role": "user", "content": content}]},
+                "parameters": {
+                    "n": 1, "size": f"{self.settings.width}*{self.settings.height}",
+                },
+            },
+            options={"headers": {"Idempotency-Key": client_request_id}},
+        )
+        if not isinstance(response, dict) or response.get("code"):
+            raise ToolError("DashScope 生图未返回成功结果，费用需要人工对账")
+        # Normalize the wire response only; persistence/query/trace stay in the shared path.
+        try:
+            choices = response["output"]["choices"]
+            if not isinstance(choices, list) or len(choices) != 1:
+                raise ValueError("non-unique choice")
+            result = choices[0]["message"]["content"]
+            if not isinstance(result, list):
+                raise ValueError("invalid image content")
+            images = [item["image"] for item in result
+                      if isinstance(item, dict) and "image" in item]
+            if len(images) != 1 or not isinstance(images[0], str) or not images[0]:
+                raise ValueError("non-unique image")
+        except (KeyError, TypeError, ValueError) as error:
+            raise ToolError("DashScope 生图未返回唯一图片，费用需要人工对账") from error
+        return SimpleNamespace(data=[SimpleNamespace(url=images[0])])
 
     def check_access(self) -> ProviderAccessResult:
         """兼容接口没有可靠的免计费生图探针，不能把模型查询冒充可用性验证。"""
@@ -396,8 +478,8 @@ class AlibabaQwenImageProvider(OpenAIImageProvider):
             prompt=prompt, shot_no=shot_no,
             reference_urls=reference_urls, seed=seed,
         )
-        if self.settings.provider != "alibaba-qwen-image":
-            raise ConfigError("Qwen 生图供应商标识不正确")
+        self._validate_configuration()
+        self._validate_output_configuration()
         if len(reference_urls) > 3 or any(
             not isinstance(value, str)
             or not (value.startswith("data:image/") or value.startswith("https://"))
@@ -405,15 +487,3 @@ class AlibabaQwenImageProvider(OpenAIImageProvider):
             for value in reference_urls
         ):
             raise ToolError("Qwen 参考图仅支持最多三张 HTTPS 或 Base64 图片")
-        base_url = self.settings.base_url.strip()
-        endpoint = urlsplit(base_url)
-        if (
-            not base_url
-            or endpoint.scheme != "https"
-            or not endpoint.netloc
-            or "/compatible-mode/v1" not in endpoint.path
-            or endpoint.query
-        ):
-            raise ConfigError("Qwen 生图需配置有效的 HTTPS OpenAI 兼容 base_url")
-        if self._client is None:
-            self.settings.api_key()
