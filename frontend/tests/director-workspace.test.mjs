@@ -115,6 +115,19 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /if \(failedRun\) \{ selectedRun\.value = failedRun\.run_id/)
 })
 
+test('confirmed workspace submits version-bound production through existing Run API', () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  assert.match(view, /async function generateImage\(\)/)
+  assert.match(view, /if \(!confirmed\.value/)
+  assert.match(view, /createRun\('comic', \{/)
+  assert.match(view, /production_project_id: project\.value\.project\.project_id/)
+  assert.match(view, /director_version: spec\.value\.version/)
+  assert.match(view, /request_id: productionRequests\.get\(key\)/)
+  assert.match(view, /@click="generateImage"/)
+  assert.match(view, /name: 'task_run', runId: run.id/)
+  assert.doesNotMatch(view, /provider\.submit|images\/generations/)
+})
+
 test('Chat gives a concise entry to the real draft, never another technical director report', () => {
   const text = directorConversationSummary({ ...spec, director_plan: { visual_strategy: 'do not repeat the report' }, cinematography: { camera_angle: 'hidden camera' } })
   assert.match(text, /异兽观察文明/)

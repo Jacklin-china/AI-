@@ -9,6 +9,7 @@ from concurrent.futures import ThreadPoolExecutor
 from decimal import Decimal
 from http.client import HTTPConnection
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -213,6 +214,127 @@ def _confirm(app: web_studio.StudioApplication, run: dict[str, Any]) -> dict[str
     assert approval and approval.request["kind"] == "director_review"
     app.decide_core_approval(approval.id, "approve", {})
     return app._run_payload(run["id"])
+
+
+def test_auto_quote_and_model_policy_never_use_unpriced_fallback(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = web_studio.get_settings()
+    settings.llm.fallback_model_chat = "unpriced-fallback"
+    assert app._quick_creation_cost(1, primary_only=True)[1] == []
+    assert "unpriced-fallback" in app._quick_creation_cost(1)[1]
+    flags = []
+    monkeypatch.setattr(web_studio, "chat", lambda *_args, **kwargs: (
+        flags.append(kwargs["single_attempt"]) or SimpleNamespace(content="{}")
+    ))
+    state = ComicState(project="p", prompt="q", shot_no=1, estimate_fen=50,
+                       quick_creation={"auto_create_image": True})
+    with web_studio._comic_model_policy(state):
+        web_studio.StudioApplication._comic_director_model([])
+        web_studio.StudioApplication._comic_storyboard_model([])
+    web_studio.StudioApplication._comic_director_model([])
+    assert flags == [True, True, False]
+
+
+def _workspace_production_request(app: web_studio.StudioApplication) -> dict:
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    snapshot = app.create_comic_project({"title": "雨夜少女",
+                                       "brief": {"original_request": "中式修仙少女站在竹林"}})
+    project_id = snapshot["project"]["project_id"]
+    result = app.create_comic_director(project_id, {
+        "expected_project_version": snapshot["project"]["current_version"],
+        "conversation_id": cid, "creation_mode": "professional", "task": "中式修仙少女站在竹林",
+    })
+    spec = result["director_spec"]
+    app.confirm_comic_director(project_id, {
+        "version": spec["version"],
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+    })
+    return {"production_project_id": project_id, "director_version": spec["version"],
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+            "conversation_id": cid, "request_id": "workspace-single-submit"}
+
+
+def test_confirmed_workspace_enters_shared_image_pipeline_and_persists_artifact(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    request = _workspace_production_request(app)
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["status"] == "waiting" and run["current_node"] == "cost_approval"
+    duplicate = app.create_core_run({"domain": "comic", "state": request})
+    assert duplicate["id"] == run["id"]
+    director_calls = list(production)
+    approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
+    app.decide_core_approval(approval.id, "approve", {})
+    current = app._run_payload(run["id"])
+    assert current["status"] == "waiting" and current["current_node"] == "human_review"
+    assert production == director_calls + ["storyboard", "prompt"]
+    assert current["state"]["image_path"]
+    assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
+    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
+    app.decide_core_approval(qc.id, "approve", {})
+    final = app._run_payload(run["id"])
+    assert final["status"] == "completed"
+    # Compilation has advanced project versions; a lost HTTP response still
+    # recovers this same paid task instead of rejecting/recreating it.
+    before = list(production)
+    replay = app.create_core_run({"domain": "comic", "state": request})
+    assert replay["id"] == run["id"] and production == before
+    artifact = app.runtime_store.get_artifact(final["state"]["image_artifact_id"])
+    assert artifact.type is ArtifactType.IMAGE and Path(artifact.location).is_file()
+    assert artifact.conversation_id == request["conversation_id"]
+    children = [item for item in app.runtime_store.list_runs()
+                if item.state.get("parent_run_id") == run["id"]]
+    assert children and all(item.state["execution_mode"] == "professional" for item in children)
+
+
+def test_workspace_unconfirmed_or_cross_conversation_cannot_submit_image(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    request = _workspace_production_request(app)
+    request["conversation_id"] = app.create_conversation({"interaction_mode": "guided"})["id"]
+    with pytest.raises(ToolError, match="不属于当前创作会话"):
+        app.create_core_run({"domain": "comic", "state": request})
+    assert "storyboard" not in production
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+
+
+def test_auto_qc_failure_is_real_failure_not_an_approval_card(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(services, "qc_image", lambda *_a, **_k: QcResult(
+        broken_hands=True, watermark=False, composition_ok=True,
+        persona_consistency=3, confidence=0.9, reason="offline broken hands",
+    ))
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    assert run["status"] == "failed" and run["current_node"] == "human_review"
+    assert run["state"]["qc_passed"] is False
+    assert app.runtime_store.approval_for_node(run["id"], "human_review") is None
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+
+
+def test_http_workspace_production_uses_real_run_endpoint(
+    app: web_studio.StudioApplication, production: list[str], server: int,
+) -> None:
+    request = _workspace_production_request(app)
+    connection = HTTPConnection("127.0.0.1", server, timeout=10)
+    try:
+        for _ in range(2):
+            connection.request("POST", "/api/runs", body=json.dumps({
+                "domain": "comic", "state": request,
+            }), headers={"X-Studio-Token": app.token, "Content-Type": "application/json"})
+            response = connection.getresponse()
+            assert response.status == 201
+            result = json.loads(response.read())
+            assert result["workflow"] == "comic.production.v1"
+            assert result["state"]["conversation_id"] == request["conversation_id"]
+        parents = [run for run in app.runtime_store.list_runs()
+                   if run.workflow == "comic.production.v1"]
+        assert len(parents) == 1
+        assert result["current_node"] == "cost_approval"
+    finally:
+        connection.close()
 
 
 def test_comic_selection_enters_coordinator_and_real_shared_production(
@@ -458,35 +580,33 @@ def test_each_selected_task_binds_only_its_fresh_brief(
     assert director.state["previous_run_id"] is None
 
 
-def test_high_cost_waits_before_director_then_resumes_same_run(
+def test_high_cost_auto_creation_fails_before_paid_calls_without_approval_card(
     app: web_studio.StudioApplication,
     production: list[str],
 ) -> None:
     web_studio.get_settings().budget.autonomous_image_auto_cny = Decimal("0.10")
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     run = _run(_send(app, cid))
-    assert run["status"] == "waiting" and production == []
+    assert run["status"] == "failed" and production == []
     snapshot = app.comic_projects.get(run["state"]["quick_creation"]["project_id"])
     assert snapshot.project.director_id is None
     approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    assert approval.request["total_fen"] > 10
-    assert approval.request["estimate_fen"] == approval.request["total_fen"]
-    app.decide_core_approval(approval.id, "approve", {})
-    _confirm(app, run)
-    assert app.runtime_store.get_run(run["id"]).status is ExecutionStatus.COMPLETED
-    assert production == SKILLS[:4] + ["storyboard", "prompt"]
+    assert approval is None
+    assert run["state"]["total_estimate_fen"] > 10
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
 
 
-def test_missing_price_requires_honest_cost_confirmation(
+def test_missing_price_auto_creation_fails_without_approval_card(
     app: web_studio.StudioApplication,
     production: list[str],
 ) -> None:
     web_studio.get_settings().llm.pricing_cny_per_million_by_model = {}
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     run = _run(_send(app, cid))
-    assert run["status"] == "waiting" and production == []
+    assert run["status"] == "failed" and production == []
     approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    assert set(approval.request["unpriced_models"]) == {"text-test", "vision-test"}
+    assert approval is None
+    assert set(run["state"]["quick_creation"]["unpriced_models"]) == {"text-test", "vision-test"}
 
 
 def test_critic_revision_keeps_draft_and_never_calls_image(
@@ -520,7 +640,7 @@ def test_critic_revision_keeps_draft_and_never_calls_image(
 
     monkeypatch.setattr(app, "_comic_director_model", needs_review)
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
-    run = _run(_send(app, cid))
+    run = _run(_send(app, cid, legacy_review=True))
     assert run["status"] == "waiting"
     assert "storyboard" not in production
     assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
@@ -547,14 +667,16 @@ def test_home_review_format_error_returns_real_error_id_without_director_dump(
     monkeypatch.setattr(app, "_comic_director_model", malformed_review)
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     run = _run(_send(app, cid))
-    assert run["status"] == "waiting" and "storyboard" not in production
+    assert run["status"] == "failed" and "storyboard" not in production
     approval = app.runtime_store.approval_for_node(run["id"], "director_gate")
-    assert approval.request["ready"] is False
-    assert "公开审核结构" in approval.request["message"]
-    assert approval.request["error_id"].startswith("ERR-")
-    assert approval.request["error_id"] in approval.request["message"]
-    assert approval.request["trace_id"] == "trace-quick-domain-test"
-    assert "private-fragment" not in approval.request["message"]
+    assert approval is None
+    director = app.runtime_store.get_run(run["state"]["quick_creation"]["director_run_id"])
+    assert director.state["error_id"].startswith("ERR-")
+    assert director.state["director_candidate"]
+    failures = [event for event in app.runtime_store.list_events(run["id"])
+                if event.event_type.value == "node_failed"]
+    assert failures and "private-fragment" not in str(failures[-1].payload)
+    assert failures[-1].payload["error_id"] == director.state["error_id"]
     assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
 
 
@@ -661,12 +783,14 @@ def test_home_twenty_yuan_boundary(
     total: int,
     automatic: bool,
 ) -> None:
-    monkeypatch.setattr(app, "_quick_creation_cost", lambda _count: (total, []))
+    monkeypatch.setattr(app, "_quick_creation_cost", lambda _count, **_kwargs: (total, []))
     cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
     run = _run(_send(app, cid))
     assert (run["status"] == "completed") is automatic
     approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    assert (approval is None) is automatic
+    assert approval is None
+    if not automatic:
+        assert run["status"] == "failed" and production == []
 
 
 def test_other_conversation_and_normal_chat_are_not_blocked_by_director(

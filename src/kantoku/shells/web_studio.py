@@ -14,7 +14,8 @@ import threading
 import time
 import webbrowser
 from collections.abc import Callable
-from contextlib import suppress
+from contextlib import contextmanager, suppress
+from contextvars import ContextVar
 from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -394,6 +395,19 @@ def _image_result_summary(requirement: str, prompt: str, trace_id: str) -> str:
         )
     detail = f"；本次采用了{'、'.join(parts)}等设定" if parts else ""
     return f"已按你的要求生成一张{subject}{detail}。图片已保存到当前聊天。"
+
+
+_comic_single_attempt: ContextVar[bool] = ContextVar("comic_single_attempt", default=False)
+
+
+@contextmanager
+def _comic_model_policy(state: ComicState):
+    """Scope the priced primary-only policy to this worker, never other conversations."""
+    token = _comic_single_attempt.set(bool((state.quick_creation or {}).get("auto_create_image")))
+    try:
+        yield
+    finally:
+        _comic_single_attempt.reset(token)
 
 
 class StudioApplication:
@@ -903,7 +917,7 @@ class StudioApplication:
                 snapshot = self.comic_projects.create(ComicProjectInput.model_validate({
                     "title": requirement[:200], "brief": {"original_request": requirement},
                 }))
-                total, unpriced = self._quick_creation_cost(count)
+                total, unpriced = self._quick_creation_cost(count, primary_only=True)
                 state.update(
                     project=snapshot.project.project_id, total_estimate_fen=total,
                     confirmed=not unpriced and total <= int(
@@ -934,7 +948,7 @@ class StudioApplication:
 
     @staticmethod
     def _quick_creation_cost(
-        count: int, *, text_calls: int = 8, vision: bool = True,
+        count: int, *, text_calls: int = 8, vision: bool = True, primary_only: bool = False,
     ) -> tuple[int, list[str]]:
         """Conservative task quote from configuration, not a fabricated provider bill."""
         from decimal import ROUND_CEILING, Decimal
@@ -945,19 +959,23 @@ class StudioApplication:
         unpriced: list[str] = []
         # Three director stages, critic + at most one repair/review, storyboard,
         # compiler. Include configured retries and the larger fallback rate.
-        text_models = {llm.model_chat, getattr(llm, "fallback_model_chat", llm.model_chat)}
+        text_models = {llm.model_chat}
+        if not primary_only:
+            text_models.add(getattr(llm, "fallback_model_chat", llm.model_chat))
         for model in text_models | ({llm.model_vision} if vision else set()):
             if model not in prices:
                 unpriced.append(model)
         known = [prices[model] for model in text_models if model in prices]
-        attempts = 1 + getattr(llm, "retry", 0)
+        attempts = 1 if primary_only else 1 + getattr(llm, "retry", 0)
         if known:
             total += attempts * text_calls * (max(p.input_cny for p in known) * 50000
                                     + max(p.output_cny for p in known)
                                     * getattr(llm, "max_tokens", 4096)) / 10000
         if vision and (vision_price := prices.get(llm.model_vision)):
-            total += attempts * (vision_price.input_cny * 50000 + vision_price.output_cny
-                                 * getattr(llm, "vision_max_tokens", 512)) / 10000
+            total += (1 + getattr(llm, "retry", 0)) * (
+                vision_price.input_cny * 50000
+                + vision_price.output_cny * getattr(llm, "vision_max_tokens", 512)
+            ) / 10000
         return int(total.to_integral_value(rounding=ROUND_CEILING)), sorted(unpriced)
 
     def _comic_fast_director_review(self, state: ComicState) -> dict[str, Any]:
@@ -987,8 +1005,14 @@ class StudioApplication:
         creation = dict(state.quick_creation or {})
         project_id = creation["project_id"]
         request = creation["original_request"]
-        with request_trace(state.trace_id or f"trace-{context.run_id}"):
+        with request_trace(state.trace_id or f"trace-{context.run_id}"), _comic_model_policy(state):
             if step == "director":
+                if creation.get("use_confirmed_director"):
+                    spec = self.comic_projects.get_director(project_id)
+                    if (not self.comic_projects.director_confirmed(spec)
+                            or spec.version != creation["director_spec_version"]):
+                        raise ToolError("已确认导演版本发生变化，未调用生图")
+                    return {"quick_creation": {**creation, "director_status": "completed"}}
                 existing = next((run for run in self.runtime_store.list_runs(
                     conversation_id=state.conversation_id,
                 ) if run.workflow == "comic.director"
@@ -1044,6 +1068,12 @@ class StudioApplication:
                     )
                 return {"quick_creation": creation}
             if step == "director_gate":
+                if creation.get("use_confirmed_director"):
+                    spec = self.comic_projects.get_director(project_id)
+                    if (not self.comic_projects.director_confirmed(spec)
+                            or spec.version != creation["director_spec_version"]):
+                        raise ToolError("导演确认门禁未通过：版本已变化，未调用生图")
+                    return {"quick_creation": {**creation, "director_decision": "approve"}}
                 if context.approval_decision is ApprovalDecision.REJECT:
                     creation["director_decision"] = "reject"
                     return {"quick_creation": creation}
@@ -1093,6 +1123,16 @@ class StudioApplication:
                 if director_run.status is ExecutionStatus.FAILED:
                     raise ToolError("导演执行失败，未进入制作", detail=director_run.error)
                 if director_run.status is not ExecutionStatus.COMPLETED:
+                    if creation.get("auto_create_image"):
+                        review = self._comic_fast_director_review(state)
+                        error = ToolError(review["message"])
+                        if review.get("error_id"):
+                            error._kantoku_public_failure = {
+                                "error_id": review["error_id"], "trace_id": review["trace_id"],
+                                "safe_message": review["message"], "error_kind": "fatal",
+                                "retryable": False,
+                            }
+                        raise error
                     raise ExternalJobPending("导演草稿需要修订；原方案和 Trace 已保存，未调用生图")
                 automatic = bool(creation.get("auto_create_image"))
                 if not automatic and context.approval_decision is not ApprovalDecision.APPROVE:
@@ -1118,13 +1158,15 @@ class StudioApplication:
                 )
                 return {"quick_creation": creation}
             if step == "storyboard":
+                if creation.get("shot_id"):
+                    return {}
                 result = self.create_comic_storyboard(project_id, {
                     "expected_project_version": self.comic_projects.get(
                         project_id,
                     ).project.current_version,
                     "generate": True,
                     "task": "依据当前 Brief 和导演方案，规划本次轻量图片任务的一个关键画面。",
-                    "asset_ids": [],
+                    "asset_ids": creation.get("asset_ids", []),
                 })
                 shots = result["shots"]
                 if len(shots) != 1:
@@ -2122,7 +2164,8 @@ class StudioApplication:
     @staticmethod
     def _comic_director_model(messages: list[dict[str, str]]) -> str:
         """共享文本模型入口；Comic Domain 不持有 Provider 客户端。"""
-        return chat(messages, response_format={"type": "json_object"}).content or ""
+        return chat(messages, response_format={"type": "json_object"},
+                    single_attempt=_comic_single_attempt.get()).content or ""
 
     def _comic_intent_model(self, messages: list[dict[str, str]]) -> str:
         """边界检查复用同一文本出口，不绑定模型或新增 Skill。"""
@@ -2558,7 +2601,8 @@ class StudioApplication:
 
     @staticmethod
     def _comic_storyboard_model(messages: list[dict[str, str]]) -> str:
-        return chat(messages, response_format={"type": "json_object"}).content or ""
+        return chat(messages, response_format={"type": "json_object"},
+                    single_attempt=_comic_single_attempt.get()).content or ""
 
     def _comic_tracked_action(
         self, project_id: str, task_type: str,
@@ -2582,7 +2626,8 @@ class StudioApplication:
         if parent and parent.state.get("quick_creation"):
             state.update(parent_run_id=parent.id,
                          conversation_id=parent.state.get("conversation_id"),
-                         message_id=parent.state.get("message_id"), execution_mode="fast")
+                         message_id=parent.state.get("message_id"),
+                         execution_mode=parent.state.get("execution_mode", "professional"))
         run = self.runtime_store.create_run(
             "comic", f"comic.{task_type}", state, task_type,
             interaction_mode=InteractionMode.AUTONOMOUS
@@ -2997,6 +3042,8 @@ class StudioApplication:
         """根据 shell 选择 Domain Pack；Core 本身没有领域分支。"""
         domain = str(data.get("domain", "")).strip().lower()
         if domain == "comic":
+            if data.get("state", {}).get("production_project_id"):
+                return self._start_comic_project_production(data["state"])
             state = ComicState.model_validate(data.get("state", data))
             run = self.runtime.start(COMIC_WORKFLOW_ID, state)
         elif domain == "commerce":
@@ -3008,6 +3055,80 @@ class StudioApplication:
         else:
             raise ToolError("不支持的 Domain Pack", detail=domain)
         return self._run_payload(run.id)
+
+    def _start_comic_project_production(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Submit a confirmed workspace revision to the SAME production graph as Home."""
+        project_id = str(data["production_project_id"])
+        conversation_id = str(data.get("conversation_id") or "")
+        self.runtime_store.get_conversation(conversation_id)
+        message_id = str(data.get("request_id") or "").strip()
+        if not message_id or len(message_id) > 100:
+            raise ToolError("制作请求必须携带唯一 request_id")
+        # Check the submitted revision before reading CURRENT versions: compilation
+        # may already have advanced the project while the HTTP response was lost.
+        existing = next((run for run in self.runtime_store.list_runs(
+            conversation_id=conversation_id,
+        ) if run.workflow == COMIC_WORKFLOW_ID
+            and run.state.get("message_id") == message_id), None)
+        if existing:
+            bound = existing.state.get("quick_creation") or {}
+            if (bound.get("project_id") != project_id
+                    or bound.get("director_spec_version") != data.get("director_version")
+                    or bound.get("requested_shot_id") != data.get("shot_id")
+                    or bound.get("requested_shot_version") != data.get("shot_version")):
+                raise ToolError("制作请求 ID 已绑定其他作品或导演/镜头版本")
+            return self._run_payload(existing.id)
+        snapshot = self.comic_projects.get(project_id)
+        spec = self.comic_projects.get_director(project_id)
+        self.comic_projects.require_confirmed_director(spec)
+        if (data.get("expected_project_version") != snapshot.project.current_version
+                or data.get("director_version") != spec.version
+                or spec.creative_brief_version != snapshot.creative_brief.version):
+            raise ToolError("制作来源版本已变化，请刷新并重新确认，未调用生图")
+        owners = [run for run in self.runtime_store.list_runs(conversation_id=conversation_id)
+                  if run.workflow == "comic.director"
+                  and run.state.get("project_id") == project_id]
+        if not owners:
+            raise ToolError("作品不属于当前创作会话，未调用生图")
+        source = {"project_id": project_id, "use_confirmed_director": True,
+                  "director_spec_version": spec.version,
+                  "original_request": snapshot.creative_brief.original_request,
+                  "input_brief_id": snapshot.creative_brief.brief_id,
+                  "input_brief_version": snapshot.creative_brief.version,
+                  "requested_shot_id": data.get("shot_id"),
+                  "requested_shot_version": data.get("shot_version"),
+                  "asset_ids": [key.removeprefix("asset:") for key in spec.asset_versions
+                                if key.startswith("asset:")]}
+        if data.get("shot_id"):
+            _snapshot, _spec, board, shot, _assets = self.comic_prompts.source(data["shot_id"])
+            if shot.project_id != project_id or data.get("shot_version") != shot.version:
+                raise ToolError("镜头绑定或版本不一致，未调用生图")
+            source.update(shot_id=shot.shot_id, storyboard_id=board.storyboard_id)
+        # Client retries retrieve the same explicitly bound request, not another paid task.
+        index = hash((conversation_id, message_id)) % len(self._workflow_dispatch_locks)
+        with self._workflow_dispatch_locks[index]:
+            existing = next((run for run in self.runtime_store.list_runs(
+                conversation_id=conversation_id,
+            ) if run.workflow == COMIC_WORKFLOW_ID
+                and run.state.get("message_id") == message_id), None)
+            if existing:
+                bound = existing.state.get("quick_creation") or {}
+                if any(bound.get(key) != source.get(key) for key in (
+                    "project_id", "director_spec_version", "input_brief_id",
+                    "input_brief_version", "requested_shot_id", "requested_shot_version",
+                )):
+                    raise ToolError("制作请求 ID 已绑定其他作品或导演版本")
+                return self._run_payload(existing.id)
+            total, unpriced = self._quick_creation_cost(1, text_calls=2)
+            source["unpriced_models"] = unpriced
+            state = {"project": project_id, "prompt": snapshot.creative_brief.original_request,
+                     "conversation_id": conversation_id, "message_id": message_id,
+                     "trace_id": current_trace_id() or f"trace-{uuid4().hex[:12]}",
+                     "execution_mode": "professional", "quick_creation": source,
+                     "shot_no": 1, "estimate_fen": budget.estimate_image_fen(),
+                     "total_estimate_fen": total, "confirmed": False}
+            return self.enqueue_core_run({"domain": "comic", "state": state,
+                                          "interaction_mode": "guided"})
 
     def enqueue_core_run(
         self, data: dict[str, Any], *, dispatch: dict[str, Any] | None = None,

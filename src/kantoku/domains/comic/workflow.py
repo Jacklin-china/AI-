@@ -6,7 +6,7 @@ from collections.abc import Callable
 from typing import Any
 
 from kantoku.capabilities.video import VideoGenerationRequest, VideoService
-from kantoku.config import get_settings
+from kantoku.config import ToolError, get_settings
 from kantoku.core.budget import attach_image_artifact
 from kantoku.core.conversations import MessageRole, MessageType
 from kantoku.core.runtime.graph import (
@@ -46,6 +46,8 @@ def build_comic_workflow(
 
     def review(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
         decision = context.approval_decision
+        if (state.quick_creation or {}).get("auto_create_image") and not state.qc_passed:
+            raise ToolError("图片已生成，但视觉检查未通过；请在专业工作区查看检查结果")
         if decision is None and state.execution_mode == "fast" and state.qc_passed:
             # Automatic QC pass is not a human review; do not record a fake label.
             return {"approval_decision": ApprovalDecision.APPROVE.value}
@@ -53,7 +55,14 @@ def build_comic_workflow(
             raise RuntimeError("approval decision is missing")
         return dict(service.review(state, decision.value, context.approval_response))
 
-    def approve_cost(_state: ComicState, context: RuntimeContext) -> dict[str, Any]:
+    def approve_cost(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
+        if (state.quick_creation or {}).get("auto_create_image") and not state.confirmed:
+            raise ToolError(
+                "快速创作费用无法安全自动执行；请核实模型价格或使用专业模式",
+                detail=f"gate=cost_approval estimate_fen={state.total_estimate_fen} "
+                f"limit_cny={get_settings().budget.autonomous_image_auto_cny} "
+                f"unpriced_models={state.quick_creation.get('unpriced_models', [])}",
+            )
         decision = context.approval_decision
         if decision is None:
             return {"confirmed": True, "cost_decision": "approve"}
@@ -126,8 +135,8 @@ def build_comic_workflow(
             requires_approval=True,
             approval_when=lambda state: bool(state.quick_creation)
             and state.quick_creation.get("director_status") != "failed"
-            and (not state.quick_creation.get("auto_create_image")
-                 or state.quick_creation.get("director_status") != "completed"),
+            and not state.quick_creation.get("auto_create_image")
+            and not state.quick_creation.get("use_confirmed_director"),
             approval_request=director_review_request or (lambda state: {
                 "kind": "director_review",
                 "director_version": (state.quick_creation or {}).get("director_spec_version"),
@@ -142,7 +151,8 @@ def build_comic_workflow(
             "cost_approval",
             approve_cost,
             requires_approval=True,
-            approval_when=lambda state: not state.confirmed,
+            approval_when=lambda state: not state.confirmed
+            and not (state.quick_creation or {}).get("auto_create_image"),
             approval_request=lambda state: {
                 "kind": "cost_approval",
                 "estimate_fen": state.total_estimate_fen or state.estimate_fen,
@@ -168,7 +178,8 @@ def build_comic_workflow(
             "human_review",
             review,
             requires_approval=True,
-            approval_when=lambda state: state.execution_mode != "fast" or not state.qc_passed,
+            approval_when=lambda state: (state.execution_mode != "fast" or not state.qc_passed)
+            and not (state.quick_creation or {}).get("auto_create_image"),
             approval_request=lambda state: {
                 "kind": "creative_review",
                 "request_id": state.request_id,

@@ -1705,7 +1705,7 @@ def test_home_fast_comic_complex_request_uses_existing_graph_without_start_confi
     monkeypatch.setattr(app.runner, "submit", lambda _execute: None)
     # Execution routing is independent of a quote; this test explicitly supplies
     # a complete below-threshold estimate. Missing prices are tested separately.
-    monkeypatch.setattr(app, "_quick_creation_cost", lambda _count: (30, []))
+    monkeypatch.setattr(app, "_quick_creation_cost", lambda _count, **_kwargs: (30, []))
     monkeypatch.setattr(
         web_studio, "plan_creative_turn",
         lambda content, _prior, **_kwargs: creative.CreativeDecision(

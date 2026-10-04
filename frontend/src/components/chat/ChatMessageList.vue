@@ -410,7 +410,7 @@ function activityText(event: RuntimeEvent): string {
           <ChatImageAttachment v-if="inlineRuns[message.id].imageUrl" :media="{ url: inlineRuns[message.id].imageUrl, filename: `kantoku-${inlineRuns[message.id].run.id}.png` }" @open="openImage" />
           <figure v-if="inlineRuns[message.id].videoUrl && inlineRuns[message.id].run.status === 'completed'" class="chat-generated-image"><video :src="inlineRuns[message.id].videoUrl" controls preload="metadata" /><figcaption>视频已保存</figcaption></figure>
           <p v-else-if="inlineRuns[message.id].run.status === 'completed' && inlineRuns[message.id].artifact?.type === 'video'" class="chat-inline-status">视频已保存，预览暂不可用。</p>
-          <ApprovalCard v-if="inlineRuns[message.id].approval" :approval="inlineRuns[message.id].approval!" :domain="inlineRuns[message.id].run.domain" :busy="approvalBusy ?? false" :image-url="inlineRuns[message.id].imageUrl" home-mode @decide="(action, response) => $emit('decideInline', message.id, action, response)" />
+          <ApprovalCard v-if="inlineRuns[message.id].approval && !isComicFastImage(inlineRuns[message.id].run)" :approval="inlineRuns[message.id].approval!" :domain="inlineRuns[message.id].run.domain" :busy="approvalBusy ?? false" :image-url="inlineRuns[message.id].imageUrl" home-mode @decide="(action, response) => $emit('decideInline', message.id, action, response)" />
         </section>
         <div v-if="!homeMode && activityAnchor === index + 1 && activityLines.length" class="runtime-activity-list anchored" aria-label="任务进度">
           <button type="button" class="activity-toggle" :data-status="run?.status" @click="activityExpanded = !activityExpanded">

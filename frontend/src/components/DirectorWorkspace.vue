@@ -11,7 +11,7 @@ import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import { navigate, route } from '../router'
 import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey } from '../domains/comic/directorPresentation'
-import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, createRun, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage } from '../types'
 import type { CoreRun } from '../types'
 
@@ -52,6 +52,8 @@ const revisionVersion = ref<number | null>(null)
 const restoredSpec = ref<Record<string, unknown> | null>(null)
 const events = ref<RuntimeEvent[]>([])
 const compiling = ref(false)
+const submittingImage = ref(false)
+const productionRequests = new Map<string, string>()
 const stageScroll = ref<HTMLElement | null>(null)
 const scrollPositions = new Map<string, number>()
 const referenceUrls = ref<Record<string, string>>({})
@@ -467,6 +469,28 @@ async function compilePrompt(): Promise<void> {
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) compiling.value = false }
 }
+async function generateImage(): Promise<void> {
+  if (!confirmed.value || !project.value || !spec.value || submittingImage.value || compiling.value || busy.value || hasRunning.value) return
+  const epoch = conversationEpoch
+  const shot = section.value === 'prompt' ? shots.value.find(item => item.shot_id === selectedShot.value) : undefined
+  const key = `${activeConversationId.value}:${spec.value.version}:${shot?.shot_id ?? 'keyframe'}:${shot?.version ?? ''}`
+  // A network retry keeps the same request identity; it must never submit a second image.
+  if (!productionRequests.has(key)) productionRequests.set(key, `production-${crypto.randomUUID()}`)
+  submittingImage.value = true; error.value = ''
+  try {
+    const run = await createRun('comic', {
+      production_project_id: project.value.project.project_id,
+      expected_project_version: project.value.project.current_version,
+      director_version: spec.value.version, conversation_id: activeConversationId.value,
+      request_id: productionRequests.get(key),
+      ...(shot ? { shot_id: shot.shot_id, shot_version: shot.version } : {}),
+    })
+    if (epoch !== conversationEpoch || disposed) return
+    // Existing task screen handles professional budget/QC approvals and real Artifacts.
+    navigate({ name: 'task_run', runId: run.id })
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) submittingImage.value = false }
+}
 async function restore(version: number): Promise<void> {
   if (!project.value || busy.value || hasRunning.value) return
   busy.value = true; invalidate()
@@ -610,6 +634,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="visitStage" />
                   <div v-if="spec && selectedStage === 'director_assemble'" class="final-approval"><p>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '当前版本已确认' : dirty ? '请先保存编辑，再检查并确认' : '这是可修改的草稿，确认后才进入下一阶段。' }}</p><div class="draft-actions"><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">用对话修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed" @click="openSection('prompt')">进入下一步</button></div></div>
                   <button v-if="spec && selectedStage !== 'director_assemble' && !editing && selectedStage !== 'director_critic'" class="ui-button quiet sm" @click="visitStage('director_assemble')">{{ mode === 'fast' ? '查看整体方案并确认' : '返回最终导演稿' }}</button>
+                  <button v-if="confirmed && selectedStage === 'director_assemble'" class="ui-button primary sm" :disabled="submittingImage || busy || hasRunning" @click="generateImage">{{ submittingImage ? '正在创建图片任务' : '生成当前画面' }}</button>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
                 <template v-else-if="section === 'assets'">
@@ -623,6 +648,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 </template>
                 <template v-else-if="section === 'storyboard' || section === 'prompt'">
                   <p v-if="section === 'prompt' && !confirmed" class="review-notice">导演方案尚未在本界面确认。可查看历史 Prompt，但不能进入新制作。</p>
+                  <button v-if="section === 'prompt' && confirmed" class="ui-button primary sm" :disabled="submittingImage || compiling || busy || hasRunning" @click="generateImage">{{ submittingImage ? '正在创建图片任务' : selectedShot ? '生成当前镜头图片' : '规划关键画面并生成图片' }}</button>
                   <label v-if="boards.length">分镜 <select v-model="selectedBoard" @change="loadShots"><option v-for="board in boards" :key="board.storyboard_id" :value="board.storyboard_id">{{ board.title }} · v{{ board.version }}</option></select></label>
                   <p v-else class="pane-note">尚无作品分镜。此页面只展示已有分镜，不会自动开始制作。</p>
                   <template v-if="section === 'storyboard'"><article v-for="shot in shots" :key="shot.shot_id" class="shot-row"><strong>镜头 {{ shot.sequence_number }} · {{ shot.subject }}</strong><p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[shot.status] ?? shot.status }} · 角色 {{ shot.character_asset_versions.map(ref => `${ref.asset_id} v${ref.version}`).join('、') || '未引用' }}</small></article></template>

@@ -152,7 +152,7 @@ onBeforeUnmount(() => {
           <button v-for="item in visualArtifacts" :key="item.id" class="ui-button quiet sm" @click="selectedArtifactId = item.id">{{ presenter.artifactName(item.source, item.type) }} · v{{ item.version }}</button>
           <button class="text-action" @click="navigate({ name: 'task_run', runId: run.id })">查看原任务、审批与追踪记录</button>
         </section>
-        <p v-else class="pane-note">作品级图片生产尚未接入。导演方案完成不代表已出图；本轮不触发旧单镜头工作流。</p>
+        <p v-else class="pane-note">当前会话暂无图片生产记录。确认导演方案后可选择“生成当前画面”，在原任务界面查看费用、生成、检查和图片结果。</p>
       </template>
     </DirectorWorkspace>
   </section>

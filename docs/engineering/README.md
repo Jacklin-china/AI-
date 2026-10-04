@@ -354,12 +354,14 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 - Comic 快捷任务在已有 `comic.production.v1` 增量接入导演、审核门、分镜、Prompt 节点，复用 ComicDirectorCoordinator、作品存储、Prompt Compiler、Studio Image/QC/Artifact；旧专业任务没有快捷上下文时仍沿用原图。首页单镜头生产不自动开启视频，也不宣称已制作整部多镜头作品。
 - 每条快捷 Comic 任务使用独立的 Project/Brief，输入只含本条需求和显式资产；生产 Run 保存 conversation/message/trace 与 `quick_creation` 中的 Brief、Director Run、分镜、镜头、Prompt Artifact 绑定。导演审核失败保留真实输出，等待修订或返回失败，禁止回退普通聊天、默认方案或未经审核的生图。
 - 同一消息的顺序或并发重试复用原生产 Run；进程内分配保护只覆盖创建/提交，不锁住导演执行。`domain_dispatch` 事件必须在 Worker 启动前写入，避免同一 Run 的并发事件序号冲突；恢复生产节点时复用明确绑定的 Director Run，不自动重提未知账单模型请求。
-- 费用门放在任何付费导演/图片调用之前，按配置估算整个任务（文本、图片、视觉检查及重试）；已知预计费用不超过首页配置限额时自动执行，超过则使用原 Core Approval。未配置价格必须公开标明未计价模型，不假报零成本。专业模式原审批不变。Commerce 继续公开标记现有 Mock 数据源/Marketplace，不假装已连接真实商品平台。
+- 费用门放在任何付费导演/图片调用之前，按配置估算整个任务（文本、图片、视觉检查及重试）；已知预计费用不超过首页配置限额时自动执行。首页自动 Comic 图片任务超限或未定价时明确失败，不弹中间审批卡、不假报零成本；旧手动任务与专业模式保留原 Core Approval。Commerce 继续公开标记现有 Mock 数据源/Marketplace，不假装已连接真实商品平台。
 - 测试必须等待所有已提交 Worker 结束后才撤销离线替身，并显式禁止真实模型客户端；否则异常退出后的线程可能使用恢复的生产配置。离线回归与付费验收分开执行。
 
 ### 首页漫剧自动出图与专业确认（2026-10-03）
 
-- 新首页漫剧图片任务保存 `quick_creation.auto_create_image=true`，内部完成导演/真实 Critic/分镜/Prompt，再自动进入共享图片调用。通过审核的当前不可变修订由 Fast 执行策略授权，沿用 Core Approval，记录 production Run 与 `human_review=false`，不伪造用户确认。失败、待修订、预算未知/超限仍停止或等待必要决定。旧待确认 Run 没有该标志，保留原版本确认语义；专业工作台继续人工编辑、审核与确认。恢复使用同一 Run，不另起未知账单任务。
+- 新首页漫剧图片任务保存 `quick_creation.auto_create_image=true`，内部完成导演/真实 Critic/分镜/Prompt，再自动进入共享图片调用。通过审核的当前不可变修订由 Fast 执行策略授权，沿用 Core Approval，记录 production Run 与 `human_review=false`，不伪造用户确认。导演待修订、执行错误或 QC 不通过明确失败并保留来源/检查结果，不以确认卡掩盖失败。供应商真实异步等待/未知账单仍沿用查询/对账，不重提。旧待确认 Run 没有该标志，保留原版本确认语义；专业工作台继续人工编辑、审核与确认。
+- 首页自动 Comic 文本调用在该 worker 的 ContextVar 作用域使用共享 `chat(single_attempt=True)`：只使用已报价主模型，关闭文本自动重试和备用模型；报价同步按此策略计算。不能仅从报价删除未定价备用模型却仍允许调用它。视觉模型沿用原重试并包含在报价中；其他会话与专业模式不受这个局部策略影响。
+- 专业工作区“生成当前画面/镜头”通过现有 `/api/runs` 提交 `production_project_id`、project/director/shot 版本、conversation 与唯一 request_id。服务端核实当前已审核且已确认的修订及会话归属后，复用同一个 `comic.production.v1` 的分镜、Prompt、Image、QC、归档链；不再生成另一套 Director。专业费用/QC 审批仍在原任务界面处理，重试同一 request_id 返回原 Run。
 - 新首页快捷图片任务不将 DirectorSpec 中间数据写成聊天消息；公开结果留在原 Director Run/Trace 中。首页只展示状态、阶段粒子进度和真实图片/必要错误；历史 quick-director 消息在首页不展示长篇分析。专业节点仍投影可读公开字段。首页图片继续复用原预览/下载组件。
 - 创意理解中的 hard_constraints 是输入 Brief 的只读投影，模型不得擅自新增或改写；输出适配层绑定原列表，原始用户需求继续进入导演、Critic 与 Prompt 上下文，不将空列表误解为可以忽略用户原文。
 - 粒子占位与图片同宽；百分比明确标为**阶段进度**，只由真实 Runtime 节点完成事件计算。供应商未提供细粒度进度时保持当前阶段百分比并显示真实等待秒数，不人为虚涨。100% 必须同时有 completed Run 和真实图片 URL。错误展示真实错误，不冒充完成。

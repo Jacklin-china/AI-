@@ -113,6 +113,18 @@ test('homepage actual template hides director reports and renders the stage load
   assert.match(html, /正在分析需求 阶段进度 10%/)
   assert.doesNotMatch(html, /creative_decision|private-report-marker|chat-run-feed/)
 })
+
+test('automatic image entry never renders budget or director approval cards', async () => {
+  const task = { ...run, id: 'run-1', current_node: 'generate', state: { execution_mode: 'fast', quick_creation: { auto_create_image: true } } }
+  for (const kind of ['cost_approval', 'director_review', 'creative_review']) {
+    const html = await renderMessages({ inlineRuns: { 'user-1': { run: task, activities: events, approval: { id: 'approval-1', request: { kind } }, artifact: null, imageUrl: '', videoUrl: '' } } })
+    assert.doesNotMatch(html, /data-component="ApprovalCard"|private-report-marker/)
+    assert.match(html, /正在生成图片/)
+  }
+  const legacy = { ...task, state: { execution_mode: 'fast', quick_creation: {} } }
+  const html = await renderMessages({ inlineRuns: { 'user-1': { run: legacy, activities: [], approval: { id: 'legacy', request: { kind: 'director_review' } }, artifact: null, imageUrl: '', videoUrl: '' } } })
+  assert.match(html, /data-component="ApprovalCard"/)
+})
 test('completed image replaces the loader once; persisted artifact still renders without inline state', async () => {
   const url = '/api/artifacts/real-image/content'
   const result = { id: 'result-1', role: 'assistant', content: '已生成当前镜头图片。', event_id: 'quick-image:run-1', run_id: 'run-1', artifact_id: 'real-image' }
