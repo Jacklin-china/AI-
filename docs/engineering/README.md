@@ -371,7 +371,9 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 
 ### Comic 工作区制作与专业确认（2026-10-04）
 
-- 工作区人工审核默认开启，新创意走原导演草稿入口，保存三个公开决策节点与真实 Critic。
+- 工作区普通模式默认自动制作；只有主动选择专业导演模式并开启人工审核才走导演草稿确认入口。
+  两者复用原生产 Workflow、Run、预算台账与 Artifact，不修改 Commerce 审批或任务中心。
+  专业草稿保存三个公开决策节点与真实 Critic。
   用户确认当前不可变修订后，Core Approval response/state 投影为 `approval.status=approved`，
   原 confirmation Run/Event 保存 `workflow_transition: director_review → storyboard_generation`。
   不改 Core 的通用 decision 枚举，不另存一套审批。指纹和依赖有效、摄影完整且无阻断项时，
@@ -379,8 +381,8 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   确认只表示当前版本已获授权，不立即付费。“进入下一步”打开分镜并通过既有作品生产 API
   创建绑定该导演版本的 Run，继续分镜、Prompt、Image、QC、Artifact；不再次生成导演。
   导演页没有生图按钮，镜头生成入口只在分镜页；输入/刷新/版本恢复均读取服务端审批状态。
-  专业费用/QC 仍在原任务详情处理，工作区提供真实 waiting 状态和审批入口。
-- 显式关闭人工审核及旧自动任务继续通过原 `POST /api/runs` 提交 `state.creative_request`、当前 guided Comic
+  确认后复用自动制作策略，预算后台预占/结算，QC 保存真实结果，不额外要求 Task Center 费用/QC 批准。
+- 普通模式及关闭人工审核的专业模式通过原 `POST /api/runs` 提交 `state.creative_request`、当前 guided Comic
   Conversation、唯一 `request_id`、`creation_mode` 与 `approval_required=false`。
   应用入口复用同一个 Conversation Workflow 分配锁和 `comic.production.v1`，在 Worker
   启动前持久化用户消息及 `domain_dispatch(entrypoint=comic_workspace)`；不再只创建导演 Run。
@@ -390,9 +392,17 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   内部 Critic、分镜、Prompt、Image、真实 QC 和 Artifact。未定价、超限、硬约束冲突、
   审核执行失败或未知账单仍停止并明确报错，不能为了自动体验绕过安全门。
   `creation_mode=professional` 仅增加导演决策深度；Conversation 仍属于 guided 工作区。
-- 首页 `+ → 漫剧` 继续自动策略确认，不受工作区默认人工确认影响。
+- 首页 `+ → 漫剧` 保持同一自动策略，不展示内部导演报告或人工确认卡。
   不会自动启动历史草稿或重新提交旧失败 Run。
 - 前端轮询父生产 Run 和事件，首次进入真实分镜阶段自动切换分镜页；之后可自由返回导演节点。
   对话和工作区复用原阶段粒子占位/图片附件，结果读取当前 Conversation 的持久化 Artifact。
   自动任务隐藏草稿确认控件；刷新只恢复状态，取消父任务同时取消未完成的关联导演任务。
   没有新增 Runtime、Skill、Prompt 系统、Provider 或数据表，没有页面布局重做。
+- 生图明确拒绝且预算已释放/结算后，用户可以显式重新生成；保留原失败 Run，新请求绑定原镜头及
+  指定 Prompt 修订。编辑 Prompt 沿用现有版本 API，不重写 Compiler。网络重试保留 request_id。
+  供应商提交/账单未知时禁止重提（包括换模型），有 job_id 时恢复原 Run 查询，无 job_id 时等待对账。
+- Run 响应的 `image_execution` 是现有节点时间、供应商身份和预算台账的只读投影，不新增持久化结构。
+  前端仅显示真实模型、节点耗时及已结算费用；未知费用显示待结算，不估算冒充账单。
+  模型/protocol 仍只读取 settings.yaml，更换兼容型号无需代码白名单；前端换模型入口提示配置步骤，
+  不虚构未实现的单任务模型覆盖。日志贯通 image_generation_started、provider_request_sent、
+  provider_response_received、artifact_saved、image_generation_completed/failed，并保留脱敏异常链。

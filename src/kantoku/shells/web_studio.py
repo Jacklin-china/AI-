@@ -1080,9 +1080,12 @@ class StudioApplication:
                     )
                 return {"quick_creation": creation}
             if step == "director_gate":
-                automatic = bool(creation.get("auto_create_image") or (
-                    creation.get("use_existing_director")
-                    and creation.get("approval_required") is False))
+                automatic = not creation.get("use_confirmed_director") and bool(
+                    creation.get("auto_create_image") or (
+                        creation.get("use_existing_director")
+                        and creation.get("approval_required") is False
+                    )
+                )
                 if automatic:
                     try:
                         spec = self.comic_projects.get_director(project_id)
@@ -1222,6 +1225,15 @@ class StudioApplication:
                                 shot_id=shots[0]["shot_id"])
                 return {"quick_creation": creation}
             if step == "prompt":
+                if creation.get("requested_prompt_version"):
+                    prompt = self.comic_prompts.get(creation["shot_id"])
+                    if (prompt.version != creation["requested_prompt_version"]
+                            or prompt.model_target != get_settings().image.model):
+                        raise ToolError("所选 Prompt 或模型已变化，未调用生图")
+                    self.comic_prompts.source(prompt.shot_id)
+                    creation.update(prompt_artifact_id=prompt.artifact_id,
+                                    prompt_version=prompt.version)
+                    return {"quick_creation": creation, "prompt": prompt.positive_prompt}
                 shot = self.comic_storyboards.get_shot(creation["shot_id"])
                 prompt = self.compile_comic_prompt(shot.shot_id, {
                     "expected_project_version": self.comic_projects.get(
@@ -3101,6 +3113,28 @@ class StudioApplication:
         payload["nodes"] = [
             node.model_dump(mode="json") for node in self.runtime_store.list_nodes(run_id)
         ]
+        if run.workflow == COMIC_WORKFLOW_ID and run.state.get("quick_creation"):
+            request_id = run.state.get("request_id")
+            reservation = budget.get_reservation(request_id) if request_id else None
+            unknown = bool(reservation and reservation.status in {
+                "reserved", "submitted", "unknown", "succeeded", "failed",
+            })
+            image_node = next((item for item in reversed(payload["nodes"])
+                               if item["node_id"] == "generate"), None)
+            payload["image_execution"] = {
+                "provider": reservation.provider if reservation else (
+                    self.image_service.provider.generation_identity().get("provider")
+                ),
+                "model": reservation.model if reservation else get_settings().image.model,
+                "actual_fen": reservation.actual_fen if reservation else None,
+                "billing_status": reservation.status if reservation else "not_submitted",
+                "started_at": image_node.get("started_at") if image_node else None,
+                "finished_at": image_node.get("completed_at") if image_node else None,
+                "can_regenerate": run.status is ExecutionStatus.FAILED and not unknown,
+                "can_resume": run.status is ExecutionStatus.WAITING and bool(
+                    reservation and reservation.provider_job_id),
+                "needs_reconciliation": unknown and not bool(reservation.provider_job_id),
+            }
         return payload
 
     def create_core_run(self, data: dict[str, Any]) -> dict[str, Any]:
@@ -3157,7 +3191,7 @@ class StudioApplication:
         message_id = str(data.get("request_id") or "").strip()
         if not message_id or len(message_id) > 100:
             raise ToolError("制作请求必须携带唯一 request_id")
-        approval_required = data.get("approval_required", True)
+        approval_required = data.get("approval_required", False)
         if not isinstance(approval_required, bool):
             raise ToolError("approval_required 必须是布尔值")
         # Check the submitted revision before reading CURRENT versions: compilation
@@ -3172,6 +3206,7 @@ class StudioApplication:
                     or bound.get("director_spec_version") != data.get("director_version")
                     or bound.get("requested_shot_id") != data.get("shot_id")
                     or bound.get("requested_shot_version") != data.get("shot_version")
+                    or bound.get("requested_prompt_version") != data.get("prompt_version")
                     or bound.get("approval_required", False)
                     != approval_required):
                 raise ToolError("制作请求 ID 已绑定其他作品或导演/镜头版本")
@@ -3195,6 +3230,10 @@ class StudioApplication:
             raise ToolError("作品不属于当前创作会话，未调用生图")
         source = {"project_id": project_id, "use_confirmed_director": approval_required,
                   "use_existing_director": not approval_required,
+                  # Director consent and financial/QC execution are separate policies.
+                  # Both ordinary and explicitly confirmed creations use the same
+                  # bounded automatic image lifecycle, never Task Center approvals.
+                  "auto_create_image": True,
                   "approval_required": approval_required,
                   "director_spec_version": spec.version,
                   "original_request": snapshot.creative_brief.original_request,
@@ -3202,6 +3241,7 @@ class StudioApplication:
                   "input_brief_version": snapshot.creative_brief.version,
                   "requested_shot_id": data.get("shot_id"),
                   "requested_shot_version": data.get("shot_version"),
+                  "requested_prompt_version": data.get("prompt_version"),
                   "asset_ids": [key.removeprefix("asset:") for key in spec.asset_versions
                                 if key.startswith("asset:")]}
         if data.get("shot_id"):
@@ -3209,6 +3249,15 @@ class StudioApplication:
             if shot.project_id != project_id or data.get("shot_version") != shot.version:
                 raise ToolError("镜头绑定或版本不一致，未调用生图")
             source.update(shot_id=shot.shot_id, storyboard_id=board.storyboard_id)
+            if data.get("prompt_version") is not None:
+                prompt = self.comic_prompts.get(shot.shot_id)
+                if (prompt.version != data["prompt_version"]
+                        or prompt.shot_version != shot.version
+                        or prompt.director_spec_version != spec.version
+                        or prompt.model_target != get_settings().image.model):
+                    raise ToolError("所选 Prompt 版本、镜头或模型不一致，未调用生图")
+        elif data.get("prompt_version") is not None:
+            raise ToolError("选择 Prompt 必须绑定镜头")
         # Client retries retrieve the same explicitly bound request, not another paid task.
         index = hash((conversation_id, message_id)) % len(self._workflow_dispatch_locks)
         with self._workflow_dispatch_locks[index]:
@@ -3222,17 +3271,29 @@ class StudioApplication:
                     "project_id", "director_spec_version", "input_brief_id",
                     "input_brief_version", "requested_shot_id", "requested_shot_version",
                     "approval_required",
+                    "requested_prompt_version",
                 )):
                     raise ToolError("制作请求 ID 已绑定其他作品或导演版本")
                 return self._run_payload(existing.id)
-            total, unpriced = self._quick_creation_cost(1, text_calls=2)
+            for prior in self.runtime_store.list_runs(conversation_id=conversation_id):
+                prior_source = prior.state.get("quick_creation") or {}
+                if (prior.workflow != COMIC_WORKFLOW_ID
+                        or prior_source.get("project_id") != project_id):
+                    continue
+                reservation = budget.get_reservation(prior.state["request_id"]) \
+                    if prior.state.get("request_id") else None
+                if reservation and reservation.status not in {"released", "settled"}:
+                    raise ToolError("原生图请求尚未结算，请继续查询或对账；不能重新提交")
+            total, unpriced = self._quick_creation_cost(1, text_calls=2, primary_only=True)
             source["unpriced_models"] = unpriced
             state = {"project": project_id, "prompt": snapshot.creative_brief.original_request,
                      "conversation_id": conversation_id, "message_id": message_id,
                      "trace_id": current_trace_id() or f"trace-{uuid4().hex[:12]}",
-                     "execution_mode": "professional", "quick_creation": source,
+                     "execution_mode": "fast", "quick_creation": source,
                      "shot_no": 1, "estimate_fen": budget.estimate_image_fen(),
-                     "total_estimate_fen": total, "confirmed": False}
+                     "total_estimate_fen": total,
+                     "confirmed": not unpriced and total <= int(
+                         get_settings().budget.autonomous_image_auto_cny * 100)}
             return self.enqueue_core_run({"domain": "comic", "state": state,
                                           "interaction_mode": "guided"})
 

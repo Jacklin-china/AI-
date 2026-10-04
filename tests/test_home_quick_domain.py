@@ -20,6 +20,7 @@ from test_web_studio import server as server_fixture
 from kantoku.capabilities import creative
 from kantoku.config import ToolError
 from kantoku.config.settings import TextTokenPricing
+from kantoku.core import budget
 from kantoku.core.conversations import InteractionMode
 from kantoku.core.runtime.graph import RuntimeContext
 from kantoku.core.runtime.models import ArtifactType, ExecutionStatus
@@ -256,27 +257,26 @@ def _workspace_production_request(
         })
     return {"production_project_id": project_id, "director_version": spec["version"],
             "expected_project_version": app.comic_projects.get(project_id).project.current_version,
-            "conversation_id": cid, "request_id": "workspace-single-submit"}
+            "conversation_id": cid, "request_id": "workspace-single-submit",
+            "approval_required": True}
 
 
 def test_confirmed_workspace_enters_shared_image_pipeline_and_persists_artifact(
     app: web_studio.StudioApplication, production: list[str],
 ) -> None:
     request = _workspace_production_request(app)
+    director_calls = list(production)
     run = app.create_core_run({"domain": "comic", "state": request})
-    assert run["status"] == "waiting" and run["current_node"] == "cost_approval"
+    assert run["status"] == "completed"
     duplicate = app.create_core_run({"domain": "comic", "state": request})
     assert duplicate["id"] == run["id"]
-    director_calls = list(production)
-    approval = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    app.decide_core_approval(approval.id, "approve", {})
     current = app._run_payload(run["id"])
-    assert current["status"] == "waiting" and current["current_node"] == "human_review"
+    assert current["status"] == "completed"
     assert production == director_calls + ["storyboard", "prompt"]
     assert current["state"]["image_path"]
     assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
-    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
-    app.decide_core_approval(qc.id, "approve", {})
+    assert app.runtime_store.approval_for_node(run["id"], "cost_approval") is None
+    assert app.runtime_store.approval_for_node(run["id"], "human_review") is None
     final = app._run_payload(run["id"])
     assert final["status"] == "completed"
     # Compilation has advanced project versions; a lost HTTP response still
@@ -289,7 +289,7 @@ def test_confirmed_workspace_enters_shared_image_pipeline_and_persists_artifact(
     assert artifact.conversation_id == request["conversation_id"]
     children = [item for item in app.runtime_store.list_runs()
                 if item.state.get("parent_run_id") == run["id"]]
-    assert children and all(item.state["execution_mode"] == "professional" for item in children)
+    assert children and all(item.state["execution_mode"] == "fast" for item in children)
 
 
 def test_workspace_unconfirmed_or_cross_conversation_cannot_submit_image(
@@ -336,7 +336,7 @@ def test_http_workspace_production_uses_real_run_endpoint(
         parents = [run for run in app.runtime_store.list_runs()
                    if run.workflow == "comic.production.v1"]
         assert len(parents) == 1
-        assert result["current_node"] == "cost_approval"
+        assert result["status"] == "completed" and result["state"]["image_artifact_id"]
     finally:
         connection.close()
 
@@ -743,18 +743,16 @@ def test_professional_explicit_automatic_policy_accepts_advice_without_confirmat
     spec = app.comic_projects.get_director(request["production_project_id"])
     assert not app.comic_projects.director_confirmed(spec)
     run = app.create_core_run({"domain": "comic", "state": request})
-    assert run["current_node"] == "cost_approval"
+    assert run["status"] == "completed"
     with pytest.raises(ToolError, match="请求 ID 已绑定"):
         app.create_core_run({"domain": "comic", "state": {
             **request, "approval_required": True,
         }})
-    cost = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    app.decide_core_approval(cost.id, "approve", {})
     generated = app._run_payload(run["id"])
-    assert generated["current_node"] == "human_review" and generated["state"]["image_path"]
+    assert generated["status"] == "completed" and generated["state"]["image_path"]
     assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
-    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
-    app.decide_core_approval(qc.id, "approve", {})
+    assert app.runtime_store.approval_for_node(run["id"], "cost_approval") is None
+    assert app.runtime_store.approval_for_node(run["id"], "human_review") is None
     assert app._run_payload(run["id"])["state"]["image_artifact_id"]
     saved = app.comic_projects.get_director(spec.project_id)
     assert saved.critic_result.verdict == "needs_revision"
@@ -768,6 +766,149 @@ def test_explicit_human_director_review_still_requires_confirmation(
     with pytest.raises(ToolError, match="先确认"):
         app.create_core_run({"domain": "comic", "state": request})
     assert "prompt" not in production
+
+
+def test_workspace_default_policy_has_no_user_approval_or_raw_director_message(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    request = _workspace_production_request(app, confirm=False)
+    request.pop("approval_required")
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["status"] == "completed" and run["state"]["image_artifact_id"]
+    assert not [item for item in app.runtime_store.list_approvals()
+                if item.run_id == run["id"] and item.decision.value == "pending"]
+    summary = run["image_execution"]
+    assert summary["actual_fen"] == 30 and summary["billing_status"] == "settled"
+    assert summary["started_at"] and summary["finished_at"]
+    assert not summary["can_regenerate"]
+    assert not any("director_spec" in item["content"]
+                   for item in app.conversation(request["conversation_id"])["messages"])
+
+
+def test_workspace_rejected_image_can_regenerate_without_deleting_history(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    from loguru import logger
+
+    from kantoku.config import logging_setup
+
+    provider = app.image_service.provider
+    original = provider.submit
+    attempts = []
+
+    def reject(**kwargs):
+        attempts.append(kwargs["client_request_id"])
+        try:
+            raise ValueError("explicit offline invalid request")
+        except ValueError as cause:
+            error = ToolError("explicit offline provider rejected request")
+            error.status_code = 400
+            raise error from cause
+
+    monkeypatch.setattr(provider, "submit", reject)
+    monkeypatch.setattr(logging_setup, "LOG_DIR", tmp_path / "logs")
+    request = _workspace_production_request(app)
+    try:
+        logging_setup.setup_logging("INFO")
+        failed = app.create_core_run({"domain": "comic", "state": request})
+    finally:
+        logger.remove()
+    assert failed["status"] == "failed" and failed["current_node"] == "generate"
+    assert failed["image_execution"]["can_regenerate"]
+    failure = budget.load_generation_result(failed["state"]["request_id"])
+    for content in (capsys.readouterr().err,
+                    (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8")):
+        for expected in (failure.error_id, failed["state"]["trace_id"], failed["id"],
+                         "ValueError", "test_home_quick_domain.py", "image_gen.py",
+                         "Traceback", "image_generation_failed"):
+            assert expected in content
+    calls = list(production)
+    creation = failed["state"]["quick_creation"]
+    shot = app.comic_storyboards.get_shot(creation["shot_id"])
+    prompt = app.comic_prompts.get(shot.shot_id)
+    edited_text = prompt.positive_prompt + "\n用户修改：保留主体，背景更简洁。"
+    app.edit_comic_prompt(shot.shot_id, {
+        "expected_project_version": app.comic_projects.get(
+            request["production_project_id"]).project.current_version,
+        "expected_version": prompt.version,
+        "draft": {"director_summary": prompt.director_summary,
+                  "positive_prompt": edited_text, "negative_prompt": prompt.negative_prompt},
+    })
+    edited = app.comic_prompts.get(shot.shot_id)
+    assert edited.version == prompt.version + 1
+    assert app.comic_prompts.get(shot.shot_id, version=prompt.version) == prompt
+    submitted_prompts = []
+
+    def accept(**kwargs):
+        submitted_prompts.append(kwargs["prompt"])
+        return original(**kwargs)
+
+    monkeypatch.setattr(provider, "submit", accept)
+    regenerated = app.create_core_run({"domain": "comic", "state": {
+        **request, "request_id": "user-regenerate",
+        "expected_project_version": app.comic_projects.get(
+            request["production_project_id"]).project.current_version,
+        "shot_id": shot.shot_id, "shot_version": shot.version,
+        "prompt_version": edited.version,
+    }})
+    assert regenerated["status"] == "completed" and production == calls
+    assert regenerated["id"] != failed["id"]
+    assert app.runtime_store.get_run(failed["id"]).status is ExecutionStatus.FAILED
+    assert len(attempts) == 1 and provider.submit_count == 1
+    assert submitted_prompts == [edited_text]
+    assert budget.get_reservation(failed["state"]["request_id"]).status == "released"
+
+
+@pytest.mark.parametrize("has_job", [False, True])
+def test_workspace_unknown_image_only_queries_original_never_resubmits(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, has_job: bool,
+) -> None:
+    from kantoku.schemas.media import ImageGenerationResult
+
+    provider = app.image_service.provider
+    query = provider.query
+    if has_job:
+        monkeypatch.setattr(provider, "query", lambda job: ImageGenerationResult(
+            status="unknown", provider_job_id=job, error="offline still processing"))
+    else:
+        def unknown(**_kwargs):
+            raise ConnectionError("offline submit outcome unknown")
+        monkeypatch.setattr(provider, "submit", unknown)
+    request = _workspace_production_request(app)
+    waiting = app.create_core_run({"domain": "comic", "state": request})
+    assert waiting["status"] == "waiting" and waiting["current_node"] == "generate"
+    assert waiting["image_execution"]["can_resume"] is has_job
+    assert waiting["image_execution"]["needs_reconciliation"] is not has_job
+    assert not waiting["image_execution"]["can_regenerate"]
+    calls = list(production)
+    with pytest.raises(ToolError, match="不能重新提交"):
+        app.create_core_run({"domain": "comic", "state": {
+            **request, "request_id": "must-not-resubmit",
+            "expected_project_version": app.comic_projects.get(
+                request["production_project_id"]).project.current_version,
+        }})
+    monkeypatch.setattr(provider, "query", query)
+    restored = app.resume_core_run(waiting["id"])
+    assert restored["id"] == waiting["id"] and production == calls
+    assert restored["status"] == ("completed" if has_job else "waiting")
+    assert provider.submit_count == int(has_job)
+
+
+@pytest.mark.parametrize("pricing", ["missing", "over_limit"])
+def test_confirmed_workspace_keeps_budget_guard_without_payment_ui(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, pricing: str,
+) -> None:
+    request = _workspace_production_request(app)
+    before = list(production)
+    monkeypatch.setattr(app, "_quick_creation_cost", lambda *_args, **_kwargs:
+                        (2001, []) if pricing == "over_limit" else (30, ["unknown-model"]))
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["status"] == "failed" and production == before
+    assert app.runtime_store.approval_for_node(run["id"], "cost_approval") is None
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
 
 
 @pytest.mark.parametrize("mode", ["fast", "professional"])
@@ -784,7 +925,7 @@ def test_workspace_confirmed_director_transitions_to_storyboard_then_real_artifa
     )
     project_id = request["production_project_id"]
     before = list(production)
-    # The professional production endpoint defaults to requiring human consent.
+    # Explicit professional director consent is separate from automatic image billing.
     with pytest.raises(ToolError):
         app.create_core_run({"domain": "comic", "state": request})
     assert production == before and "storyboard" not in production
@@ -816,17 +957,15 @@ def test_workspace_confirmed_director_transitions_to_storyboard_then_real_artifa
     child = next(run for run in app.runtime_store.list_runs() if run.workflow == "comic.director")
     assert app._comic_director_result(child)["director_spec"]["approval"]["status"] == "approved"
     run = app.create_core_run({"domain": "comic", "state": request})
-    assert run["current_node"] == "cost_approval"
-    cost = app.runtime_store.approval_for_node(run["id"], "cost_approval")
-    app.decide_core_approval(cost.id, "approve", {})
+    assert run["status"] == "completed"
     current = app._run_payload(run["id"])
-    assert current["current_node"] == "human_review"
+    assert current["state"]["image_path"]
     assert production == before + ["storyboard", "prompt"]
     assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
     assert any(item.payload.get("kind") == "storyboard_started"
                for item in app.runtime_store.list_events(run["id"]))
-    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
-    app.decide_core_approval(qc.id, "approve", {})
+    assert app.runtime_store.approval_for_node(run["id"], "cost_approval") is None
+    assert app.runtime_store.approval_for_node(run["id"], "human_review") is None
     final = app._run_payload(run["id"])
     assert final["status"] == "completed"
     image = app.runtime_store.get_artifact(final["state"]["image_artifact_id"])

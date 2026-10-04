@@ -132,6 +132,11 @@ export interface CoreRun {
   error: string | null
   cost_fen: number
   nodes: NodeExecution[]
+  image_execution?: {
+    provider: string; model: string; actual_fen: number | null; billing_status: string
+    started_at: string | null; finished_at: string | null
+    can_regenerate: boolean; can_resume: boolean; needs_reconciliation: boolean
+  }
 }
 
 export interface CoreApproval {

@@ -17,6 +17,11 @@ Kantoku 是 **AI Production Supervisor**。用户用自然语言提出需求，�
 
 同一领域可分别采用 `execution_mode=fast` 或 `execution_mode=professional`；两者复用 Domain、Workflow、Provider、Artifact、Budget 与 Logging。模式决定交互和必要的审批策略，不代表另建一套能力，也不能把尚未接入的供应商能力伪装成已完成。
 
+Comic/Studio 的普通创作面向实时交付，默认自动完成可执行的图片生产，不依赖 Task Center 的费用或方案批准。
+Comic 用户主动选择专业导演模式并开启人工审核时，才要求编辑/确认导演草稿；确认后的生产仍在当前工作区完成。
+Task Center 保留长期任务管理职责，Commerce 原有批量、预算审批与发布审核不因此改变。
+自动执行不是取消预算保护：缺少定价、超出配置额度、硬约束冲突或账单未知必须明确停止，不能假装完成或重复提交。
+
 功能按钮选择的是**领域上下文和交互策略**，不是能力开关。进入创作域后仍须判断本次请求是聊天、图片、视频，还是完整领域生产；一句话不应自动等于启动整个 Workflow。
 
 ## Conversation 与任务分流

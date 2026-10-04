@@ -275,7 +275,9 @@ def test_invalid_request_never_reaches_paid_endpoint(tmp_path: Path) -> None:
     client.images.generate.assert_not_called()
 
 
-@pytest.mark.parametrize("model", ["qwen-image-3.0", "qwen-image-2.0-pro", "future-model-id"])
+@pytest.mark.parametrize("model", [
+    "qwen-image-3.0", "qwen-image-2.0-pro", "qwen-image-2.1-pro", "future-model-id",
+])
 @pytest.mark.parametrize("protocol", ["openai-compatible", "dashscope-multimodal"])
 @pytest.mark.parametrize("use_reference", [False, True])
 def test_qwen_model_is_configured_and_protocol_controls_wire_format(

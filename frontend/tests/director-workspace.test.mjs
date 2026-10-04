@@ -95,7 +95,7 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /class="director-flow" aria-label="导演流程"/)
   assert.match(view, /navOpen = ref\(!window.matchMedia/)
   assert.match(view, /inspectorOpen = ref\(false\)/)
-  assert.match(view, /:disabled="!confirmed"/)
+  assert.match(view, /manualDirectorApproval && !confirmed/)
   assert.match(view, /id: 'conversation', label: '对话'/)
   assert.match(view, /id: 'director', label: '导演'/)
   assert.match(view, /id: 'storyboard', label: '分镜'/)
@@ -120,17 +120,17 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
 
 test('confirmed workspace submits version-bound production through existing Run API', () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
-  assert.match(view, /async function generateImage\(\)/)
+  assert.match(view, /async function generateImage\(newGeneration = false\)/)
   assert.match(view, /if \(!productionEligible\.value/)
-  assert.match(view, /const manualDirectorApproval = ref\(true\)/)
+  assert.match(view, /const manualDirectorApproval = ref\(false\)/)
   assert.match(view, /approval_required: manualDirectorApproval\.value/)
   assert.match(view, /manualDirectorApproval\.value && !confirmed\.value/)
   assert.match(view, /createRun\('comic', \{/)
   assert.match(view, /production_project_id: project\.value\.project\.project_id/)
   assert.match(view, /director_version: spec\.value\.version/)
   assert.match(view, /request_id: productionRequests\.get\(key\)/)
-  assert.match(view, /@click="generateImage"/)
-  assert.match(view, /name: 'tasks', tab: 'waiting'/)
+  assert.match(view, /@click="generateImage\(\)"/)
+  assert.doesNotMatch(view, /name: 'tasks', tab: 'waiting'/)
   assert.doesNotMatch(view, /provider\.submit|images\/generations/)
 })
 
@@ -291,8 +291,8 @@ test('automatic workspace submits one durable production Run, not a director-onl
   })
   assert.equal(state.productionRun.value.id, 'production')
   assert.equal(state.pendingText.value, '')
-  assert.match(view, /manualDirectorApproval = ref\(true\)/)
-  assert.match(view, /manualDirectorApproval.value = !latest \|\| !productionRun.value/)
+  assert.match(view, /manualDirectorApproval = ref\(false\)/)
+  assert.match(view, /manualDirectorApproval.value = !!latest && \(!productionRun.value/)
   assert.match(view, /v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'"/)
   assert.match(view, /productionRun.value.id\), getEvents\(productionRun.value.id\)/)
   assert.match(view, /if \(run\) runs.value\[run.id\] = run/)
@@ -327,4 +327,42 @@ test('professional confirmation enables a persistent transition to storyboard, n
   assert.match(production, /productionRun.value = run/)
   assert.match(production, /openSection\('storyboard'\)/)
   assert.doesNotMatch(production, /navigate\(\{ name: 'task_run'/)
+})
+
+test('ordinary mode is automatic; explicit Professional keeps director consent only', () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  assert.match(view, /manualDirectorApproval = ref\(false\)/)
+  assert.match(view, /manualDirectorApproval.value = value === 'professional'/)
+  assert.match(view, /const executionLabel = computed\(\(\) => hasRunning\.value/)
+  assert.match(view, /busy\.value \? '正在处理当前操作'/)
+  assert.match(view, /v-if="mode === 'professional'" class="toolbar-mode"/)
+  assert.doesNotMatch(view, /处理制作审批|name: 'tasks'/)
+  assert.match(view, /quickDirectorMessage\(item.content\)/)
+  assert.match(view, /imageExecution.actual_fen === null \? '待结算/)
+})
+
+test('regenerate is explicit new generation; unknown recovery only resumes the same run', async () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const source = view.slice(view.indexOf('async function recoverImage'), view.indexOf('function editImagePrompt'))
+  const code = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+  const ref = value => ({ value })
+  const actions = []
+  const state = { imageExecution: ref({ can_regenerate: false }), productionRun: ref({ id: 'original' }),
+    busy: ref(false), hasRunning: ref(false), error: ref(''), productionEligible: ref(true) }
+  const result = new Function('state', 'actions', `const {${Object.keys(state).join(',')}}=state;
+    const conversationEpoch=1; async function generateImage(isNew){actions.push(['new',isNew])};
+    async function resumeRun(id){actions.push(['resume',id]);return {id}};
+    async function refresh(){}; function failureText(e){return String(e)}; ${code};
+    return { recoverImage,regenerateImage }`)(state, actions)
+  await result.regenerateImage()
+  assert.deepEqual(actions, [])
+  await result.recoverImage()
+  assert.deepEqual(actions, [['resume', 'original']])
+  state.imageExecution.value.can_regenerate = true
+  await result.regenerateImage()
+  assert.deepEqual(actions, [['resume', 'original'], ['new', true]])
+  assert.match(view, /if \(newGeneration\) productionRequests.delete\(key\)/)
+  assert.match(view, /request_id: productionRequests.get\(key\)/)
+  assert.match(view, /prompt_version: promptVersion/)
+  assert.match(view, /保存为新版本/)
 })

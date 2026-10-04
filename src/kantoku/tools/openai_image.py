@@ -243,6 +243,9 @@ class OpenAIImageProvider:
         error_name: str | None = None
         response_request_id: str | None = None
         try:
+            logger.bind(component="image-provider", provider=self.settings.provider,
+                        model=self.model_id, base_url=self.settings.base_url,
+                        request_id=client_request_id).info("provider_request_sent")
             response = self._generate_response(
                 prompt=prompt, reference_urls=reference_urls, client_request_id=client_request_id,
             )
@@ -252,7 +255,7 @@ class OpenAIImageProvider:
                 base_url=self.settings.base_url, request_id=client_request_id,
                 provider_request_id=response_request_id or "-",
                 latency_ms=max(0, round((perf_counter() - started_at) * 1000)),
-            ).info("image response received; validating and persisting artifact data")
+            ).info("provider_response_received; validating and persisting artifact data")
             data = getattr(response, "data", None)
             if not isinstance(data, list) or len(data) != 1:
                 raise ToolError("生图接口未返回唯一图片，费用需要人工对账")

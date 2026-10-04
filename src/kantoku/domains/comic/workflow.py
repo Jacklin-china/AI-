@@ -90,6 +90,8 @@ def build_comic_workflow(
         )
         update["image_artifact_id"] = artifact.id
         logger.bind(run_id=context.run_id, task_id=state.request_id,
+                    trace_id=state.trace_id, artifact_id=artifact.id).info("artifact_saved")
+        logger.bind(run_id=context.run_id, task_id=state.request_id,
                     trace_id=state.trace_id, artifact_id=artifact.id).info(
             "image_generation_completed artifact_id={}", artifact.id,
         )

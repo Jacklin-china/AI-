@@ -105,6 +105,9 @@ export function compileComicPrompt(id: string, projectVersion: number, shotVersi
     expected_project_version: projectVersion, expected_shot_version: shotVersion,
   })
 }
+export function saveComicPrompt(id: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/shots/${encodeURIComponent(id)}/prompt`, body, 'PUT')
+}
 
 const API_BASE = (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, '')
   ?? (import.meta.env.DEV ? 'http://127.0.0.1:8000' : '')
@@ -181,10 +184,10 @@ async function coreGet<T>(path: string, key: string): Promise<T | null> {
   }
 }
 
-async function corePost<T>(path: string, body: Record<string, unknown> = {}): Promise<T> {
+async function corePost<T>(path: string, body: Record<string, unknown> = {}, method: 'POST' | 'PUT' = 'POST'): Promise<T> {
   await ensureToken()
   const response = await fetch(api(path), {
-    method: 'POST',
+    method,
     headers: { 'Content-Type': 'application/json', 'X-Studio-Token': token },
     body: JSON.stringify(body),
   })
