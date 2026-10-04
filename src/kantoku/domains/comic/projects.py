@@ -513,16 +513,43 @@ class ComicProjectStore:
                 "spec_id": spec.spec_id, "version": spec.version,
                 "brief_version": spec.creative_brief_version}
 
-    def require_confirmed_director(self, spec: DirectorSpec) -> None:
+    def human_director_confirmed(self, spec: DirectorSpec) -> bool:
+        if self.runtime_store is None:
+            return False
+        return any(
+            approval.decision is ApprovalDecision.APPROVE
+            and approval.request == self._confirmation_request(spec)
+            and approval.response.get("human_review") is True
+            for approval in self.runtime_store.list_approvals()
+        )
+
+    def require_confirmed_director(self, spec: DirectorSpec, *, human_review: bool = False) -> None:
         from .critic import require_approved_director
 
-        require_approved_director(spec)
-        if not self.director_confirmed(spec):
+        require_approved_director(spec, allow_advisory=not human_review
+                                  and self.advisory_authorized(spec))
+        confirmed = self.human_director_confirmed(spec) if human_review \
+            else self.director_confirmed(spec)
+        if not confirmed:
             raise ToolError("请先确认当前导演方案，才能进入下一步")
+
+    def advisory_authorized(self, spec: DirectorSpec) -> bool:
+        """Only a durable, version-bound server production authorization accepts advice."""
+        if self.runtime_store is None:
+            return False
+        return any(
+            approval.decision is ApprovalDecision.APPROVE
+            and approval.request == self._confirmation_request(spec)
+            and approval.response.get("allow_advisory") is True
+            and approval.response.get("human_review") is False
+            and bool(approval.response.get("production_run_id"))
+            for approval in self.runtime_store.list_approvals()
+        )
 
     def confirm_director(self, project_id: str, *, version: int,
                          expected_project_version: int,
-                         automatic_run_id: str | None = None) -> DirectorSpec:
+                         automatic_run_id: str | None = None,
+                         allow_advisory: bool = False) -> DirectorSpec:
         from .critic import require_approved_director
 
         # 与保存/分叉共用写锁，不能在确认过程中将旧方案标为当前。
@@ -538,11 +565,15 @@ class ComicProjectStore:
             if (spec.version != version
                     or spec.creative_brief_version != snapshot.creative_brief.version):
                 raise ToolError("只能确认当前 Brief 下的当前导演版本")
-            require_approved_director(spec)
+            if allow_advisory and not automatic_run_id:
+                raise ToolError("建议性审核放行必须绑定真实生产 Run")
+            require_approved_director(spec, allow_advisory=allow_advisory)
             if self.runtime_store is None:
                 raise ToolError("导演确认尚未绑定现有 Runtime")
             # 审批库可能与作品库是同一 SQLite，先持有写锁验证，再提交后写审批。
-        if not self.director_confirmed(spec):
+        confirmed = self.director_confirmed(spec) if automatic_run_id \
+            else self.human_director_confirmed(spec)
+        if not confirmed:
             run = self.runtime_store.create_run(
                 "comic", "comic.director.confirmation", {"project_id": project_id,
                   "director_spec_version": version}, "director_confirmation",
@@ -553,9 +584,12 @@ class ComicProjectStore:
                 run.id, "director_confirmation", self._confirmation_request(spec),
             )
             self.runtime_store.decide_approval(approval.id, ApprovalDecision.APPROVE, {
-                "authorization": "fast_creation_policy" if automatic_run_id
+                "authorization": ("fast_creation_policy" if self.runtime_store.get_run(
+                    automatic_run_id).state.get("execution_mode") == "fast"
+                    else "production_policy") if automatic_run_id
                 else "user_confirmation", "production_run_id": automatic_run_id,
                 "human_review": not bool(automatic_run_id),
+                "allow_advisory": allow_advisory,
             })
             self.runtime_store.update_run(run.id, status=ExecutionStatus.COMPLETED,
                                           state=run.state, current_node="director_confirmation")

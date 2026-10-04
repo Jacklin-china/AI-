@@ -1007,12 +1007,13 @@ class StudioApplication:
         request = creation["original_request"]
         with request_trace(state.trace_id or f"trace-{context.run_id}"), _comic_model_policy(state):
             if step == "director":
-                if creation.get("use_confirmed_director"):
+                if creation.get("use_confirmed_director") or creation.get("use_existing_director"):
                     spec = self.comic_projects.get_director(project_id)
-                    if (not self.comic_projects.director_confirmed(spec)
-                            or spec.version != creation["director_spec_version"]):
+                    if spec.version != creation["director_spec_version"]:
                         raise ToolError("已确认导演版本发生变化，未调用生图")
-                    return {"quick_creation": {**creation, "director_status": "completed"}}
+                    if creation.get("use_confirmed_director"):
+                        self.comic_projects.require_confirmed_director(spec, human_review=True)
+                    return {}
                 existing = next((run for run in self.runtime_store.list_runs(
                     conversation_id=state.conversation_id,
                 ) if run.workflow == "comic.director"
@@ -1068,9 +1069,49 @@ class StudioApplication:
                     )
                 return {"quick_creation": creation}
             if step == "director_gate":
+                automatic = bool(creation.get("auto_create_image") or (
+                    creation.get("use_existing_director")
+                    and creation.get("approval_required") is False))
+                if automatic:
+                    try:
+                        spec = self.comic_projects.get_director(project_id)
+                        if spec.version != creation.get("director_spec_version"):
+                            raise ToolError("自动制作来源版本变化，未调用生图")
+                        self.confirm_comic_director(project_id, {
+                            "version": spec.version,
+                            "expected_project_version": self.comic_projects.get(
+                                project_id).project.current_version,
+                        }, automatic_run_id=context.run_id)
+                    except ToolError as error:
+                        # Preserve the real child error ID when review execution failed.
+                        child_id = creation.get("director_run_id")
+                        child = self.runtime_store.get_run(child_id) if child_id else None
+                        if child and child.state.get("error_id"):
+                            error._kantoku_public_failure = {
+                                "error_id": child.state["error_id"],
+                                "trace_id": child.state.get("trace_id", state.trace_id),
+                                "safe_message": error.message, "error_kind": "fatal",
+                                "retryable": False,
+                            }
+                        raise
+                    creation["director_decision"] = "approve"
+                    creation["approval_required"] = False
+                    context.store.append_event(
+                        context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                        payload={"kind": "director_auto_accepted", "project_id": project_id,
+                                 "director_version": spec.version, "human_review": False,
+                                 "critic_result": spec.critic_result.model_dump(mode="json")
+                                 if spec.critic_result else None},
+                    )
+                    logger.bind(project_id=project_id, run_id=context.run_id,
+                                director_version=spec.version).info(
+                        "director_gate auto_accept critic_verdict={}",
+                        spec.critic_result.verdict if spec.critic_result else "legacy",
+                    )
+                    return {"quick_creation": creation}
                 if creation.get("use_confirmed_director"):
                     spec = self.comic_projects.get_director(project_id)
-                    if (not self.comic_projects.director_confirmed(spec)
+                    if (not self.comic_projects.human_director_confirmed(spec)
                             or spec.version != creation["director_spec_version"]):
                         raise ToolError("导演确认门禁未通过：版本已变化，未调用生图")
                     return {"quick_creation": {**creation, "director_decision": "approve"}}
@@ -1123,19 +1164,8 @@ class StudioApplication:
                 if director_run.status is ExecutionStatus.FAILED:
                     raise ToolError("导演执行失败，未进入制作", detail=director_run.error)
                 if director_run.status is not ExecutionStatus.COMPLETED:
-                    if creation.get("auto_create_image"):
-                        review = self._comic_fast_director_review(state)
-                        error = ToolError(review["message"])
-                        if review.get("error_id"):
-                            error._kantoku_public_failure = {
-                                "error_id": review["error_id"], "trace_id": review["trace_id"],
-                                "safe_message": review["message"], "error_kind": "fatal",
-                                "retryable": False,
-                            }
-                        raise error
                     raise ExternalJobPending("导演草稿需要修订；原方案和 Trace 已保存，未调用生图")
-                automatic = bool(creation.get("auto_create_image"))
-                if not automatic and context.approval_decision is not ApprovalDecision.APPROVE:
+                if context.approval_decision is not ApprovalDecision.APPROVE:
                     raise ExternalJobPending("等待确认当前导演方案，未调用生图")
                 spec = self.comic_projects.get_director(project_id)
                 approval = context.store.approval_for_node(context.run_id, step)
@@ -1147,14 +1177,13 @@ class StudioApplication:
                     "expected_project_version": self.comic_projects.get(
                         project_id,
                     ).project.current_version,
-                }, automatic_run_id=context.run_id if automatic else None)
+                })
                 creation["director_spec_version"] = spec.version
                 creation["director_decision"] = "approve"
                 context.store.append_event(
                     context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
                     payload={"kind": "director_confirmed", "director_version": spec.version,
-                             "authorization": "fast_creation_policy" if automatic
-                             else "user_confirmation", "human_review": not automatic},
+                             "authorization": "user_confirmation", "human_review": True},
                 )
                 return {"quick_creation": creation}
             if step == "storyboard":
@@ -2876,6 +2905,7 @@ class StudioApplication:
                 snapshot=snapshot, director=director, storyboard=storyboard,
                 shot=current_shot, assets=assets, model_target=model_target,
                 model_call=self._comic_storyboard_model,
+                allow_advisory=self.comic_projects.advisory_authorized(director),
             )
             progress("checking", "prompt_compiled")
             run_id = current_run_id()
@@ -2964,7 +2994,7 @@ class StudioApplication:
 
     def _comic_director_spec_payload(self, spec) -> dict[str, Any]:
         return {**spec.model_dump(mode="json"),
-                "user_confirmed": self.comic_projects.director_confirmed(spec)}
+                "user_confirmed": self.comic_projects.human_director_confirmed(spec)}
 
     def _comic_director_bindings(self, project_id: str, spec) -> dict[str, Any]:
         """只定位该修订的来源身份；不得从最近失败任务猜测镜头或故事。"""
@@ -2984,17 +3014,16 @@ class StudioApplication:
     def confirm_comic_director(
         self, project_id: str, data: dict[str, Any], *, automatic_run_id: str | None = None,
     ) -> dict[str, Any]:
-        # Internal Fast policy only; HTTP data cannot grant automatic authorization.
+        # Internal production policy only; HTTP confirmation cannot grant this authority.
         if automatic_run_id:
             production = self.runtime_store.get_run(automatic_run_id)
             creation = production.state.get("quick_creation") or {}
             if (production.workflow != COMIC_WORKFLOW_ID
-                    or self.runtime_store.get_conversation(
-                        production.state["conversation_id"],
-                    ).interaction_mode is not InteractionMode.AUTONOMOUS
-                    or production.state.get("execution_mode") != "fast"
                     or not production.state.get("confirmed")
-                    or not creation.get("auto_create_image")
+                    or not (creation.get("auto_create_image") or (
+                        creation.get("use_existing_director")
+                        and creation.get("approval_required") is False))
+                    or production.current_node != "director_gate"
                     or creation.get("project_id") != project_id
                     or creation.get("director_spec_version") != data.get("version")):
                 raise ToolError("快速制作授权与当前任务不匹配，未进入生图")
@@ -3014,6 +3043,7 @@ class StudioApplication:
             project_id, version=request.version,
             expected_project_version=request.expected_project_version,
             automatic_run_id=automatic_run_id,
+            allow_advisory=bool(automatic_run_id),
         ))
 
     def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:
@@ -3057,13 +3087,16 @@ class StudioApplication:
         return self._run_payload(run.id)
 
     def _start_comic_project_production(self, data: dict[str, Any]) -> dict[str, Any]:
-        """Submit a confirmed workspace revision to the SAME production graph as Home."""
+        """Submit a bound workspace revision to the SAME production graph as Home."""
         project_id = str(data["production_project_id"])
         conversation_id = str(data.get("conversation_id") or "")
         self.runtime_store.get_conversation(conversation_id)
         message_id = str(data.get("request_id") or "").strip()
         if not message_id or len(message_id) > 100:
             raise ToolError("制作请求必须携带唯一 request_id")
+        approval_required = data.get("approval_required", False)
+        if not isinstance(approval_required, bool):
+            raise ToolError("approval_required 必须是布尔值")
         # Check the submitted revision before reading CURRENT versions: compilation
         # may already have advanced the project while the HTTP response was lost.
         existing = next((run for run in self.runtime_store.list_runs(
@@ -3075,12 +3108,19 @@ class StudioApplication:
             if (bound.get("project_id") != project_id
                     or bound.get("director_spec_version") != data.get("director_version")
                     or bound.get("requested_shot_id") != data.get("shot_id")
-                    or bound.get("requested_shot_version") != data.get("shot_version")):
+                    or bound.get("requested_shot_version") != data.get("shot_version")
+                    or bound.get("approval_required", False)
+                    != approval_required):
                 raise ToolError("制作请求 ID 已绑定其他作品或导演/镜头版本")
             return self._run_payload(existing.id)
         snapshot = self.comic_projects.get(project_id)
         spec = self.comic_projects.get_director(project_id)
-        self.comic_projects.require_confirmed_director(spec)
+        if approval_required:
+            self.comic_projects.require_confirmed_director(spec, human_review=True)
+        else:
+            from kantoku.domains.comic.critic import require_approved_director
+
+            require_approved_director(spec, allow_advisory=True)
         if (data.get("expected_project_version") != snapshot.project.current_version
                 or data.get("director_version") != spec.version
                 or spec.creative_brief_version != snapshot.creative_brief.version):
@@ -3090,7 +3130,9 @@ class StudioApplication:
                   and run.state.get("project_id") == project_id]
         if not owners:
             raise ToolError("作品不属于当前创作会话，未调用生图")
-        source = {"project_id": project_id, "use_confirmed_director": True,
+        source = {"project_id": project_id, "use_confirmed_director": approval_required,
+                  "use_existing_director": not approval_required,
+                  "approval_required": approval_required,
                   "director_spec_version": spec.version,
                   "original_request": snapshot.creative_brief.original_request,
                   "input_brief_id": snapshot.creative_brief.brief_id,
@@ -3116,6 +3158,7 @@ class StudioApplication:
                 if any(bound.get(key) != source.get(key) for key in (
                     "project_id", "director_spec_version", "input_brief_id",
                     "input_brief_version", "requested_shot_id", "requested_shot_version",
+                    "approval_required",
                 )):
                     raise ToolError("制作请求 ID 已绑定其他作品或导演版本")
                 return self._run_payload(existing.id)

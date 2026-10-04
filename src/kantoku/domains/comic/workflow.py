@@ -5,6 +5,8 @@ from __future__ import annotations
 from collections.abc import Callable
 from typing import Any
 
+from loguru import logger
+
 from kantoku.capabilities.video import VideoGenerationRequest, VideoService
 from kantoku.config import ToolError, get_settings
 from kantoku.core.budget import attach_image_artifact
@@ -87,6 +89,10 @@ def build_comic_workflow(
             },
         )
         update["image_artifact_id"] = artifact.id
+        logger.bind(run_id=context.run_id, task_id=state.request_id,
+                    trace_id=state.trace_id, artifact_id=artifact.id).info(
+            "image_generation_completed artifact_id={}", artifact.id,
+        )
         if isinstance(service, StudioComicServices) and state.request_id is not None:
             attach_image_artifact(state.request_id, artifact.id)
         if state.conversation_id:
@@ -136,7 +142,9 @@ def build_comic_workflow(
             approval_when=lambda state: bool(state.quick_creation)
             and state.quick_creation.get("director_status") != "failed"
             and not state.quick_creation.get("auto_create_image")
-            and not state.quick_creation.get("use_confirmed_director"),
+            and not state.quick_creation.get("use_confirmed_director")
+            and not (state.quick_creation.get("use_existing_director")
+                     and state.quick_creation.get("approval_required") is False),
             approval_request=director_review_request or (lambda state: {
                 "kind": "director_review",
                 "director_version": (state.quick_creation or {}).get("director_spec_version"),

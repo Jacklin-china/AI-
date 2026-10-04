@@ -115,7 +115,9 @@ def test_unknown_submission_logs_full_cause_and_persists_error_id_without_resubm
     for content in (capsys.readouterr().err,
                     (tmp_path / "logs/kantoku.log").read_text(encoding="utf-8")):
         for fragment in ("ConnectionError", "test_image_gen.py", "image_gen.py", "Traceback",
-                         "run-image-error", "request-1", "configured-model", result.error_id):
+                         "run-image-error", "request-1", "configured-model", result.error_id,
+                         "image_generation_started", "prompt_hash=",
+                         "image_generation_failed provider_error="):
             assert fragment in content
 
 

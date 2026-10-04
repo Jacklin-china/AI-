@@ -123,7 +123,9 @@ def director_hash(spec: DirectorSpecDraft) -> str:
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
 
-def require_approved_director(spec: DirectorSpecDraft) -> None:
+def require_approved_director(
+    spec: DirectorSpecDraft, *, allow_advisory: bool = False,
+) -> None:
     """旧 v1 保持兼容；v2 必须有绑定当前方案的实际审核凭据。"""
     if spec.schema_version == 1:
         return
@@ -131,11 +133,21 @@ def require_approved_director(spec: DirectorSpecDraft) -> None:
         raise ToolError("摄影方案待修订，不能进入下一步")
     review = spec.critic_result
     if (
-        review is None or review.verdict != "pass"
+        review is None
         or review.review_version != REVIEW_VERSION
         or review.reviewed_spec_hash != director_hash(spec)
     ):
         raise ToolError("DirectorSpec v2 尚未通过当前方案的导演审核")
+    if review.verdict == "pass":
+        return
+    # Production policy may accept advice, never manufacture a Critic pass.
+    # Missing/failed review, immutable-input conflicts and incomplete plans still stop.
+    if (allow_advisory and review.verdict == "needs_revision"
+            and not any(item.severity == "error" or item.code in {
+                "REVIEW_EXECUTION_FAILED", "CINEMATOGRAPHY_INCOMPLETE",
+            } for item in review.findings)):
+        return
+    raise ToolError("DirectorSpec v2 尚未通过当前方案的导演审核：存在阻断问题或需要人工审核")
 
 
 class PublicFinding(BaseModel):

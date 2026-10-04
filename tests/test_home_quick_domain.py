@@ -236,7 +236,9 @@ def test_auto_quote_and_model_policy_never_use_unpriced_fallback(
     assert flags == [True, True, False]
 
 
-def _workspace_production_request(app: web_studio.StudioApplication) -> dict:
+def _workspace_production_request(
+    app: web_studio.StudioApplication, *, confirm: bool = True,
+) -> dict:
     cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
     snapshot = app.create_comic_project({"title": "雨夜少女",
                                        "brief": {"original_request": "中式修仙少女站在竹林"}})
@@ -246,10 +248,11 @@ def _workspace_production_request(app: web_studio.StudioApplication) -> dict:
         "conversation_id": cid, "creation_mode": "professional", "task": "中式修仙少女站在竹林",
     })
     spec = result["director_spec"]
-    app.confirm_comic_director(project_id, {
-        "version": spec["version"],
-        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
-    })
+    if confirm:
+        app.confirm_comic_director(project_id, {
+            "version": spec["version"],
+            "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+        })
     return {"production_project_id": project_id, "director_version": spec["version"],
             "expected_project_version": app.comic_projects.get(project_id).project.current_version,
             "conversation_id": cid, "request_id": "workspace-single-submit"}
@@ -678,6 +681,136 @@ def test_home_review_format_error_returns_real_error_id_without_director_dump(
     assert failures and "private-fragment" not in str(failures[-1].payload)
     assert failures[-1].payload["error_id"] == director.state["error_id"]
     assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+
+
+def _advisory_critic(app, monkeypatch):
+    original = app._comic_director_model
+
+    def review(messages):
+        if "findings 每项" not in messages[0]["content"]:
+            return original(messages)
+        return json.dumps({
+            "public_summary": "建议强化人物与环境的视觉关系。", "confidence": 0.9,
+            "findings": [{"code": "COMPOSITION_SUGGESTION", "severity": "warning",
+                          "field_path": "director_plan.visual_focus",
+                          "evidence": "竹林", "expected": "可增强环境比例",
+                          "suggested_action": "优化构图"}],
+            "suggested_patches": [],
+        }, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", review)
+
+
+@pytest.mark.parametrize("creative_request", [
+    "帮我生成中式少女站在竹林的卡通图片",
+    "帮我生成日本女优设乐夕日的卡通版图片",
+])
+def test_fast_advisory_critic_continues_to_image_without_faking_pass(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+    creative_request: str,
+) -> None:
+    _advisory_critic(app, monkeypatch)
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid, content=creative_request))
+    assert run["status"] == "completed"
+    creation = run["state"]["quick_creation"]
+    spec = app.comic_projects.get_director(creation["project_id"])
+    assert spec.critic_result.verdict == "needs_revision"
+    assert app.comic_projects.advisory_authorized(spec)
+    assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
+    assert production[-2:] == ["storyboard", "prompt"]
+    image = app.runtime_store.get_artifact(run["state"]["image_artifact_id"])
+    assert image.type is ArtifactType.IMAGE and image.conversation_id == cid
+    assert Path(image.location).is_file()
+    accepted = [event for event in app.runtime_store.list_events(run["id"])
+                if event.payload.get("kind") == "director_auto_accepted"]
+    assert accepted[0].payload["critic_result"]["verdict"] == "needs_revision"
+    assert not accepted[0].payload["human_review"]
+    restarted = web_studio.StudioApplication()
+    try:
+        restarted.comic_projects.require_confirmed_director(spec)
+    finally:
+        restarted.runner.close()
+
+
+def test_professional_default_accepts_advice_without_director_confirmation(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _advisory_critic(app, monkeypatch)
+    request = _workspace_production_request(app, confirm=False)
+    spec = app.comic_projects.get_director(request["production_project_id"])
+    assert not app.comic_projects.director_confirmed(spec)
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["current_node"] == "cost_approval"
+    with pytest.raises(ToolError, match="请求 ID 已绑定"):
+        app.create_core_run({"domain": "comic", "state": {
+            **request, "approval_required": True,
+        }})
+    cost = app.runtime_store.approval_for_node(run["id"], "cost_approval")
+    app.decide_core_approval(cost.id, "approve", {})
+    generated = app._run_payload(run["id"])
+    assert generated["current_node"] == "human_review" and generated["state"]["image_path"]
+    assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
+    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
+    app.decide_core_approval(qc.id, "approve", {})
+    assert app._run_payload(run["id"])["state"]["image_artifact_id"]
+    saved = app.comic_projects.get_director(spec.project_id)
+    assert saved.critic_result.verdict == "needs_revision"
+
+
+def test_explicit_human_director_review_still_requires_confirmation(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    request = _workspace_production_request(app, confirm=False)
+    request["approval_required"] = True
+    with pytest.raises(ToolError, match="先确认"):
+        app.create_core_run({"domain": "comic", "state": request})
+    assert "prompt" not in production
+
+
+def test_automatic_authorization_is_not_a_human_confirmation(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "autonomous"})["id"]
+    run = _run(_send(app, cid))
+    project_id = run["state"]["quick_creation"]["project_id"]
+    spec = app.comic_projects.get_director(project_id)
+    assert app.comic_projects.director_confirmed(spec)
+    assert not app.get_comic_director(project_id)["user_confirmed"]
+    with pytest.raises(ToolError, match="先确认"):
+        app.comic_projects.require_confirmed_director(spec, human_review=True)
+    app.confirm_comic_director(project_id, {
+        "version": spec.version,
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+    })
+    assert app.get_comic_director(project_id)["user_confirmed"]
+    app.comic_projects.require_confirmed_director(spec, human_review=True)
+
+
+def test_advisory_policy_does_not_accept_changed_hash_or_failed_review(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from kantoku.domains.comic.critic import require_approved_director
+    from kantoku.domains.comic.models import DirectorCriticFinding
+
+    _advisory_critic(app, monkeypatch)
+    request = _workspace_production_request(app, confirm=False)
+    spec = app.comic_projects.get_director(request["production_project_id"])
+    require_approved_director(spec, allow_advisory=True)
+    with pytest.raises(ToolError, match="尚未通过"):
+        require_approved_director(spec.model_copy(update={"lighting": "已修改"}),
+                                  allow_advisory=True)
+    for finding in (
+        DirectorCriticFinding(code="HARD_CONSTRAINT_CONFLICT", severity="error"),
+        DirectorCriticFinding(code="REVIEW_EXECUTION_FAILED", severity="warning"),
+    ):
+        altered = spec.model_copy(update={"critic_result": spec.critic_result.model_copy(
+            update={"findings": [finding]})})
+        with pytest.raises(ToolError):
+            require_approved_director(altered, allow_advisory=True)
+    with pytest.raises(ToolError):
+        app.comic_projects.require_confirmed_director(spec)
+    assert "prompt" not in production
 
 
 def test_selected_commerce_runs_existing_graph_not_normal_chat(

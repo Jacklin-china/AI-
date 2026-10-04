@@ -44,6 +44,7 @@ class BasePromptCompiler(Protocol):
         self, *, snapshot: ComicProjectSnapshot, director: DirectorSpec,
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
         model_target: str, model_call: Callable[[list[dict[str, str]]], str],
+        allow_advisory: bool = False,
     ) -> ComicPromptDraft: ...
 
 
@@ -59,8 +60,9 @@ class StructuredImagePromptCompiler:
         self, *, snapshot: ComicProjectSnapshot, director: DirectorSpec,
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
         model_target: str, model_call: Callable[[list[dict[str, str]]], str],
+        allow_advisory: bool = False,
     ) -> ComicPromptDraft:
-        require_approved_director(director)
+        require_approved_director(director, allow_advisory=allow_advisory)
         if director.schema_version == 2 and any(
             director.asset_versions.get(f"asset:{asset.asset_id}") != asset.version
             for asset in assets
@@ -155,7 +157,6 @@ class ComicPromptStore:
                 or snapshot.project.director_id is None):
             raise ToolError("导演方案已变化，请先创建当前方案的分镜")
         director = self.projects.get_director(shot.project_id)
-        require_approved_director(director)
         self.projects.require_confirmed_director(director)
         refs = [*shot.character_asset_versions, *shot.scene_asset_versions]
         if shot.style_version is not None:

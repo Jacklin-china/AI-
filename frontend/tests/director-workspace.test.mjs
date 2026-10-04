@@ -118,7 +118,10 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
 test('confirmed workspace submits version-bound production through existing Run API', () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
   assert.match(view, /async function generateImage\(\)/)
-  assert.match(view, /if \(!confirmed\.value/)
+  assert.match(view, /if \(!productionEligible\.value/)
+  assert.match(view, /const manualDirectorApproval = ref\(false\)/)
+  assert.match(view, /approval_required: manualDirectorApproval\.value/)
+  assert.match(view, /manualDirectorApproval\.value && !confirmed\.value/)
   assert.match(view, /createRun\('comic', \{/)
   assert.match(view, /production_project_id: project\.value\.project\.project_id/)
   assert.match(view, /director_version: spec\.value\.version/)

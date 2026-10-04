@@ -213,7 +213,7 @@ def _image_failure(
     run_id: str | None = None,
 ) -> dict[str, object]:
     identity = provider.generation_identity()
-    return public_error(
+    failure = public_error(
         error, component="image-generation", task_id=request_id,
         run_id=run_id or current_run_id() or "-", request_id=request_id,
         generation_request_id=request_id, provider_task_id=provider_job_id,
@@ -221,6 +221,12 @@ def _image_failure(
         base_url=identity.get("base_url", "-"), phase=phase,
         latency_ms=max(0, round((perf_counter() - started_at) * 1000)),
     )
+    logger.bind(task_id=request_id, run_id=run_id or current_run_id(),
+                provider=identity.get("provider", "unknown"), model=provider.model_id,
+                error_id=failure["error_id"], trace_id=failure["trace_id"]).error(
+        "image_generation_failed provider_error={} phase={}", failure["safe_message"], phase,
+    )
+    return failure
 
 
 def _record_result(
@@ -395,6 +401,9 @@ def gen_image(
         )
     started_at = perf_counter()
     try:
+        event.info("image_generation_started provider={} model={} prompt_hash={}",
+                   provider_name, provider.model_id,
+                   hashlib.sha256(prompt.encode("utf-8")).hexdigest())
         event.info("submit once")
         provider_job_id = provider.submit(
             prompt=prompt,

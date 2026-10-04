@@ -359,7 +359,9 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 
 ### 首页漫剧自动出图与专业确认（2026-10-03）
 
-- 新首页漫剧图片任务保存 `quick_creation.auto_create_image=true`，内部完成导演/真实 Critic/分镜/Prompt，再自动进入共享图片调用。通过审核的当前不可变修订由 Fast 执行策略授权，沿用 Core Approval，记录 production Run 与 `human_review=false`，不伪造用户确认。导演待修订、执行错误或 QC 不通过明确失败并保留来源/检查结果，不以确认卡掩盖失败。供应商真实异步等待/未知账单仍沿用查询/对账，不重提。旧待确认 Run 没有该标志，保留原版本确认语义；专业工作台继续人工编辑、审核与确认。
+- 新首页漫剧图片任务保存 `quick_creation.auto_create_image=true`，内部完成导演/真实 Critic/分镜/Prompt，再自动进入共享图片调用。Critic 的艺术建议（`needs_revision` 且无 error finding）不要求人工确认：生产策略为当前不可变修订生成 Core Approval，记录 production Run 与 `human_review=false/allow_advisory=true`，保留真实审核结论，不伪造 pass 或用户确认。硬约束/资产冲突、摄影缺失、审核执行失败、审核指纹或版本不匹配仍阻止生产。分镜与 Prompt 只接受绑定当前版本的策略授权；直接编译没有授权仍保持严格门禁。供应商真实异步等待/未知账单仍沿用查询/对账，不重提，QC 不通过不能交付。
+- 专业作品生产默认 `approval_required=false`，复用同一生产图，由服务端在 `director_gate` 授权当前导演版本；可设置 `approval_required=true` 保留人工导演确认。费用/QC 审批保持既有专业机制，首页预算限额不替代它们。相同 request_id 的重试必须保持作品、导演/镜头版本和审核策略不变。旧待确认 Run 没有自动标志，保留原确认语义。
+- 真实图片提交记录 `image_generation_started`（provider/model/prompt_hash），归档记录 `image_generation_completed`（artifact_id），异常记录 `image_generation_failed`（provider_error），沿用 trace/run/task/error ID 和脱敏完整 traceback；未知提交仍标记 unknown 并保留预算，不能因失败日志而重提。首页继续仅显示现有粒子加载、真实阶段映射进度和最终图片，不展示导演中间稿。
 - 首页自动 Comic 文本调用在该 worker 的 ContextVar 作用域使用共享 `chat(single_attempt=True)`：只使用已报价主模型，关闭文本自动重试和备用模型；报价同步按此策略计算。不能仅从报价删除未定价备用模型却仍允许调用它。视觉模型沿用原重试并包含在报价中；其他会话与专业模式不受这个局部策略影响。
 - 专业工作区“生成当前画面/镜头”通过现有 `/api/runs` 提交 `production_project_id`、project/director/shot 版本、conversation 与唯一 request_id。服务端核实当前已审核且已确认的修订及会话归属后，复用同一个 `comic.production.v1` 的分镜、Prompt、Image、QC、归档链；不再生成另一套 Director。专业费用/QC 审批仍在原任务界面处理，重试同一 request_id 返回原 Run。
 - 新首页快捷图片任务不将 DirectorSpec 中间数据写成聊天消息；公开结果留在原 Director Run/Trace 中。首页只展示状态、阶段粒子进度和真实图片/必要错误；历史 quick-director 消息在首页不展示长篇分析。专业节点仍投影可读公开字段。首页图片继续复用原预览/下载组件。
