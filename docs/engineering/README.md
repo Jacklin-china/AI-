@@ -368,3 +368,22 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 - 创意理解中的 hard_constraints 是输入 Brief 的只读投影，模型不得擅自新增或改写；输出适配层绑定原列表，原始用户需求继续进入导演、Critic 与 Prompt 上下文，不将空列表误解为可以忽略用户原文。
 - 粒子占位与图片同宽；百分比明确标为**阶段进度**，只由真实 Runtime 节点完成事件计算。供应商未提供细粒度进度时保持当前阶段百分比并显示真实等待秒数，不人为虚涨。100% 必须同时有 completed Run 和真实图片 URL。错误展示真实错误，不冒充完成。
 - 快捷选择发送后由 Run 保存执行上下文，输入框与下一条消息恢复普通模式；顺序/并发重试不重新绑定已消费的选择。预算费用门仍在首次付费调用前，专业任务不新增首页确认门。
+
+### Comic 工作区默认自动制作（2026-10-04）
+
+- 工作区新创意默认通过原 `POST /api/runs` 提交 `state.creative_request`、当前 guided Comic
+  Conversation、唯一 `request_id`、`creation_mode` 与 `approval_required=false`。
+  应用入口复用同一个 Conversation Workflow 分配锁和 `comic.production.v1`，在 Worker
+  启动前持久化用户消息及 `domain_dispatch(entrypoint=comic_workspace)`；不再只创建导演 Run。
+  网络重试必须沿用 request_id 和原请求/导演深度，即使 Prompt 已编译也返回原生产 Run，
+  不重新生成图片。每条新创意使用独立 Project/Brief，不继承旧作品或失败任务。
+- 自动制作使用已有 fast 执行策略：预先报价、配置的自动额度上限、已报价文本主模型单次调用、
+  内部 Critic、分镜、Prompt、Image、真实 QC 和 Artifact。未定价、超限、硬约束冲突、
+  审核执行失败或未知账单仍停止并明确报错，不能为了自动体验绕过安全门。
+  `creation_mode=professional` 仅增加导演决策深度；Conversation 仍属于 guided 工作区。
+- 用户在发送前主动开启“人工审核模式”才走原导演草稿入口及版本确认，随后通过已有作品生产
+  入口生成图片，原专业费用/QC 审批不变。不会自动启动历史草稿或重新提交旧失败 Run。
+- 前端轮询父生产 Run 和事件，首次进入真实分镜阶段自动切换分镜页；之后可自由返回导演节点。
+  对话和工作区复用原阶段粒子占位/图片附件，结果读取当前 Conversation 的持久化 Artifact。
+  默认隐藏草稿确认控件；刷新只恢复状态，取消父任务同时取消未完成的关联导演任务。
+  没有新增 Runtime、Skill、Prompt 系统、Provider 或数据表，没有页面布局重做。

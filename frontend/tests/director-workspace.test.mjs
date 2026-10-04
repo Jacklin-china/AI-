@@ -257,3 +257,44 @@ test('discarding one node preserves other edits; saving uses the same immutable 
   assert.equal(spec.cinematography.camera_angle, '平视')
   assert.equal(next.critic_result, null)
 })
+
+test('automatic workspace submits one durable production Run, not a director-only task', async () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const body = view.slice(view.indexOf('async function execute('), view.indexOf('\nfunction sendInput('))
+  const code = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+  const ref = value => ({ value })
+  const submissions = []
+  const state = {
+    busy: ref(false), hasRunning: ref(false), project: ref(null), composer: ref(null),
+    draftKey: ref('draft'), mode: ref('professional'), activeConversationId: ref('current'),
+    manualDirectorApproval: ref(false), pendingText: ref(''), previousRunIds: ref([]),
+    executions: ref([]), error: ref(''), restoredSpec: ref(null), productionRun: ref(null),
+    runs: ref({}), section: ref('director'), selectedStage: ref('director_assemble'),
+    invalidate() {}, failureText: String, refresh() {}, loadConversations() {},
+    createDirectorExecution() { throw new Error('automatic mode must not stop at director analysis') },
+    async createRun(domain, payload) {
+      submissions.push({ domain, payload })
+      return { id: 'production', state: { quick_creation: { project_id: 'fresh-project' } } }
+    },
+    async getComicProject(id) { return { project: { project_id: id } } },
+  }
+  const names = Object.keys(state)
+  const execute = new Function('state', `const {${names.join(',')}} = state; let pendingCreation=null,productionAdvanced=false; const conversationEpoch=1,disposed=false; ${code}; return execute`)(state)
+  await execute('少女竹林')
+  assert.equal(submissions.length, 1)
+  assert.deepEqual({ ...submissions[0].payload, request_id: 'stable-id' }, {
+    creative_request: '少女竹林', conversation_id: 'current', creation_mode: 'professional',
+    approval_required: false, request_id: 'stable-id',
+  })
+  assert.equal(state.productionRun.value.id, 'production')
+  assert.equal(state.pendingText.value, '')
+  assert.match(view, /manualDirectorApproval = ref\(false\)/)
+  assert.match(view, /manualDirectorApproval.value = !!latest && \(!productionRun.value/)
+  assert.match(view, /v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'"/)
+  assert.match(view, /productionRun.value.id\), getEvents\(productionRun.value.id\)/)
+  assert.match(view, /if \(run\) runs.value\[run.id\] = run/)
+  assert.match(view, /quick_creation as Record<string, unknown> \| undefined\)\?\.director_run_id === entry.execution.run_id/)
+  assert.match(view, /section.value = 'storyboard'/)
+  assert.match(view, /turn.artifactId && referenceUrls\[turn.artifactId\]/)
+  assert.match(view, /productionProgress\?\.visible/)
+})

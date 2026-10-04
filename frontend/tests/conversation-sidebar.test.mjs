@@ -50,7 +50,7 @@ test('switching conversation during submission keeps the original owner and igno
   const environment = {
     epoch: 1, disposed: false, busy: ref(false), hasRunning: ref(false), project: ref(null),
     composer: ref(null), draftKey: ref('old-draft'), activeConversationId: ref('old'),
-    mode: ref('fast'), pendingText: ref(''), previousRunIds: ref([]), executions: ref([]),
+    mode: ref('fast'), manualDirectorApproval: ref(true), pendingText: ref(''), previousRunIds: ref([]), executions: ref([]),
     error: ref(''), restoredSpec: ref(null), selectedRun: ref(''), drafts: ref({}),
     invalidate() {}, createComicProject: () => created,
     getComicProject() { throw new Error('unexpected project inheritance') },
@@ -73,5 +73,42 @@ test('switching conversation during submission keeps the original owner and igno
   assert.equal(submissions[0].options.task, '少年雨夜思念故乡')
   assert.equal(environment.project.value, null)
   assert.equal(environment.selectedRun.value, '')
+  assert.equal(environment.error.value, '')
+})
+
+test('automatic creation late response cannot bind its project or image to the new conversation', async () => {
+  const comic = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const start = comic.indexOf('async function execute(')
+  const body = comic.slice(start, comic.indexOf('\nfunction sendInput(', start))
+    .replace(/\bconversationEpoch\b/g, 'environment.epoch').replace(/\bdisposed\b/g, 'environment.disposed')
+  const output = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+  const ref = value => ({ value })
+  let release
+  const response = new Promise(resolve => { release = resolve })
+  const submissions = []
+  const environment = {
+    epoch: 1, disposed: false, busy: ref(false), hasRunning: ref(false), project: ref(null),
+    composer: ref(null), draftKey: ref('draft'), activeConversationId: ref('old'),
+    mode: ref('fast'), manualDirectorApproval: ref(false), pendingText: ref(''),
+    previousRunIds: ref([]), executions: ref([]), error: ref(''), restoredSpec: ref(null),
+    productionRun: ref(null), runs: ref({}), invalidate() {},
+    createRun(domain, payload) { submissions.push({ domain, payload }); return response },
+    getComicProject() { throw new Error('must not load a late project into the new view') },
+    refresh() { throw new Error('must not refresh another conversation') },
+    failureText: String,
+  }
+  const names = Object.keys(environment).filter(name => name !== 'epoch' && name !== 'disposed')
+  const execute = new Function('environment', `const {${names.join(',')}}=environment; let pendingCreation=null,productionAdvanced=false; ${output}; return execute`)(environment)
+  const pending = execute('少女竹林')
+  environment.epoch++
+  environment.activeConversationId.value = 'new'
+  environment.busy.value = false
+  environment.pendingText.value = ''
+  release({ id: 'old-production', state: { quick_creation: { project_id: 'old-project' } } })
+  await pending
+  assert.equal(submissions.length, 1)
+  assert.equal(submissions[0].payload.conversation_id, 'old')
+  assert.equal(environment.productionRun.value, null)
+  assert.equal(environment.project.value, null)
   assert.equal(environment.error.value, '')
 })

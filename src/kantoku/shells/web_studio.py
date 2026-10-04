@@ -877,6 +877,12 @@ class StudioApplication:
         if existing:
             if existing.domain != domain:
                 raise ToolError("本条任务已绑定其他创作域，不能用同一请求 ID 重提")
+            if (data.get("automatic_creation") and (
+                    (existing.state.get("quick_creation") or {}).get("original_request")
+                    != requirement
+                    or (existing.state.get("quick_creation") or {}).get("creation_mode")
+                    != data.get("creation_mode", "fast"))):
+                raise ToolError("制作请求 ID 已绑定其他创意或导演模式")
             return self._run_payload(existing.id)
         guided = conversation.interaction_mode is InteractionMode.GUIDED
         identity = {"conversation_id": conversation.id, "message_id": message_id,
@@ -912,19 +918,21 @@ class StudioApplication:
                 "confirmed": not guided and budget.estimate_image_fen(count=count)
                 <= int(get_settings().budget.autonomous_image_auto_cny * 100),
             }
-            if selected_domain == "comic" and not guided:
+            if selected_domain == "comic" and (not guided or data.get("automatic_creation")):
                 # A new task gets its own creative root, not an old title/failed Brief.
                 snapshot = self.comic_projects.create(ComicProjectInput.model_validate({
                     "title": requirement[:200], "brief": {"original_request": requirement},
                 }))
                 total, unpriced = self._quick_creation_cost(count, primary_only=True)
                 state.update(
+                    execution_mode="fast",
                     project=snapshot.project.project_id, total_estimate_fen=total,
                     confirmed=not unpriced and total <= int(
                         get_settings().budget.autonomous_image_auto_cny * 100,
                     ),
                     quick_creation={"project_id": snapshot.project.project_id,
                                     "auto_create_image": True,
+                                    "creation_mode": data.get("creation_mode", "fast"),
                                     "original_request": requirement,
                                     "input_brief_id": snapshot.creative_brief.brief_id,
                                     "input_brief_version": snapshot.creative_brief.version,
@@ -941,6 +949,8 @@ class StudioApplication:
                    "execution_mode": state["execution_mode"],
                    "resolved_intent": f"{domain}_production",
                    "selected_coordinator": coordinator}
+        if data.get("automatic_creation"):
+            payload["entrypoint"] = "comic_workspace"
         return self.enqueue_core_run({
             "domain": domain, "state": state,
             "interaction_mode": conversation.interaction_mode.value,
@@ -1027,7 +1037,8 @@ class StudioApplication:
                         "expected_project_version": self.comic_projects.get(
                             project_id,
                         ).project.current_version,
-                        "creation_mode": "fast", "creative_operation": "new",
+                        "creation_mode": creation.get("creation_mode", "fast"),
+                        "creative_operation": "new",
                         "task": request, "conversation_id": state.conversation_id,
                         "asset_ids": [],
                     })
@@ -2581,7 +2592,7 @@ class StudioApplication:
                 run.state["project_id"], project_version=run.state["project_version_after"],
             )
             confirmed = self.comic_projects.director_confirmed(saved)
-            spec["user_confirmed"] = confirmed
+            spec["user_confirmed"] = self.comic_projects.human_director_confirmed(saved)
         return {
             "run_id": run.id,
             "status": run.status.value,
@@ -3072,6 +3083,8 @@ class StudioApplication:
         """根据 shell 选择 Domain Pack；Core 本身没有领域分支。"""
         domain = str(data.get("domain", "")).strip().lower()
         if domain == "comic":
+            if "creative_request" in data.get("state", {}):
+                return self._start_comic_workspace_creation(data["state"])
             if data.get("state", {}).get("production_project_id"):
                 return self._start_comic_project_production(data["state"])
             state = ComicState.model_validate(data.get("state", data))
@@ -3085,6 +3098,32 @@ class StudioApplication:
         else:
             raise ToolError("不支持的 Domain Pack", detail=domain)
         return self._run_payload(run.id)
+
+    def _start_comic_workspace_creation(self, data: dict[str, Any]) -> dict[str, Any]:
+        """Workspace automatic mode submits the existing durable production graph."""
+        conversation = self.runtime_store.get_conversation(str(data.get("conversation_id", "")))
+        if (conversation.interaction_mode is not InteractionMode.GUIDED
+                or conversation.domain != "comic"):
+            raise ToolError("自动漫剧制作必须绑定当前创作域 Conversation")
+        request = data.get("creative_request")
+        request_id = data.get("request_id")
+        if not isinstance(request, str) or not isinstance(request_id, str):
+            raise ToolError("创作需求和 request_id 必须是字符串")
+        request = request.strip()
+        request_id = request_id.strip()
+        mode = data.get("creation_mode", "fast")
+        if not request or len(request) > 1000 or not request_id or len(request_id) > 100:
+            raise ToolError("创作需求或 request_id 无效")
+        if (not isinstance(mode, str) or mode not in {"fast", "professional"}
+                or data.get("approval_required", False) is not False):
+            raise ToolError("自动制作不能携带人工导演审核；请使用专业草稿入口")
+        # The same message ID and dispatch lock protect retries before any paid work.
+        result = self._start_conversation_workflow(
+            "comic", request, conversation, request_id,
+            {"automatic_creation": True, "creation_mode": mode},
+            trace_id=current_trace_id() or f"trace-{uuid4().hex[:12]}", selected_domain="comic",
+        )
+        return result
 
     def _start_comic_project_production(self, data: dict[str, Any]) -> dict[str, Any]:
         """Submit a bound workspace revision to the SAME production graph as Home."""
@@ -3198,6 +3237,12 @@ class StudioApplication:
         # Publish the entry-point binding before the worker can append events.
         if dispatch is not None:
             payload = {**dispatch, "run_id": run.id}
+            if payload.get("entrypoint") == "comic_workspace":
+                self.runtime_store.add_conversation_message(
+                    state.conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+                    content=state.quick_creation["original_request"], run_id=run.id,
+                    event_id=f"workspace-input:{state.message_id}",
+                )
             logger.bind(
                 trace_id=payload.get("trace_id"),
                 conversation_id=payload.get("conversation_id"),
@@ -3329,6 +3374,18 @@ class StudioApplication:
     def cancel_core_run(self, run_id: str) -> dict[str, Any]:
         """取消一个尚未结束的 Run。"""
         run = self.runtime.cancel(run_id)
+        creation = run.state.get("quick_creation") or {}
+        child_id = creation.get("director_run_id")
+        children = [self.runtime_store.get_run(child_id)] if child_id else (
+            [item for item in self.runtime_store.list_runs(
+                conversation_id=run.state.get("conversation_id"),
+            ) if item.workflow == "comic.director"
+                and item.state.get("project_id") == creation["project_id"]]
+            if creation.get("project_id") else []
+        )
+        for child in children:
+            if child.status not in TERMINAL_STATUSES:
+                self.runtime.cancel(child.id)
         for batch_id in self.runtime_store.batch_ids_for_run(run.id):
             self.batches.refresh(batch_id, force_progress=True)
         return self._run_payload(run.id)

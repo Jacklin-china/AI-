@@ -813,6 +813,146 @@ def test_advisory_policy_does_not_accept_changed_hash_or_failed_review(
     assert "prompt" not in production
 
 
+@pytest.mark.parametrize("mode", ["fast", "professional"])
+def test_workspace_input_runs_to_image_without_manual_director_gate(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, mode: str,
+) -> None:
+    _advisory_critic(app, monkeypatch)
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    request = {"creative_request": "生成日本女优设乐夕日卡通版图片",
+               "conversation_id": cid, "creation_mode": mode,
+               "request_id": "workspace-once", "approval_required": False}
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["status"] == "completed"
+    creation = run["state"]["quick_creation"]
+    assert creation["storyboard_id"] and creation["prompt_artifact_id"]
+    spec = app.comic_projects.get_director(creation["project_id"])
+    assert spec.schema_version == 2 and spec.critic_result.verdict == "needs_revision"
+    assert not app.get_comic_director(spec.project_id)["user_confirmed"]
+    child = app.runtime_store.get_run(creation["director_run_id"])
+    assert not app._comic_director_result(child)["director_spec"]["user_confirmed"]
+    assert child.state["execution_mode"] == mode
+    assert child.state["conversation_id"] == cid
+    assert app.conversation(cid)["interaction_mode"] == "guided"
+    assert run["state"]["execution_mode"] == "fast"
+    assert production[:3] == SKILLS[:3]
+    assert production[-2:] == ["storyboard", "prompt"]
+    assert not [item for item in app.runtime_store.list_approvals()
+                if item.run_id == run["id"] and item.node_id != "director_policy"]
+    image = app.runtime_store.get_artifact(run["state"]["image_artifact_id"])
+    assert image.type is ArtifactType.IMAGE and image.conversation_id == cid
+    assert Path(image.location).is_file()
+    messages = app.conversation(cid)["messages"]
+    assert messages[0]["role"] == "user" and messages[0]["content"] == request["creative_request"]
+    assert messages[-1]["artifact_id"] == image.id
+    assert not any("creative_decision" in item["content"] for item in messages)
+    dispatch = next(e for e in app.runtime_store.list_events(run["id"])
+                    if e.payload.get("kind") == "domain_dispatch")
+    assert dispatch.payload["entrypoint"] == "comic_workspace"
+    calls = list(production)
+    retried = app.create_core_run({"domain": "comic", "state": request})
+    assert retried["id"] == run["id"] and production == calls
+    assert app.conversation(cid)["messages"] == messages
+    for change in ({"creative_request": "少女校园"}, {"creation_mode": "other"}):
+        with pytest.raises(ToolError):
+            app.create_core_run({"domain": "comic", "state": {**request, **change}})
+
+
+def test_workspace_creation_isolated_and_restored_without_another_image(
+    app: web_studio.StudioApplication, production: list[str],
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    outputs = []
+    for number, request in enumerate(("山海经穷奇悬崖看村庄", "JOJO儿童风电话场景")):
+        outputs.append(app.create_core_run({"domain": "comic", "state": {
+            "creative_request": request, "conversation_id": cid,
+            "request_id": f"workspace-{number}", "creation_mode": "fast",
+        }}))
+    assert all(run["status"] == "completed" for run in outputs)
+    first, second = (run["state"]["quick_creation"] for run in outputs)
+    assert first["project_id"] != second["project_id"]
+    brief = app.comic_projects.get(second["project_id"]).creative_brief
+    assert brief.original_request == "JOJO儿童风电话场景"
+    spec = app.comic_projects.get_director(second["project_id"])
+    assert "穷奇" not in spec.creative_decision.intent_summary
+    calls = list(production)
+    restarted = web_studio.StudioApplication()
+    try:
+        assert restarted.conversation(cid)["messages"] == app.conversation(cid)["messages"]
+        for run in outputs:
+            assert restarted._run_payload(run["id"])["state"]["image_artifact_id"]
+        assert production == calls
+    finally:
+        restarted.runner.close()
+
+
+@pytest.mark.parametrize("change", [
+    {"creative_request": ""}, {"creation_mode": []}, {"approval_required": True},
+    {"creative_request": None}, {"request_id": None},
+])
+def test_workspace_invalid_request_never_starts_paid_work(
+    app: web_studio.StudioApplication, production: list[str], change: dict,
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    with pytest.raises(ToolError):
+        app.create_core_run({"domain": "comic", "state": {
+            "creative_request": "少女竹林", "conversation_id": cid,
+            "request_id": "invalid", **change,
+        }})
+    assert production == [] and not app.runtime_store.list_runs()
+
+
+def test_workspace_cancellation_stops_bound_director_before_image(
+    app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entered, release = threading.Event(), threading.Event()
+    original = app._comic_director_model
+
+    def blocking(messages):
+        entered.set()
+        assert release.wait(10)
+        return original(messages)
+
+    monkeypatch.setattr(app, "_comic_director_model", blocking)
+    monkeypatch.setattr(app.runner, "submit", TaskRunner.submit.__get__(app.runner))
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    run = app.create_core_run({"domain": "comic", "state": {
+        "creative_request": "少女竹林", "conversation_id": cid, "request_id": "cancel",
+    }})
+    try:
+        assert entered.wait(10)
+        assert app.cancel_core_run(run["id"])["status"] == "cancelled"
+        director = next(item for item in app.runtime_store.list_runs(conversation_id=cid)
+                        if item.workflow == "comic.director")
+        assert director.status is ExecutionStatus.CANCELLED
+    finally:
+        release.set()
+        app.runner.close()
+    assert "storyboard" not in production and "prompt" not in production
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+
+
+def test_workspace_http_request_reaches_existing_production_graph(
+    app: web_studio.StudioApplication, production: list[str], server: int,
+) -> None:
+    cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
+    connection = HTTPConnection("127.0.0.1", server, timeout=15)
+    try:
+        connection.request("POST", "/api/runs", json.dumps({"domain": "comic", "state": {
+            "creative_request": "中式修仙少女站在竹林", "conversation_id": cid,
+            "request_id": "workspace-http", "approval_required": False,
+        }}), headers={"Content-Type": "application/json", "X-Studio-Token": app.token})
+        response = connection.getresponse()
+        run = json.loads(response.read())
+        assert response.status == 201 and run["status"] == "completed"
+        assert run["workflow"] == "comic.production.v1"
+        assert run["state"]["image_artifact_id"]
+        assert run["state"]["trace_id"] == response.getheader("X-Trace-ID")
+    finally:
+        connection.close()
+
+
 def test_selected_commerce_runs_existing_graph_not_normal_chat(
     app: web_studio.StudioApplication,
     production: list[str],
