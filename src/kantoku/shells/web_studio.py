@@ -1198,6 +1198,13 @@ class StudioApplication:
                 )
                 return {"quick_creation": creation}
             if step == "storyboard":
+                context.store.append_event(
+                    context.run_id, RuntimeEventType.NODE_PROGRESS, node_id=step,
+                    payload={"kind": "storyboard_started", "project_id": project_id,
+                             "trace_id": state.trace_id},
+                )
+                logger.bind(trace_id=state.trace_id, project_id=project_id,
+                            run_id=context.run_id).info("storyboard_started")
                 if creation.get("shot_id"):
                     return {}
                 result = self.create_comic_storyboard(project_id, {
@@ -2593,12 +2600,15 @@ class StudioApplication:
             )
             confirmed = self.comic_projects.director_confirmed(saved)
             spec["user_confirmed"] = self.comic_projects.human_director_confirmed(saved)
+            spec["approval"] = {"status": "approved" if spec["user_confirmed"] else "pending"}
+            spec["next_stage"] = "storyboard_generation" if spec["user_confirmed"] else None
         return {
             "run_id": run.id,
             "status": run.status.value,
             "director_spec": spec,
             "director_spec_status": spec_status,
-            "ready_for_prompt": spec_status == "reviewed" and confirmed,
+            "ready_for_prompt": confirmed and (spec_status == "reviewed"
+                                               or self.comic_projects.advisory_authorized(saved)),
             "director_execution_summary": director_execution_summary(run),
             "recovery_required": run.status is ExecutionStatus.RUNNING
             and run.state.get("worker_instance_id") != self._instance_id,
@@ -3004,8 +3014,11 @@ class StudioApplication:
         return self._comic_director_spec_payload(self.comic_projects.get_director(project_id))
 
     def _comic_director_spec_payload(self, spec) -> dict[str, Any]:
+        confirmed = self.comic_projects.human_director_confirmed(spec)
         return {**spec.model_dump(mode="json"),
-                "user_confirmed": self.comic_projects.human_director_confirmed(spec)}
+                "user_confirmed": confirmed,
+                "approval": {"status": "approved" if confirmed else "pending"},
+                "next_stage": "storyboard_generation" if confirmed else None}
 
     def _comic_director_bindings(self, project_id: str, spec) -> dict[str, Any]:
         """只定位该修订的来源身份；不得从最近失败任务猜测镜头或故事。"""
@@ -3050,12 +3063,23 @@ class StudioApplication:
                 not bindings.get("shot_id") or self.comic_storyboards.get_shot(
                     bindings["shot_id"]).version != spec.shot_version)):
             raise ToolError("导演镜头版本已变化，请先更新方案")
-        return self._comic_director_spec_payload(self.comic_projects.confirm_director(
-            project_id, version=request.version,
-            expected_project_version=request.expected_project_version,
-            automatic_run_id=automatic_run_id,
-            allow_advisory=bool(automatic_run_id),
-        ))
+        trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
+        with request_trace(trace_id):
+            saved = self.comic_projects.confirm_director(
+                project_id, version=request.version,
+                expected_project_version=request.expected_project_version,
+                automatic_run_id=automatic_run_id,
+                # Explicit human confirmation can accept artistic warnings, never
+                # conflicts, missing photography, failed review or a stale fingerprint.
+                allow_advisory=True,
+            )
+        if not automatic_run_id:
+            logger.bind(trace_id=trace_id, project_id=project_id,
+                        director_version=saved.version).info(
+                "workflow_transition from=director_review director_review_completed "
+                "approval_status=approved next_stage=storyboard_generation"
+            )
+        return self._comic_director_spec_payload(saved)
 
     def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:
         return {"versions": [
@@ -3133,7 +3157,7 @@ class StudioApplication:
         message_id = str(data.get("request_id") or "").strip()
         if not message_id or len(message_id) > 100:
             raise ToolError("制作请求必须携带唯一 request_id")
-        approval_required = data.get("approval_required", False)
+        approval_required = data.get("approval_required", True)
         if not isinstance(approval_required, bool):
             raise ToolError("approval_required 必须是布尔值")
         # Check the submitted revision before reading CURRENT versions: compilation

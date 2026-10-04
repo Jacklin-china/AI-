@@ -151,8 +151,11 @@ export function directorIsStale(
   })
 }
 export function canConfirmDirector(status: string | undefined, spec: Record<string, unknown> | null, stale: boolean, dirty: boolean): boolean {
-  return status === 'completed' && spec?.schema_version === 2 && !stale && !dirty &&
-    publicDirectorSections(spec).length === 3 && (spec.critic_result as { verdict?: string } | null)?.verdict === 'pass'
+  const review = spec?.critic_result as { verdict?: string; reviewed_spec_hash?: string; findings?: { severity: string; code: string }[] } | undefined
+  return ['completed', 'waiting'].includes(status ?? '') && spec?.schema_version === 2 && !stale && !dirty &&
+    publicDirectorSections(spec).length === 3 && (spec.cinematography as { status?: string })?.status === 'complete' &&
+    !!review?.reviewed_spec_hash && ['pass', 'needs_revision'].includes(review.verdict ?? '') &&
+    !review.findings?.some(item => item.severity === 'error' || ['REVIEW_EXECUTION_FAILED', 'CINEMATOGRAPHY_INCOMPLETE'].includes(item.code))
 }
 export function stageDraftKey(projectId: string, runId: string, stage: string): string {
   return JSON.stringify([projectId, runId, stage])

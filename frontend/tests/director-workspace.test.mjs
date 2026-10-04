@@ -15,7 +15,7 @@ const spec = {
   schema_version: 2, spec_id: 'director', version: 2, creative_brief_version: 3,
   creative_decision: { intent_summary: '异兽观察文明', emotional_target: '孤独', private_thought: 'must not show' },
   director_plan: { visual_strategy: '留出环境空间', composition_strategy: '人物与城市遥相呼应' },
-  cinematography: { camera_angle: '平视', light_direction: '侧光' }, critic_result: { verdict: 'pass' },
+  cinematography: { camera_angle: '平视', light_direction: '侧光', status: 'complete' }, critic_result: { verdict: 'pass', reviewed_spec_hash: 'reviewed' },
   asset_versions: { 'asset:character': 1 },
 }
 test('both modes edit public draft fields without changing identity or hard constraints', () => {
@@ -42,10 +42,13 @@ test('v2 public projection does not expose legacy fields or private model metada
 })
 test('only real completed reviewed v2 can be confirmed; draft changes invalidate', () => {
   assert.equal(canConfirmDirector('completed', spec, false, false), true)
-  for (const status of ['pending', 'running', 'waiting', 'failed']) assert.equal(canConfirmDirector(status, spec, false, false), false)
+  for (const status of ['pending', 'running', 'failed']) assert.equal(canConfirmDirector(status, spec, false, false), false)
   assert.equal(canConfirmDirector('completed', spec, true, false), false)
   assert.equal(canConfirmDirector('completed', spec, false, true), false)
-  assert.equal(canConfirmDirector('completed', { ...spec, critic_result: { verdict: 'needs_revision' } }, false, false), false)
+  assert.equal(canConfirmDirector('waiting', { ...spec, critic_result: { verdict: 'needs_revision', reviewed_spec_hash: 'reviewed', findings: [{ severity: 'warning', code: 'ARTISTIC_ADVICE' }] } }, false, false), true)
+  for (const code of ['HARD_CONSTRAINT_CONFLICT', 'REVIEW_EXECUTION_FAILED', 'CINEMATOGRAPHY_INCOMPLETE']) {
+    assert.equal(canConfirmDirector('waiting', { ...spec, critic_result: { verdict: 'needs_revision', reviewed_spec_hash: 'reviewed', findings: [{ severity: code === 'HARD_CONSTRAINT_CONFLICT' ? 'error' : 'warning', code }] } }, false, false), false)
+  }
   assert.equal(canConfirmDirector('completed', { ...spec, schema_version: 1 }, false, false), false)
 })
 test('Vue reactive drafts can be copied and saved without DataCloneError or changing the source', () => {
@@ -119,7 +122,7 @@ test('confirmed workspace submits version-bound production through existing Run 
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
   assert.match(view, /async function generateImage\(\)/)
   assert.match(view, /if \(!productionEligible\.value/)
-  assert.match(view, /const manualDirectorApproval = ref\(false\)/)
+  assert.match(view, /const manualDirectorApproval = ref\(true\)/)
   assert.match(view, /approval_required: manualDirectorApproval\.value/)
   assert.match(view, /manualDirectorApproval\.value && !confirmed\.value/)
   assert.match(view, /createRun\('comic', \{/)
@@ -127,7 +130,7 @@ test('confirmed workspace submits version-bound production through existing Run 
   assert.match(view, /director_version: spec\.value\.version/)
   assert.match(view, /request_id: productionRequests\.get\(key\)/)
   assert.match(view, /@click="generateImage"/)
-  assert.match(view, /name: 'task_run', runId: run.id/)
+  assert.match(view, /name: 'tasks', tab: 'waiting'/)
   assert.doesNotMatch(view, /provider\.submit|images\/generations/)
 })
 
@@ -288,8 +291,8 @@ test('automatic workspace submits one durable production Run, not a director-onl
   })
   assert.equal(state.productionRun.value.id, 'production')
   assert.equal(state.pendingText.value, '')
-  assert.match(view, /manualDirectorApproval = ref\(false\)/)
-  assert.match(view, /manualDirectorApproval.value = !!latest && \(!productionRun.value/)
+  assert.match(view, /manualDirectorApproval = ref\(true\)/)
+  assert.match(view, /manualDirectorApproval.value = !latest \|\| !productionRun.value/)
   assert.match(view, /v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'"/)
   assert.match(view, /productionRun.value.id\), getEvents\(productionRun.value.id\)/)
   assert.match(view, /if \(run\) runs.value\[run.id\] = run/)
@@ -297,4 +300,31 @@ test('automatic workspace submits one durable production Run, not a director-onl
   assert.match(view, /section.value = 'storyboard'/)
   assert.match(view, /turn.artifactId && referenceUrls\[turn.artifactId\]/)
   assert.match(view, /productionProgress\?\.visible/)
+})
+
+test('professional confirmation enables a persistent transition to storyboard, never image controls in director', async () => {
+  const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
+  const director = view.slice(view.indexOf(`<template v-if="section === 'director'`), view.indexOf(`<template v-else-if="section === 'assets'`))
+  assert.doesNotMatch(director, /生成当前画面|@click="generateImage"|openSection\('prompt'\)/)
+  assert.match(director, /@click="enterStoryboard"/)
+  assert.match(view, /const confirmed = computed\(\(\) => !stale.value && !dirty.value/)
+  const approval = view.slice(view.indexOf('const confirmed ='), view.indexOf('const productionEligible'))
+  assert.doesNotMatch(approval, /confirmable.value|busy.value|hasRunning.value/)
+  assert.match(approval, /status === 'approved'/)
+  const body = view.slice(view.indexOf('async function enterStoryboard'), view.indexOf('async function restore('))
+  const code = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+  const ref = value => ({ value })
+  const state = { confirmed: ref(false), productionEligible: ref(true), busy: ref(false), hasRunning: ref(false) }
+  const actions = []
+  const enter = new Function('state', 'actions', `const {confirmed,productionEligible,busy,hasRunning}=state; function openSection(value){actions.push(value)}; async function generateImage(){actions.push('production')}; ${code}; return enterStoryboard`)(state, actions)
+  await enter()
+  assert.deepEqual(actions, [])
+  state.confirmed.value = true
+  await enter()
+  assert.deepEqual(actions, ['storyboard', 'production'])
+  assert.match(view, /section === 'storyboard' && productionEligible/)
+  const production = view.slice(view.indexOf('async function generateImage'), view.indexOf('async function enterStoryboard'))
+  assert.match(production, /productionRun.value = run/)
+  assert.match(production, /openSection\('storyboard'\)/)
+  assert.doesNotMatch(production, /navigate\(\{ name: 'task_run'/)
 })

@@ -360,7 +360,7 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 ### 首页漫剧自动出图与专业确认（2026-10-03）
 
 - 新首页漫剧图片任务保存 `quick_creation.auto_create_image=true`，内部完成导演/真实 Critic/分镜/Prompt，再自动进入共享图片调用。Critic 的艺术建议（`needs_revision` 且无 error finding）不要求人工确认：生产策略为当前不可变修订生成 Core Approval，记录 production Run 与 `human_review=false/allow_advisory=true`，保留真实审核结论，不伪造 pass 或用户确认。硬约束/资产冲突、摄影缺失、审核执行失败、审核指纹或版本不匹配仍阻止生产。分镜与 Prompt 只接受绑定当前版本的策略授权；直接编译没有授权仍保持严格门禁。供应商真实异步等待/未知账单仍沿用查询/对账，不重提，QC 不通过不能交付。
-- 专业作品生产默认 `approval_required=false`，复用同一生产图，由服务端在 `director_gate` 授权当前导演版本；可设置 `approval_required=true` 保留人工导演确认。费用/QC 审批保持既有专业机制，首页预算限额不替代它们。相同 request_id 的重试必须保持作品、导演/镜头版本和审核策略不变。旧待确认 Run 没有自动标志，保留原确认语义。
+- 专业作品生产默认 `approval_required=true`，当前导演修订须人工确认；显式 `false` 的已有自动任务保持兼容，同一生产图在 `director_gate` 授权当前导演版本。费用/QC 审批保持既有专业机制，首页预算限额不替代它们。相同 request_id 的重试必须保持作品、导演/镜头版本和审核策略不变。旧待确认 Run 没有自动标志，保留原确认语义。
 - 真实图片提交记录 `image_generation_started`（provider/model/prompt_hash），归档记录 `image_generation_completed`（artifact_id），异常记录 `image_generation_failed`（provider_error），沿用 trace/run/task/error ID 和脱敏完整 traceback；未知提交仍标记 unknown 并保留预算，不能因失败日志而重提。首页继续仅显示现有粒子加载、真实阶段映射进度和最终图片，不展示导演中间稿。
 - 首页自动 Comic 文本调用在该 worker 的 ContextVar 作用域使用共享 `chat(single_attempt=True)`：只使用已报价主模型，关闭文本自动重试和备用模型；报价同步按此策略计算。不能仅从报价删除未定价备用模型却仍允许调用它。视觉模型沿用原重试并包含在报价中；其他会话与专业模式不受这个局部策略影响。
 - 专业工作区“生成当前画面/镜头”通过现有 `/api/runs` 提交 `production_project_id`、project/director/shot 版本、conversation 与唯一 request_id。服务端核实当前已审核且已确认的修订及会话归属后，复用同一个 `comic.production.v1` 的分镜、Prompt、Image、QC、归档链；不再生成另一套 Director。专业费用/QC 审批仍在原任务界面处理，重试同一 request_id 返回原 Run。
@@ -369,9 +369,18 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 - 粒子占位与图片同宽；百分比明确标为**阶段进度**，只由真实 Runtime 节点完成事件计算。供应商未提供细粒度进度时保持当前阶段百分比并显示真实等待秒数，不人为虚涨。100% 必须同时有 completed Run 和真实图片 URL。错误展示真实错误，不冒充完成。
 - 快捷选择发送后由 Run 保存执行上下文，输入框与下一条消息恢复普通模式；顺序/并发重试不重新绑定已消费的选择。预算费用门仍在首次付费调用前，专业任务不新增首页确认门。
 
-### Comic 工作区默认自动制作（2026-10-04）
+### Comic 工作区制作与专业确认（2026-10-04）
 
-- 工作区新创意默认通过原 `POST /api/runs` 提交 `state.creative_request`、当前 guided Comic
+- 工作区人工审核默认开启，新创意走原导演草稿入口，保存三个公开决策节点与真实 Critic。
+  用户确认当前不可变修订后，Core Approval response/state 投影为 `approval.status=approved`，
+  原 confirmation Run/Event 保存 `workflow_transition: director_review → storyboard_generation`。
+  不改 Core 的通用 decision 枚举，不另存一套审批。指纹和依赖有效、摄影完整且无阻断项时，
+  用户可以明确接受艺术 warning；不伪造 Critic pass。缺失/失败审核、硬约束/资产冲突仍拒绝确认。
+  确认只表示当前版本已获授权，不立即付费。“进入下一步”打开分镜并通过既有作品生产 API
+  创建绑定该导演版本的 Run，继续分镜、Prompt、Image、QC、Artifact；不再次生成导演。
+  导演页没有生图按钮，镜头生成入口只在分镜页；输入/刷新/版本恢复均读取服务端审批状态。
+  专业费用/QC 仍在原任务详情处理，工作区提供真实 waiting 状态和审批入口。
+- 显式关闭人工审核及旧自动任务继续通过原 `POST /api/runs` 提交 `state.creative_request`、当前 guided Comic
   Conversation、唯一 `request_id`、`creation_mode` 与 `approval_required=false`。
   应用入口复用同一个 Conversation Workflow 分配锁和 `comic.production.v1`，在 Worker
   启动前持久化用户消息及 `domain_dispatch(entrypoint=comic_workspace)`；不再只创建导演 Run。
@@ -381,9 +390,9 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   内部 Critic、分镜、Prompt、Image、真实 QC 和 Artifact。未定价、超限、硬约束冲突、
   审核执行失败或未知账单仍停止并明确报错，不能为了自动体验绕过安全门。
   `creation_mode=professional` 仅增加导演决策深度；Conversation 仍属于 guided 工作区。
-- 用户在发送前主动开启“人工审核模式”才走原导演草稿入口及版本确认，随后通过已有作品生产
-  入口生成图片，原专业费用/QC 审批不变。不会自动启动历史草稿或重新提交旧失败 Run。
+- 首页 `+ → 漫剧` 继续自动策略确认，不受工作区默认人工确认影响。
+  不会自动启动历史草稿或重新提交旧失败 Run。
 - 前端轮询父生产 Run 和事件，首次进入真实分镜阶段自动切换分镜页；之后可自由返回导演节点。
   对话和工作区复用原阶段粒子占位/图片附件，结果读取当前 Conversation 的持久化 Artifact。
-  默认隐藏草稿确认控件；刷新只恢复状态，取消父任务同时取消未完成的关联导演任务。
+  自动任务隐藏草稿确认控件；刷新只恢复状态，取消父任务同时取消未完成的关联导演任务。
   没有新增 Runtime、Skill、Prompt 系统、Provider 或数据表，没有页面布局重做。

@@ -14,8 +14,9 @@ from uuid import uuid4
 from pydantic import ValidationError
 
 from kantoku.config import ToolError
+from kantoku.config.observability import current_trace_id
 from kantoku.core.conversations import InteractionMode
-from kantoku.core.runtime.models import ApprovalDecision, ExecutionStatus, utc_now
+from kantoku.core.runtime.models import ApprovalDecision, ExecutionStatus, RuntimeEventType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
 from .models import (
@@ -526,23 +527,23 @@ class ComicProjectStore:
     def require_confirmed_director(self, spec: DirectorSpec, *, human_review: bool = False) -> None:
         from .critic import require_approved_director
 
-        require_approved_director(spec, allow_advisory=not human_review
-                                  and self.advisory_authorized(spec))
+        require_approved_director(spec, allow_advisory=self.advisory_authorized(spec))
         confirmed = self.human_director_confirmed(spec) if human_review \
             else self.director_confirmed(spec)
         if not confirmed:
             raise ToolError("请先确认当前导演方案，才能进入下一步")
 
     def advisory_authorized(self, spec: DirectorSpec) -> bool:
-        """Only a durable, version-bound server production authorization accepts advice."""
+        """Advice requires a durable version-bound human or production authorization."""
         if self.runtime_store is None:
             return False
         return any(
             approval.decision is ApprovalDecision.APPROVE
             and approval.request == self._confirmation_request(spec)
             and approval.response.get("allow_advisory") is True
-            and approval.response.get("human_review") is False
-            and bool(approval.response.get("production_run_id"))
+            and (approval.response.get("human_review") is True or (
+                approval.response.get("human_review") is False
+                and bool(approval.response.get("production_run_id"))))
             for approval in self.runtime_store.list_approvals()
         )
 
@@ -565,8 +566,6 @@ class ComicProjectStore:
             if (spec.version != version
                     or spec.creative_brief_version != snapshot.creative_brief.version):
                 raise ToolError("只能确认当前 Brief 下的当前导演版本")
-            if allow_advisory and not automatic_run_id:
-                raise ToolError("建议性审核放行必须绑定真实生产 Run")
             require_approved_director(spec, allow_advisory=allow_advisory)
             if self.runtime_store is None:
                 raise ToolError("导演确认尚未绑定现有 Runtime")
@@ -576,7 +575,9 @@ class ComicProjectStore:
         if not confirmed:
             run = self.runtime_store.create_run(
                 "comic", "comic.director.confirmation", {"project_id": project_id,
-                  "director_spec_version": version}, "director_confirmation",
+                  "director_spec_version": version,
+                  "trace_id": current_trace_id() or f"trace-{uuid4().hex[:12]}"},
+                "director_confirmation",
                 interaction_mode=InteractionMode.AUTONOMOUS if automatic_run_id
                 else InteractionMode.GUIDED,
             )
@@ -590,7 +591,21 @@ class ComicProjectStore:
                 else "user_confirmation", "production_run_id": automatic_run_id,
                 "human_review": not bool(automatic_run_id),
                 "allow_advisory": allow_advisory,
+                "status": "approved",
             })
+            if not automatic_run_id:
+                transition = {"from": "director_review", "to": "storyboard_generation",
+                              "project_id": project_id, "director_version": version,
+                              "approval_status": "approved",
+                              "trace_id": run.state["trace_id"]}
+                self.runtime_store.append_event(
+                    run.id, RuntimeEventType.NODE_PROGRESS, node_id="director_confirmation",
+                    payload={"kind": "workflow_transition", **transition},
+                )
+                run = run.model_copy(update={"state": {
+                    **run.state, "approval": {"status": "approved", "id": approval.id},
+                    "workflow_transition": transition,
+                }})
             self.runtime_store.update_run(run.id, status=ExecutionStatus.COMPLETED,
                                           state=run.state, current_node="director_confirmation")
         return spec

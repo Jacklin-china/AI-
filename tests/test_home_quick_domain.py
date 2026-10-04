@@ -238,14 +238,15 @@ def test_auto_quote_and_model_policy_never_use_unpriced_fallback(
 
 def _workspace_production_request(
     app: web_studio.StudioApplication, *, confirm: bool = True,
+    creative_request: str = "中式修仙少女站在竹林", creation_mode: str = "professional",
 ) -> dict:
     cid = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})["id"]
     snapshot = app.create_comic_project({"title": "雨夜少女",
-                                       "brief": {"original_request": "中式修仙少女站在竹林"}})
+                                       "brief": {"original_request": creative_request}})
     project_id = snapshot["project"]["project_id"]
     result = app.create_comic_director(project_id, {
         "expected_project_version": snapshot["project"]["current_version"],
-        "conversation_id": cid, "creation_mode": "professional", "task": "中式修仙少女站在竹林",
+        "conversation_id": cid, "creation_mode": creation_mode, "task": creative_request,
     })
     spec = result["director_spec"]
     if confirm:
@@ -733,11 +734,12 @@ def test_fast_advisory_critic_continues_to_image_without_faking_pass(
         restarted.runner.close()
 
 
-def test_professional_default_accepts_advice_without_director_confirmation(
+def test_professional_explicit_automatic_policy_accepts_advice_without_confirmation(
     app: web_studio.StudioApplication, production: list[str], monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     _advisory_critic(app, monkeypatch)
     request = _workspace_production_request(app, confirm=False)
+    request["approval_required"] = False
     spec = app.comic_projects.get_director(request["production_project_id"])
     assert not app.comic_projects.director_confirmed(spec)
     run = app.create_core_run({"domain": "comic", "state": request})
@@ -766,6 +768,110 @@ def test_explicit_human_director_review_still_requires_confirmation(
     with pytest.raises(ToolError, match="先确认"):
         app.create_core_run({"domain": "comic", "state": request})
     assert "prompt" not in production
+
+
+@pytest.mark.parametrize("mode", ["fast", "professional"])
+@pytest.mark.parametrize("advice", [False, True])
+def test_workspace_confirmed_director_transitions_to_storyboard_then_real_artifact(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, mode: str, advice: bool,
+) -> None:
+    if advice:
+        _advisory_critic(app, monkeypatch)
+    request = _workspace_production_request(
+        app, confirm=False, creation_mode=mode,
+        creative_request="生成日本女演员三宫椿卡通版图片",
+    )
+    project_id = request["production_project_id"]
+    before = list(production)
+    # The professional production endpoint defaults to requiring human consent.
+    with pytest.raises(ToolError):
+        app.create_core_run({"domain": "comic", "state": request})
+    assert production == before and "storyboard" not in production
+    with web_studio.request_trace("trace-human-confirm"):
+        confirmed = app.confirm_comic_director(project_id, {
+            "version": request["director_version"],
+            "expected_project_version": request["expected_project_version"],
+        })
+    assert confirmed["user_confirmed"]
+    assert confirmed["approval"]["status"] == "approved"
+    assert confirmed["next_stage"] == "storyboard_generation"
+    confirmation = next(run for run in app.runtime_store.list_runs()
+                        if run.workflow == "comic.director.confirmation")
+    assert confirmation.state["approval"]["status"] == "approved"
+    events = app.runtime_store.list_events(confirmation.id)
+    transition = next(item.payload for item in events
+                      if item.payload.get("kind") == "workflow_transition")
+    assert transition == {"kind": "workflow_transition", "from": "director_review",
+                          "to": "storyboard_generation", "project_id": project_id,
+                          "director_version": request["director_version"],
+                          "approval_status": "approved", "trace_id": "trace-human-confirm"}
+    approvals = len(app.runtime_store.list_approvals())
+    app.confirm_comic_director(project_id, {
+        "version": request["director_version"],
+        "expected_project_version": request["expected_project_version"],
+    })
+    assert len(app.runtime_store.list_approvals()) == approvals
+    assert production == before  # Consent records readiness; it is not an image request.
+    child = next(run for run in app.runtime_store.list_runs() if run.workflow == "comic.director")
+    assert app._comic_director_result(child)["director_spec"]["approval"]["status"] == "approved"
+    run = app.create_core_run({"domain": "comic", "state": request})
+    assert run["current_node"] == "cost_approval"
+    cost = app.runtime_store.approval_for_node(run["id"], "cost_approval")
+    app.decide_core_approval(cost.id, "approve", {})
+    current = app._run_payload(run["id"])
+    assert current["current_node"] == "human_review"
+    assert production == before + ["storyboard", "prompt"]
+    assert app.runtime_store.approval_for_node(run["id"], "director_gate") is None
+    assert any(item.payload.get("kind") == "storyboard_started"
+               for item in app.runtime_store.list_events(run["id"]))
+    qc = app.runtime_store.approval_for_node(run["id"], "human_review")
+    app.decide_core_approval(qc.id, "approve", {})
+    final = app._run_payload(run["id"])
+    assert final["status"] == "completed"
+    image = app.runtime_store.get_artifact(final["state"]["image_artifact_id"])
+    assert image.type is ArtifactType.IMAGE and Path(image.location).is_file()
+    assert image.conversation_id == request["conversation_id"]
+    spec = app.comic_projects.get_director(project_id)
+    assert spec.critic_result.verdict == ("needs_revision" if advice else "pass")
+    restarted = web_studio.StudioApplication()
+    try:
+        assert restarted.get_comic_director(project_id)["approval"]["status"] == "approved"
+        restarted.comic_projects.require_confirmed_director(spec, human_review=True)
+    finally:
+        restarted.runner.close()
+
+
+@pytest.mark.parametrize("blocker", ["hard_constraint", "review_failure", "missing_camera"])
+def test_human_confirmation_never_overrides_director_blockers(
+    app: web_studio.StudioApplication, production: list[str],
+    monkeypatch: pytest.MonkeyPatch, blocker: str,
+) -> None:
+    from kantoku.domains.comic.models import DirectorCriticFinding
+
+    request = _workspace_production_request(app, confirm=False)
+    project_id = request["production_project_id"]
+    spec = app.comic_projects.get_director(project_id)
+    if blocker == "missing_camera":
+        spec = spec.model_copy(update={"cinematography": spec.cinematography.model_copy(
+            update={"status": "missing"})})
+    else:
+        finding = DirectorCriticFinding(
+            code="HARD_CONSTRAINT_CONFLICT" if blocker == "hard_constraint"
+            else "REVIEW_EXECUTION_FAILED",
+            severity="error" if blocker == "hard_constraint" else "warning",
+        )
+        spec = spec.model_copy(update={"critic_result": spec.critic_result.model_copy(
+            update={"verdict": "needs_revision", "findings": [finding]})})
+    monkeypatch.setattr(app.comic_projects, "get_director", lambda *_args, **_kwargs: spec)
+    before = list(production)
+    with pytest.raises(ToolError):
+        app.confirm_comic_director(project_id, {
+            "version": request["director_version"],
+            "expected_project_version": request["expected_project_version"],
+        })
+    assert production == before and not app.runtime_store.list_approvals()
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
 
 
 def test_automatic_authorization_is_not_a_human_confirmation(
