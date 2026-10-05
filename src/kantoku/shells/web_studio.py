@@ -2443,6 +2443,7 @@ class StudioApplication:
                 spec = self.comic_projects.save_director(
                     project_id, draft, expected_project_version=snapshot.project.current_version,
                     source=source,
+                    preserve_provenance=request.revision_instruction is not None,
                 )
                 state.update(
                     task_status="completed", last_completed_step="director_spec_saved",

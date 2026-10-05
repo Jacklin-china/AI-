@@ -28,8 +28,10 @@ from kantoku.core.runtime.models import ExecutionStatus, RuntimeEventType
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillRegistry
 
-from .cinematography import parse_cinematography
+from .cinematography import parse_cinematography, require_execution_choices
 from .critic import DirectorCriticEngine, require_approved_director
+from .director_knowledge import MODEL_STAGES, load_director_skill_context
+from .director_provenance import project_provenance, stage_provenance
 from .models import (
     CinematographyPlan,
     ComicAsset,
@@ -284,10 +286,21 @@ class ComicDirectorCoordinator:
         )
         context_payload = self._context_payload(request, context)
         reused_outputs = self._reused_outputs(request, input_versions)
+        prior_knowledge = self.runtime_store.get_run(request.previous_run_id).state.get(
+            "director_skill_context", {},
+        ) if request.previous_run_id and reused_outputs else {}
+        prior_provenance = (
+            request.review_draft.model_dump(mode="json")["field_provenance"]
+            if request.review_draft else self.runtime_store.get_run(request.previous_run_id)
+            .state.get("field_provenance", {}) if request.previous_run_id and reused_outputs else {}
+        )
         state: dict[str, Any] = {
             "task_type": "director",
             "project_id": project.project_id,
             "execution_mode": request.execution_mode,
+            "execution_policy": request.review_draft.execution_policy
+            if request.review_draft else "single_image"
+            if self._director_knowledge_enabled(request) else None,
             "conversation_id": request.conversation_id,
             "worker_instance_id": request.worker_instance_id,
             "trace_id": trace_id,
@@ -305,6 +318,10 @@ class ComicDirectorCoordinator:
             },
             "completed_stages": list(reused_outputs),
             "stage_outputs": reused_outputs,
+            "field_provenance": prior_provenance,
+            "director_skill_context": {
+                skill: value for skill, value in prior_knowledge.items() if skill in reused_outputs
+            },
             "stage_statuses": {
                 f"comic.{stage}": "completed" if f"comic.{stage}" in reused_outputs else "pending"
                 for stage in DIRECTOR_STAGES
@@ -426,7 +443,9 @@ class ComicDirectorCoordinator:
                         }, context_payload, request, state, outputs, stages,
                     )
                 # Fast 隐藏审核细节，不绕过真实审核和受限修订。
-                provisional = self._provisional_spec(outputs, request, critic_result=None)
+                provisional = self._provisional_spec(
+                    outputs, request, critic_result=None, state=state,
+                )
                 state["director_candidate"] = provisional.model_dump(mode="json")
                 state["draft_status"] = "generated"
                 self.runtime_store.update_run(
@@ -655,8 +674,31 @@ class ComicDirectorCoordinator:
             "execution_mode": request.execution_mode,
             "input_versions": state["input_versions"],
             "context": context_payload,
+            "execution_plan_required": self._director_knowledge_enabled(request),
         }
         with run_trace(run_id, node_id):
+            if (skill_id in MODEL_STAGES and node_id not in request.stage_edits
+                    and self._director_knowledge_enabled(request)):
+                knowledge = load_director_skill_context(self.registry.get(skill_id).metadata)
+                stage_context["director_skill_context"] = knowledge
+                provenance = {key: value for key, value in knowledge.items() if key != "content"}
+                state["director_skill_context"][skill_id] = provenance
+                debug["knowledge"] = provenance
+                self.runtime_store.update_run(
+                    run_id, status=ExecutionStatus.RUNNING, state=state, current_node=node_id,
+                )
+                self._event(
+                    run_id, RuntimeEventType.NODE_PROGRESS, "director_skill_loaded",
+                    trace_id=trace_id, project_id=request.snapshot.project.project_id,
+                    shot_id=state.get("shot_id"), skill_id=skill_id,
+                    director_skill_loaded=True, knowledge=provenance,
+                )
+                logger.info(
+                    "director_skill_loaded=true trace_id={} project_id={} shot_id={} "
+                    "skill_id={} skill_version={} knowledge_sha256={}",
+                    trace_id, request.snapshot.project.project_id, state.get("shot_id") or "-",
+                    skill_id, knowledge["skill_version"], knowledge["sha256"],
+                )
             if skill_id == "comic.director_critic":
 
                 def emit(name: str, payload: dict[str, Any]) -> None:
@@ -709,6 +751,7 @@ class ComicDirectorCoordinator:
                 state["revision_count"] = outcome.revision_count
                 state["needs_review"] = outcome.needs_review
                 state["critic_status"] = candidate.get("critic_status")
+                state["field_provenance"] = candidate.get("field_provenance", {})
                 state["task_status"] = "needs_review" if outcome.needs_review else "planning"
                 state["draft_status"] = "needs_revision" if outcome.needs_review else "reviewed"
                 outputs.update({key: candidate[key] for key in (
@@ -720,7 +763,7 @@ class ComicDirectorCoordinator:
                     raw_output["critic_status"] = "unavailable"
             elif skill_id == "comic.director_assemble":
                 raw_output = {"director_spec": self._provisional_spec(
-                    outputs, request, critic_result=outputs.get("critic_result"),
+                    outputs, request, critic_result=outputs.get("critic_result"), state=state,
                 ).model_dump()}
             elif node_id in request.stage_edits:
                 output_key = {
@@ -747,6 +790,13 @@ class ComicDirectorCoordinator:
                             "raw_output": "", "missing_fields": [],
                         }}
             self._check_cancelled(run_id)
+            model_requests = list(raw_output.get("_model_requests", [])) \
+                if isinstance(raw_output, Mapping) else []
+            if isinstance(raw_output, Mapping):
+                raw_output = {key: value for key, value in raw_output.items()
+                              if key != "_model_requests"}
+            if model_requests:
+                debug["model_request_ids"] = model_requests
             if skill_id == "comic.cinematography":
                 diagnostics = raw_output.get("parse_diagnostics", {}) \
                     if isinstance(raw_output, Mapping) else {}
@@ -754,8 +804,11 @@ class ComicDirectorCoordinator:
                            if key != "parse_diagnostics"} \
                     if isinstance(raw_output, Mapping) else raw_output
                 camera, normalized = parse_cinematography(payload)
+                if stage_context["execution_plan_required"]:
+                    camera = require_execution_choices(camera)
                 diagnostics = {**normalized, **diagnostics,
-                               "missing_fields": camera.missing_fields, "status": camera.status}
+                               "missing_fields": camera.missing_fields, "status": camera.status,
+                               "unresolved_decisions": camera.unresolved_decisions}
                 raw_output = {"cinematography": camera.model_dump()}
                 self._camera_diagnostics(run_id, diagnostics, request, state)
             if not isinstance(raw_output, Mapping):
@@ -765,6 +818,27 @@ class ComicDirectorCoordinator:
                 store=self.runtime_store, run_id=run_id, node_id=node_id,
             )
         outputs.update(validated)
+        if skill_id in MODEL_STAGES and stage_context["execution_plan_required"]:
+            section = {"comic.creative_understanding": "creative_decision",
+                       "comic.visual_direction": "director_plan",
+                       "comic.cinematography": "cinematography"}[skill_id]
+            entries = stage_provenance(
+                section, validated[section], snapshot=request.snapshot, assets=request.assets,
+                knowledge=stage_context.get("director_skill_context"),
+                model_requests=model_requests, run_id=run_id,
+                manual=node_id in request.stage_edits,
+            )
+            for path, item in entries.items():
+                prior = state["field_provenance"].get(path)
+                if (node_id in request.stage_edits and prior
+                        and prior["value_sha256"] == item.value_sha256):
+                    continue
+                if prior and prior["value_sha256"] != item.value_sha256:
+                    item = item.model_copy(update={
+                        "previous_source": prior["source_type"],
+                        "previous_value_sha256": prior["value_sha256"],
+                    })
+                state["field_provenance"][path] = item.model_dump(mode="json")
         debug["output"] = _fingerprint(validated)
         self._event(
             run_id, RuntimeEventType.NODE_PROGRESS, "director_stage_debug",
@@ -840,7 +914,9 @@ class ComicDirectorCoordinator:
             failure = diagnostics.get("failure")
             if not failure:
                 try:
-                    raise ToolError("摄影方案不完整，已保留公开输出，需要修订")
+                    fields = [*diagnostics["missing_fields"],
+                              *diagnostics.get("unresolved_decisions", [])]
+                    raise ToolError("摄影方案不完整，已保留公开输出，需要修订：" + ",".join(fields))
                 except ToolError as error:
                     failure = public_error(
                         error, trace_id=state["trace_id"], run_id=run_id, skill_id=skill_id,
@@ -851,6 +927,7 @@ class ComicDirectorCoordinator:
                 "input_version": state["input_versions"],
                 "output_before_failure": dict(state["stage_outputs"]),
                 "missing_fields": diagnostics["missing_fields"],
+                "unresolved_decisions": diagnostics.get("unresolved_decisions", []),
                 "raw_output": diagnostics.get("raw_output", ""),
                 "exception": {"type": "CinematographyOutputError",
                               "message": failure["safe_message"]},
@@ -859,10 +936,21 @@ class ComicDirectorCoordinator:
             metadata["error_id"] = failure["error_id"]
             self._event(run_id, RuntimeEventType.NODE_PROGRESS, "node_warning", **metadata)
         self._event(run_id, RuntimeEventType.NODE_PROGRESS, "stage_output_saved", **metadata)
-        logger.info("Cinematography parse status={} missing_fields={} trace_id={}",
-                    diagnostics["status"], diagnostics["missing_fields"], state["trace_id"])
+        logger.info(
+            "Cinematography parse status={} missing_fields={} unresolved_decisions={} trace_id={}",
+            diagnostics["status"], diagnostics["missing_fields"],
+            diagnostics.get("unresolved_decisions", []), state["trace_id"],
+        )
         self.runtime_store.update_run(run_id, status=ExecutionStatus.RUNNING,
                                       state=state, current_node="cinematography")
+
+    def _director_knowledge_enabled(self, request: DirectorCoordinatorRequest) -> bool:
+        """Comic workspace knowledge policy; autonomous homepage keeps its existing input."""
+        if request.conversation_id:
+            conversation = self.runtime_store.get_conversation(request.conversation_id)
+            return (conversation.interaction_mode is InteractionMode.GUIDED
+                    and conversation.domain == "comic")
+        return request.execution_mode == "professional"
 
     def _check_cancelled(self, run_id: str) -> None:
         if self.runtime_store.get_run(run_id).status is ExecutionStatus.CANCELLED:
@@ -996,12 +1084,14 @@ class ComicDirectorCoordinator:
     def _provisional_spec(
         outputs: Mapping[str, Any], request: DirectorCoordinatorRequest,
         *, critic_result: Mapping[str, Any] | None,
+        state: Mapping[str, Any] | None = None,
     ) -> DirectorSpecDraft:
         decision = outputs["creative_decision"]
         plan = outputs["director_plan"]
         camera = outputs["cinematography"]
-        return DirectorSpecDraft.model_validate({
+        spec = DirectorSpecDraft.model_validate({
             "schema_version": 2,
+            "execution_policy": (state or {}).get("execution_policy"),
             # v2 的兼容字段与 Patch Alias 指向同一公开视觉焦点，避免双份值漂移。
             "visual_direction": plan["visual_focus"],
             "storytelling_goal": decision["intent_summary"],
@@ -1014,7 +1104,7 @@ class ComicDirectorCoordinator:
             "lighting": camera.get("lighting") or "光影方案待修订",
             "color_language": plan["color_strategy"],
             "emotion": decision["emotional_target"],
-            "character_focus": plan["visual_focus"],
+            "character_focus": plan.get("character_presence") or plan["visual_focus"],
             "constraints": decision.get("hard_constraints", []),
             "creative_choices": plan.get("creative_choices") or [
                 decision["narrative_focus"]
@@ -1028,7 +1118,14 @@ class ComicDirectorCoordinator:
             },
             "storyboard_version": request.storyboard.version if request.storyboard else None,
             "shot_version": request.shot.version if request.shot else None,
+            "field_provenance": (state or {}).get("field_provenance", {}),
+            "knowledge_refs": list(dict.fromkeys(
+                [ref for knowledge in (state or {}).get("director_skill_context", {}).values()
+                 for ref in knowledge["knowledge_refs"]]
+                + (request.review_draft.knowledge_refs if request.review_draft else [])
+            )),
         })
+        return project_provenance(spec)
 
     @staticmethod
     def _stale_dependents(

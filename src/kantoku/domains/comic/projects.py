@@ -19,6 +19,8 @@ from kantoku.core.conversations import InteractionMode
 from kantoku.core.runtime.models import ApprovalDecision, ExecutionStatus, RuntimeEventType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
+from .cinematography import require_execution_choices
+from .director_provenance import project_decision_fields, project_provenance, record_changes
 from .models import (
     ComicAsset,
     ComicContext,
@@ -30,6 +32,7 @@ from .models import (
     CreativeBriefUpdate,
     CreativeIntentBoundary,
     CreativeProject,
+    DirectorEvidence,
     DirectorSpec,
     DirectorSpecDraft,
     ProjectStatus,
@@ -418,6 +421,7 @@ class ComicProjectStore:
         expected_project_version: int,
         source: Literal["model", "manual", "restored"] = "manual",
         restored_from_version: int | None = None,
+        preserve_provenance: bool = False,
     ) -> DirectorSpec:
         """CAS 追加导演修订；Brief 改动会清除当前指针但保留历史。"""
         with self._connect() as connection:
@@ -432,6 +436,27 @@ class ComicProjectStore:
                 raise ToolError("作品已由其他操作更新，请刷新后重试")
             snapshot = self._snapshot(connection, project_id, current_version)
             project = snapshot.project
+            if source == "manual" and not preserve_provenance:
+                previous = DirectorSpec.model_validate_json(self._version_payload(
+                    connection, project_id, "director_spec", project.director_id,
+                    project.director_version,
+                )) if project.director_id else None
+                if previous:
+                    draft = draft.model_copy(update={"execution_policy": previous.execution_policy})
+                if draft.execution_policy == "single_image":
+                    draft = project_decision_fields(draft, previous)
+                draft = record_changes(
+                    previous, draft, source="manual_edit", evidence=DirectorEvidence(
+                        source_type="manual_edit", reference=f"project:{project_id}",
+                        version=current_version,
+                    ),
+                )
+            else:
+                draft = project_provenance(draft)
+            if draft.schema_version == 2 and draft.execution_policy == "single_image":
+                draft = draft.model_copy(update={
+                    "cinematography": require_execution_choices(draft.cinematography),
+                })
             missing = [
                 item for item in snapshot.creative_brief.hard_constraints
                 if item not in draft.constraints

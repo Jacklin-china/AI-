@@ -218,6 +218,7 @@ class CinematographyPlan(BaseModel):
     color_relationship: BriefText | None = None
     depth_strategy: BriefText | None = None
     material_language: BriefText | None = None
+    unresolved_decisions: list[BriefItem] = Field(default_factory=list, max_length=10)
 
     @property
     def missing_fields(self) -> list[str]:
@@ -232,7 +233,10 @@ class CinematographyPlan(BaseModel):
         if self.status == "missing" and len(self.missing_fields) < 11:
             # 用户在现有草稿编辑入口补字段时，状态随真实内容更新，不要求改隐藏状态。
             self.status = "needs_revision"
-        if self.status == "needs_revision" and not self.missing_fields:
+        if self.unresolved_decisions:
+            self.status = "needs_revision"
+        if (self.status == "needs_revision" and not self.missing_fields
+                and not self.unresolved_decisions):
             self.status = "complete"
         if self.status == "complete" and self.missing_fields:
             raise ValueError("完整摄影方案不能缺少摄影字段")
@@ -276,6 +280,32 @@ class DirectorCriticResult(BaseModel):
     allowed_patches: list[BriefItem] = Field(default_factory=list, max_length=20)
     review_version: str | None = Field(default=None, max_length=100)
     reviewed_spec_hash: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    model_request_id: str | None = Field(default=None, max_length=100)
+
+
+DirectorSource = Literal["user_fact", "asset_fact", "skill_method", "model_choice", "manual_edit"]
+
+
+class DirectorEvidence(BaseModel):
+    """可解析的依据；knowledge 只是方法输入，不能证明一个作品事实。"""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_type: DirectorSource
+    reference: BriefItem
+    field_path: BriefItem | None = None
+    version: int | None = Field(default=None, ge=1)
+    sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+
+
+class DirectorFieldProvenance(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    source_type: DirectorSource
+    trust_status: Literal["confirmed_fact", "creative_choice", "unresolved"]
+    value_sha256: str = Field(pattern=r"^[0-9a-f]{64}$")
+    evidence: list[DirectorEvidence] = Field(default_factory=list, max_length=16)
+    previous_source: DirectorSource | None = None
+    previous_value_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
+    derived_from: BriefItem | None = None
 
 
 class DirectorSpecDraft(BaseModel):
@@ -289,6 +319,7 @@ class DirectorSpecDraft(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     schema_version: Literal[1, 2] = 1
+    execution_policy: Literal["single_image"] | None = None
     visual_direction: BriefText
     storytelling_goal: BriefText
     camera_language: BriefText
@@ -305,6 +336,9 @@ class DirectorSpecDraft(BaseModel):
     critic_result: DirectorCriticResult | None = None
     critic_status: Literal["unavailable"] | None = None
     knowledge_refs: list[BriefItem] = Field(default_factory=list, max_length=50)
+    field_provenance: dict[str, DirectorFieldProvenance] = Field(
+        default_factory=dict, max_length=100,
+    )
     asset_versions: dict[str, int] = Field(default_factory=dict, max_length=50)
     storyboard_version: int | None = Field(default=None, ge=1)
     shot_version: int | None = Field(default=None, ge=1)

@@ -55,13 +55,13 @@ def _parts() -> dict[str, dict[str, Any]]:
         "creative_choices": ["先建立环境压力，再聚焦人物回应。"],
     }
     camera = {
-        "shot_size": "远景渐进中近景",
+        "shot_size": "全景",
         "camera_angle": "随动作略低机位",
-        "camera_distance": "先远后近",
+        "camera_distance": "距人物六米",
         "spatial_feel": "竹林形成自然纵深",
         "lens_or_spatial_feel": "自然透视",
         "lighting": "冷色散射光照亮雨幕",
-        "light_source": "天光与剑光",
+        "light_source": "天光为主光，剑光为局部辅助光",
         "light_direction": "侧后方轮廓光",
         "color_relationship": "蓝灰环境对比暖色剑光",
         "depth_strategy": "雨丝、人物、竹林分层",
@@ -301,6 +301,11 @@ def test_professional_can_rerun_from_a_stage_using_persisted_outputs(tmp_path: P
     assert again.director_spec.version == first.director_spec.version + 1
     assert runtime.get_run(again.run_id).state["completed_stages"] == SKILLS
     assert again.run_id != first.run_id
+    first_knowledge = runtime.get_run(first.run_id).state["director_skill_context"]
+    resumed_knowledge = runtime.get_run(again.run_id).state["director_skill_context"]
+    assert set(resumed_knowledge) == set(SKILLS[:3])
+    assert resumed_knowledge[SKILLS[0]] == first_knowledge[SKILLS[0]]
+    assert resumed_knowledge[SKILLS[1]] == first_knowledge[SKILLS[1]]
 
 
 def test_coordinator_only_dispatches_director_skills(tmp_path: Path) -> None:

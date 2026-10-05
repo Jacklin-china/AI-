@@ -2,7 +2,7 @@ id: comic.cinematography
 name: Comic Cinematography
 domain: comic
 description: 根据导演计划与镜头上下文生成可编辑的摄影方案。
-version: 1.1.0
+version: 1.2.0
 required_tools: []
 input_schema:
   type: object
@@ -28,7 +28,7 @@ execution_policy:
   provider_binding: false
   coordinator_owned: true
   contract_only: true
-knowledge_refs: [cinematography.language, cinematography.spatial-continuity]
+knowledge_refs: [cinematography.language, cinematography.spatial-continuity, cinematography.lighting]
 test_cases:
   - id: accepts_shot_context
     description: 摄影决策必须基于当前镜头上下文，而不是全量历史。

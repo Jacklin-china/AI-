@@ -52,6 +52,9 @@ def observed(app: StudioApplication, monkeypatch: pytest.MonkeyPatch) -> list[di
             for key, value in output.items():
                 if isinstance(value, str):
                     output[key] = f"{brief['original_request']}：{key}"
+            # 隔离测试仍需满足当前执行契约；上下文标记继续留在叙事/空间字段。
+            if "shot_size" in output:
+                output.update(shot_size="全景", camera_angle="平视")
             if "hard_constraints" in output:
                 output["hard_constraints"] = brief["hard_constraints"]
             if "creative_choices" in output:

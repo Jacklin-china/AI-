@@ -438,3 +438,43 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   2026-10-05 真实专业闭环已到达当前图片 Provider，但 `qwen-image-2.1-pro` 仍返回
   `403 AccessDenied.Unpurchased`；镜头可直接重试、预算释放且记录 ¥0.00。
   真实图片交付验收为 **BLOCKED（供应商模型权限）**，不得用离线测试图片冒充成功。
+
+### Director Skill 知识实际加载（2026-10-05）
+
+- 现有五个导演 Skill 的 Registry/handler 保持不变；原 `knowledge_refs` 过去只有名称，
+  现在前三个模型阶段由 Comic Domain 解析实际知识文件。六份正文位于既有
+  `skills/comic/director/knowledge/`，覆盖叙事、构图、镜头设计、摄影、空间连续性及灯光。
+  引用由 manifest 决定；缺失、空正文、未解析引用、越界路径或超长知识明确报错，不能假报已加载。
+- 同一 Coordinator 在 Comic Guided 会话（包括精简导演模式）及无会话的 Professional API 中，
+  将相关知识交给原共享文本阶段适配器。正文进入 system 指令；当前 Brief、任务及固定资产
+  继续作为有界创作输入，知识不覆盖作品事实或硬约束。Autonomous 首页和无会话 Fast API
+  保持原模型输入。人工编辑节点不假报模型执行，Critic/确认/外部图片策略保持原流程。
+- 原 Run state、阶段 Debug 和 `director_skill_loaded` Runtime Event 保存 Skill 版本、引用、
+  文件路径、长度及 SHA-256，不保存知识正文或模型私有推理。重新执行的阶段读取当前文件；
+  复用阶段保留来源 Run 的知识指纹，不伪造本次重新加载。日志带 trace/project/shot/skill 身份
+  和 `director_skill_loaded=true`；加载错误由原 public_error 留下 error_id、trace_id 与脱敏堆栈。
+- 未创建第二套 Skill、Compiler、Runtime 或 Artifact。完整外部 Image Prompt、复制、上传、
+  Prompt 资产库及上传图片后的确认/视频衔接仍是后续模块，不能以本次知识接入冒充已完成。
+
+### Director 字段来源与执行方案（Module 1.5，2026-10-05）
+
+- DirectorSpec 的 `field_provenance` 按字段绑定值的 SHA-256、来源类型和可信状态，依据引用
+  Brief/资产的 ID 与版本、实际加载的 Skill hash、应用模型请求 ID 或人工编辑的版本。
+  用户约束或对应资产字段只有逐字一致才记为 confirmed_fact；模型补出的摄影、姿态、
+  色彩等是 model_choice/creative_choice。方法证据说明知识进入了输入，不冒充作品事实，
+  也不宣称已证明每个模型选择与知识之间的因果关系。缺值、未决参数或无请求证据记为 unresolved。
+- 来源由服务端维护，客户端和修改模型不能自报 confirmed_fact。手工编辑只更新变动字段，
+  保留未变依据与上一个值的指纹；指令修改及合法 Critic Patch 标记为模型选择。复审、
+  重跑和恢复仍使用原 Run/版本表，兼容字段与分层决定对应，不复制一份独立方案。
+- 新 Comic 导演工作区绑定 `execution_policy=single_image`。最终景别、机位、主光源、
+  主光方向、色彩及人物执行字段须明确选择；视觉阶段与摄影阶段各最多收敛一次已返回的
+  候选。不依据情绪填默认参数、不选第一个候选。仍未确定时保存真实草稿及具体字段，
+  等待修订；排除说明、同义角度和机位高度不误当互斥候选。首页保留原策略，历史空元数据
+  不改变旧审核指纹；人工编辑继承服务端策略，不能通过删除隐藏字段绕过。
+- Critic 只接收一份分层决定、必要 Brief/资产/镜头上下文与去重后的字段依据，不再重复
+  扁平兼容字段和完整 public_decision。编辑模型也只读取精简来源，不能重写来源元数据。
+  应用请求 ID 关联阶段 Debug 与日志，区别于供应商 response ID；实际供应商 ID 在实测
+  Trace 中另行记录。Critic 的一次结构修复/unavailable 恢复及版本绑定的人工确认保持原流程。
+- 本模块未增加 Skill、Registry、Agent、Runtime、Workflow、Artifact 或依赖；不修改 UI、
+  Prompt Compiler、Canvas、图片上传或 Video。真实文本实测在隔离数据库执行，另行授权
+  上限，记录用量与配置价格估算，不把估算称为最终账单，也不自动代表用户完成方案验收。

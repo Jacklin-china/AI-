@@ -2,7 +2,7 @@ id: comic.creative_understanding
 name: Comic Creative Understanding
 domain: comic
 description: 将创作简报和有界上下文整理为公开的 CreativeDecision。
-version: 1.0.0
+version: 1.1.0
 required_tools: []
 input_schema:
   type: object

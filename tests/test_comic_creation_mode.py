@@ -156,10 +156,10 @@ def test_diverse_creative_contracts_use_current_project_context_not_previous_out
         parts[SKILLS[1]]["director_plan"].update({
             "visual_strategy": plan_text, "visual_focus": request,
             "creative_choices": [plan_text], "composition_strategy": plan_text,
-            "color_strategy": "依据当前场景的环境色形成主体关系",
+            "color_strategy": "蓝灰环境色与人物服装形成清晰色彩对比",
         })
         parts[SKILLS[2]]["cinematography"].update({
-            "shot_size": "按当前主体和环境关系取景", "camera_angle": "平视",
+            "shot_size": "全景", "camera_angle": "平视",
             "camera_distance": "同时容纳主体与环境", "spatial_feel": plan_text,
             "lighting": "当前场景的环境光", "light_source": "场景内光源",
             "light_direction": "侧方", "color_relationship": "主体和背景分离",

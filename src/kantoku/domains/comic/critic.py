@@ -19,6 +19,14 @@ from kantoku.config.observability import (
     redact_secrets,
 )
 
+from .cinematography import (
+    EXECUTION_FIELDS,
+    PLAN_EXECUTION_FIELDS,
+    require_execution_choices,
+    unresolved_execution,
+)
+from .director import _tracked_model
+from .director_provenance import provenance_context, record_changes
 from .models import (
     CinematographyPlan,
     ComicAsset,
@@ -29,6 +37,7 @@ from .models import (
     DirectorCriticFinding,
     DirectorCriticPatch,
     DirectorCriticResult,
+    DirectorEvidence,
     DirectorPlan,
     DirectorSpecDraft,
 )
@@ -43,7 +52,8 @@ CRITIC_ALLOWED_FIELD_PATHS = frozenset(
         ("cinematography", CinematographyPlan),
     )
     for name in model.model_fields
-    if name not in {"hard_constraints", "soft_preferences", "creative_freedom", "status"}
+    if name not in {"hard_constraints", "soft_preferences", "creative_freedom", "status",
+                    "public_decision", "unresolved_decisions"}
 )
 PATCH_FIELDS = frozenset({
     "creative_decision.emotional_target",
@@ -105,6 +115,10 @@ def director_hash(spec: DirectorSpecDraft) -> str:
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
     if payload.get("critic_status") is None:
         payload.pop("critic_status", None)
+    if not payload.get("field_provenance"):
+        payload.pop("field_provenance", None)
+    if payload.get("execution_policy") is None:
+        payload.pop("execution_policy", None)
     # 新增的可选表现字段为空时不改变历史审核指纹。
     plan = payload.get("director_plan")
     if isinstance(plan, dict):
@@ -121,6 +135,8 @@ def director_hash(spec: DirectorSpecDraft) -> str:
         for key in ("public_decision", "creative_reason"):
             if camera.get(key) is None:
                 camera.pop(key, None)
+        if not camera.get("unresolved_decisions"):
+            camera.pop("unresolved_decisions", None)
     encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
 
@@ -131,6 +147,8 @@ def require_approved_director(
     """旧 v1 保持兼容；v2 必须有绑定当前方案的实际审核凭据。"""
     if spec.schema_version == 1:
         return
+    if spec.execution_policy == "single_image" and _execution_issues(spec):
+        raise ToolError("最终摄影决策待修订，不能进入下一步")
     if spec.cinematography is None or spec.cinematography.status != "complete":
         raise ToolError("摄影方案待修订，不能进入下一步")
     review = spec.critic_result
@@ -152,6 +170,27 @@ def require_approved_director(
             } for item in review.findings)):
         return
     raise ToolError("DirectorSpec v2 尚未通过当前方案的导演审核：存在阻断问题或需要人工审核")
+
+
+def _execution_issues(spec: DirectorSpecDraft) -> list[str]:
+    return ([f"cinematography.{name}" for name in unresolved_execution(
+        spec.cinematography.model_dump(), EXECUTION_FIELDS,
+    ) if getattr(spec.cinematography, name) is not None]
+        + [f"director_plan.{name}" for name in unresolved_execution(
+        spec.director_plan.model_dump(), PLAN_EXECUTION_FIELDS,
+    )])
+
+
+def critic_spec_context(spec: DirectorSpecDraft) -> dict[str, Any]:
+    """只发送一份分层决策；兼容别名仍由服务器解释，不重复送入模型。"""
+    data = spec.model_dump(mode="json", include={
+        "schema_version", "creative_decision", "director_plan", "cinematography",
+        "asset_versions", "storyboard_version", "shot_version", "knowledge_refs",
+        "execution_policy",
+    })
+    data["cinematography"].pop("public_decision", None)
+    data.update(provenance_context(spec))
+    return data
 
 
 class PublicFinding(BaseModel):
@@ -381,6 +420,12 @@ class DirectorCriticEngine:
             finding("DIRECTOR_REASON_MISSING", "error", "director_plan.creative_choices",
                     "[]", "解释构图、色彩、光影和人物关系如何服务叙事")
         camera = spec.cinematography
+        if spec.execution_policy == "single_image":
+            for path in _execution_issues(spec):
+                finding("EXECUTION_DECISION_UNRESOLVED", "error", path, _value(data, path),
+                        "仅确定一个最终参数，未确定的创作选择保留待修订")
+            if any(item.code == "EXECUTION_DECISION_UNRESOLVED" for item in findings):
+                return self._result(spec, findings, [], "最终执行参数尚未确定，草稿已保留。", 1.0)
         if camera is None or camera.status != "complete":
             finding("CINEMATOGRAPHY_INCOMPLETE", "warning", "cinematography",
                     camera.status if camera else "missing",
@@ -410,7 +455,7 @@ class DirectorCriticEngine:
             return self._result(spec, findings, [], "约束或来源版本冲突，需要人工处理。", 1.0)
 
         context = {
-            "director_spec": data, "creative_brief": brief.model_dump(
+            "director_spec": critic_spec_context(spec), "creative_brief": brief.model_dump(
                 mode="json", include=set(CreativeBriefInput.model_fields),
             ),
             "relevant_assets": [item.model_dump(mode="json", include={
@@ -430,7 +475,10 @@ class DirectorCriticEngine:
                 "审核当前导演方案的视觉因果、用户约束语义、角色/场景/风格一致性、"
                 "构图/色彩/光影/人物关系的公开创作理由以及空泛模板词。"
                 "结合具体故事判断；孤独也可在战斗中表达，禁止情绪到固定镜头的映射。"
-                "不要创造新方案或改写用户约束。只返回 JSON：public_summary、confidence、"
+                "不要创造新方案或改写用户约束。"
+                "field_provenance 的引用指向 provenance_sources，知识为方法依据，"
+                "model_choice 不能作为用户或资产事实；检查各层最终决定是否一致。"
+                "只返回 JSON：public_summary、confidence、"
                 "findings、suggested_patches。不要输出思维链、reasoning 或 CoT。"
                 "findings 每项必须含 code、severity(info/warning/error)、field_path、"
                 "evidence(输入中的逐字公开片段)、expected、suggested_action。"
@@ -446,8 +494,12 @@ class DirectorCriticEngine:
             )},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ]
-        raw = self.model_call(messages)
-        semantic, raw_patches = self._parse_review(raw, messages)
+        tracked, requests = _tracked_model(self.model_call, {
+            "component": "comic.director_critic", "trace_id": current_trace_id(),
+            "run_id": current_run_id(),
+        })
+        raw = tracked(messages)
+        semantic, raw_patches = self._parse_review(raw, messages, model_call=tracked)
         invalid_patches: list[DirectorCriticFinding] = []
         for patch_data in raw_patches:
             try:
@@ -498,10 +550,11 @@ class DirectorCriticEngine:
         return self._result(
             spec, findings, semantic.suggested_patches if not unverified else [],
             semantic.public_summary, semantic.confidence,
-        )
+        ).model_copy(update={"model_request_id": requests[-1]})
 
     def _parse_review(
         self, raw: str, messages: list[dict[str, str]], *, repair: bool = True,
+        model_call: ReviewModel | None = None,
     ) -> tuple[SemanticReview, list[Any]]:
         try:
             payload = json.loads(raw)
@@ -531,12 +584,12 @@ class DirectorCriticEngine:
             if repair:
                 # Re-request only the public structure from the same bounded context.
                 # Never echo an invalid response that could contain private reasoning.
-                repaired = self.model_call([*messages, {"role": "user", "content": (
+                repaired = (model_call or self.model_call)([*messages, {"role": "user", "content": (
                     "上次公开审核结构无效。只修复一次结构，依据原输入返回完整公开审核 JSON；"
                     "不得改写导演方案或输出私有推理。Schema 问题："
                     + json.dumps(issues, ensure_ascii=False)
                 )}])
-                return self._parse_review(repaired, messages, repair=False)
+                return self._parse_review(repaired, messages, repair=False, model_call=model_call)
             # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
             raise ToolError("导演审核模型未返回有效的公开审核结构") from None
         return semantic, raw_patches
@@ -669,7 +722,19 @@ class DirectorCriticEngine:
             ),
             "critic_result": None,
         })
-        return DirectorSpecDraft.model_validate(data)
+        revised = DirectorSpecDraft.model_validate(data)
+        if spec.execution_policy == "single_image":
+            revised = revised.model_copy(update={
+                "cinematography": require_execution_choices(revised.cinematography),
+            })
+        # 模型建议经验证后才改值；禁止沿用被替换字段的用户/资产事实标记。
+        if result.model_request_id:
+            revised = record_changes(
+                spec, revised, source="model_choice", evidence=DirectorEvidence(
+                    source_type="model_choice", reference=result.model_request_id,
+                ),
+            )
+        return revised
 
     def review_and_revise(
         self,

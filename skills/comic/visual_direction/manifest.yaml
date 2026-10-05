@@ -2,7 +2,7 @@ id: comic.visual_direction
 name: Comic Visual Direction
 domain: comic
 description: 根据创意决策与项目资产生成可编辑的 DirectorPlan。
-version: 1.0.0
+version: 1.1.0
 required_tools: []
 input_schema:
   type: object

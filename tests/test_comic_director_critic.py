@@ -158,6 +158,9 @@ def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> 
     spec = _spec()
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
     payload.pop("critic_status")
+    payload.pop("field_provenance")
+    payload.pop("execution_policy")
+    payload["cinematography"].pop("unresolved_decisions")
     for field in ("style_boundary", "character_expression", "character_pose", "character_presence"):
         payload["director_plan"].pop(field)
     for field in ("status", "public_decision", "creative_reason"):
@@ -463,9 +466,10 @@ def test_second_review_failure_does_not_trigger_a_second_automatic_patch() -> No
 
     def model(messages: Any) -> str:
         calls.append(messages)
-        current = DirectorSpecDraft.model_validate(
-            json.loads(messages[1]["content"])["director_spec"],
-        )
+        context = json.loads(messages[1]["content"])["director_spec"]
+        current = _spec().model_copy(update={
+            "director_plan": _spec().director_plan.model_validate(context["director_plan"]),
+        })
         return _semantic([_finding(current)], [_patch(current)])
 
     events: list[str] = []

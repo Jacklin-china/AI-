@@ -17,6 +17,77 @@ from .models import CinematographyPlan
 ALIASES = {"lighting_direction": "light_direction", "depth_of_field": "depth_strategy",
            "lens": "lens_or_spatial_feel", "spatial_relationship": "spatial_feel"}
 PUBLIC_KEYS = {"summary", "composition_strategy", "creative_reason"}
+EXECUTION_FIELDS = ("shot_size", "camera_angle", "light_source", "light_direction",
+                    "color_relationship")
+PLAN_EXECUTION_FIELDS = (
+    "visual_focus", "subject_environment_relation", "composition_strategy", "color_strategy",
+    "style_boundary", "character_expression", "character_pose", "character_presence",
+)
+ALTERNATIVES = re.compile(
+    r"或者|或是|还是|抑或|二选一|任选|可选|视情况|(?:\b(?:or|either|alternatively)\b)|"
+    r"(?<!不)或|渐进|切换|先.{0,15}(?:后|再)|(?:远景|全景|中景|近景|特写)\s*[/／→至到]",
+    re.IGNORECASE,
+)
+UNDECIDED = re.compile(r"待定|未定|待确认|任选|取决于|按当前|依据当前|后续确定|视情况")
+SHOT_SIZE = re.compile(
+    r"远景|全景|中景|近景|特写|全身|半身|胸像|腰部|"
+    r"\b(?:wide|long|full|medium|close[ -]?up|extreme close[ -]?up|CU|MS|LS|WS)\b", re.I,
+)
+CAMERA_POSITION = re.compile(
+    r"平视|俯|仰|低机位|高机位|略低|略高|水平|正面|侧面|鸟瞰|顶视|倾斜|眼睛高度|"
+    r"\b(?:eye[ -]?level|low|high|level|overhead|side|front|dutch|top)\b", re.I,
+)
+
+
+def _decision_text(value: str) -> str:
+    # “不使用仰拍或俯拍”是排除说明，不能算两个被选中的机位。
+    negative = re.compile(
+        r"^(?:全图|画面|人物|环境)?(?:不(?:采用|使用|表现|出现|新增|引入|依靠|设|做|含|打开|"
+        r"保留|切|夸张|直视|靠|奔跑|跳跃|施法|挥剑|移动)|不要|禁止|避免|而非)"
+    )
+    return "，".join(part for part in re.split(r"[，,。；;\n]", value)
+                    if not negative.search(part.strip()))
+
+
+def unresolved_execution(values: Mapping[str, Any], fields: tuple[str, ...]) -> list[str]:
+    """候选表达不能提升为最终执行参数；只识别冲突，不替导演选择。"""
+    unresolved = []
+    for name in fields:
+        value = values.get(name)
+        if value is None and name in PLAN_EXECUTION_FIELDS:
+            continue  # 可选人物表现字段未设计，不能伪造一份默认设定。
+        if isinstance(value, str):
+            value = _decision_text(value)
+        if (not isinstance(value, str) or not value.strip() or ALTERNATIVES.search(value)
+                or UNDECIDED.search(value)):
+            unresolved.append(name)
+            continue
+        if name == "shot_size":
+            if (not SHOT_SIZE.search(value)
+                    or len(set(re.findall("远景|全景|中景|近景|特写", value))) > 1):
+                unresolved.append(name)
+        elif name == "camera_angle":
+            # 俯拍/俯视同义，只要一个机位即可。
+            # 机位高度与视线角度是两件事：低机位平视可以是同一个确定机位。
+            groups = (r"低角度|仰拍|仰视|略仰|\blow[ -]?angle\b",
+                      r"平视|水平机位|水平视角|眼睛高度|\beye[ -]?level\b",
+                      r"俯拍|俯视|略俯|鸟瞰|顶视|\b(?:high[ -]?angle|overhead)\b")
+            if (not CAMERA_POSITION.search(value)
+                    or sum(bool(re.search(group, value, re.I)) for group in groups) > 1):
+                unresolved.append(name)
+        elif (name == "light_direction" and re.search("左右|两侧|四面|前后", value)
+              or name == "light_source" and re.search("与|和|、|及", value) and "主" not in value):
+            unresolved.append(name)
+    return unresolved
+
+
+def require_execution_choices(plan: CinematographyPlan) -> CinematographyPlan:
+    unresolved = [name for name in unresolved_execution(plan.model_dump(), EXECUTION_FIELDS)
+                  if getattr(plan, name) is not None]
+    return CinematographyPlan.model_validate({
+        **plan.model_dump(), "unresolved_decisions": unresolved,
+        "status": "needs_revision" if unresolved else plan.status,
+    })
 
 
 def _issues(error: Exception) -> dict[str, Any]:
