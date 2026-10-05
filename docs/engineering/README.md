@@ -422,3 +422,19 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 - 排查实际供应商响应先于修改链路：2026-10-04 两个创作域 Run 已完成分镜和 Prompt，
   在 `generate` 收到 `403 AccessDenied.Unpurchased`，当时配置为 `qwen-image-2.1-pro`。
   这属于平台模型权限，不是导演 Approval；不得通过删除审核、重写 Provider 或盲目重试掩盖。
+
+### Comic 专业审核恢复与镜头隔离（2026-10-05）
+
+- Critic 公开 JSON 校验失败时，使用同一有界输入只请求一次结构修复；不回传非法响应或私有推理。
+  仍无合法结果时，保存 `critic_status=unavailable`、`critic_result=null`、原 DirectorSpec、错误 ID
+  和 `critic_unavailable/node_warning` 事件，导演 Run 等待人工确认。没有伪造 pass、confidence 或审核内容。
+  完整摄影及当前 Brief/资产/镜头版本仍须有效；只有当前版本的显式人工确认允许继续制作。
+  首页自动策略不能接受 unavailable，原硬约束/资产冲突门禁保留。
+- 专业“进入下一步”只通过已有 Storyboard API 规划分镜；用户选择镜头后才提交图片。
+  新镜头的 Prompt 版本列表为空是正常状态。图片加载、错误、重试和费用按 Project/Shot/生成请求投影，
+  只放在分镜画面中；导演、资产、Prompt、历史和导航不挂图片占位。
+  网络重试绑定原请求及原 Prompt 版本；显式重新生成创建新请求，保留失败记录和导演版本。
+- Comic 图片日志补充估算/实际人民币费用、耗时及供应商 HTTP 状态/错误码/脱敏消息。
+  2026-10-05 真实专业闭环已到达当前图片 Provider，但 `qwen-image-2.1-pro` 仍返回
+  `403 AccessDenied.Unpurchased`；镜头可直接重试、预算释放且记录 ¥0.00。
+  真实图片交付验收为 **BLOCKED（供应商模型权限）**，不得用离线测试图片冒充成功。

@@ -1,12 +1,16 @@
 """Workspace-only production diagnostics; no live or paid model calls."""
 
+import json
+
 import pytest
+from loguru import logger
 from test_home_quick_domain import _workspace_production_request
 from test_home_quick_domain import app as app_fixture
 from test_home_quick_domain import production as production_fixture
 
 from kantoku.config import ToolError
 from kantoku.core import budget
+from kantoku.domains.comic.critic import require_approved_director
 
 app = app_fixture
 production = production_fixture
@@ -114,3 +118,117 @@ def test_workspace_defaults_to_current_director_board_and_keeps_history(app, pro
     with pytest.raises(ToolError, match="导演方案已变化"):
         app.comic_prompts.source(historical["shots"][0]["shot_id"])
     app.comic_prompts.source(current["shots"][0]["shot_id"])
+
+
+@pytest.mark.parametrize("critic_output", ["normal", "repaired", "unavailable"])
+def test_professional_director_confirm_storyboard_and_selected_image(
+    app, production, monkeypatch, critic_output,
+):
+    original = app._comic_director_model
+    reviews = []
+
+    def model(messages):
+        response = original(messages)
+        if '"title": "SemanticReview"' in messages[0]["content"]:
+            reviews.append(messages)
+            if (critic_output == "unavailable"
+                    or (critic_output == "repaired" and len(reviews) == 1)):
+                payload = json.loads(response)
+                payload.pop("confidence")
+                return json.dumps(payload)
+        return response
+
+    monkeypatch.setattr(app, "_comic_director_model", model)
+    request = _workspace_production_request(app, confirm=False)
+    project_id = request["production_project_id"]
+    spec = app.comic_projects.get_director(project_id)
+    assert len(reviews) == (1 if critic_output == "normal" else 2)
+    director_run = next(run for run in app.runtime_store.list_runs()
+                        if run.workflow == "comic.director")
+    if critic_output == "unavailable":
+        assert spec.critic_status == "unavailable" and spec.critic_result is None
+        assert director_run.status.value == "waiting"
+        events = [e.payload.get("director_event")
+                  for e in app.runtime_store.list_events(director_run.id)]
+        assert "critic_unavailable" in events and "node_warning" in events
+        with pytest.raises(ToolError):
+            require_approved_director(spec, allow_advisory=True)
+    else:
+        assert spec.critic_result.verdict == "pass"
+    with pytest.raises(ToolError, match="确认|尚未通过"):
+        app.comic_projects.require_confirmed_director(spec)
+    confirmed = app.confirm_comic_director(project_id, {
+        "version": spec.version, "expected_project_version": request["expected_project_version"],
+    })
+    assert confirmed["user_confirmed"] and confirmed["approval"]["status"] == "approved"
+    board = app.create_comic_storyboard(project_id, {
+        "expected_project_version": request["expected_project_version"],
+        "generate": True, "task": "当前导演方案分镜",
+    })
+    assert not [run for run in app.runtime_store.list_runs()
+                if run.workflow == "comic.production.v1"]
+    shot = board["shots"][0]
+    calls = list(production)
+    run = app.create_core_run({"domain": "comic", "state": {
+        **request, "shot_id": shot["shot_id"], "shot_version": shot["version"],
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+    }})
+    assert run["status"] == "completed"
+    assert production[len(calls):] == ["prompt"]  # no repeated Director or Storyboard
+    assert not [item for item in app.runtime_store.list_approvals() if item.run_id == run["id"]]
+    artifact = app.runtime_store.get_artifact(run["state"]["image_artifact_id"])
+    assert artifact.metadata["shot_id"] == shot["shot_id"]
+    assert app.comic_projects.get_director(project_id).critic_result == spec.critic_result
+
+
+def test_failed_shot_new_attempt_succeeds_and_cost_error_logs_are_complete(
+    app, production, monkeypatch,
+):
+    request = _workspace_production_request(app)
+    submit = app.image_service.provider.submit
+    attempts = []
+
+    def fail_once(**kwargs):
+        attempts.append(kwargs["client_request_id"])
+        if len(attempts) == 1:
+            error = ToolError("explicit offline denial")
+            error.status_code = 403
+            error.provider_error_code = "AccessDenied.Unpurchased"
+            error.provider_error_message = "offline denied api_key=sk-testsecret12345"
+            raise error
+        return submit(**kwargs)
+
+    monkeypatch.setattr(app.image_service.provider, "submit", fail_once)
+    lines = []
+    sink = logger.add(lambda message: lines.append(str(message)), format="{message}")
+    try:
+        failed = app.create_core_run({"domain": "comic", "state": request})
+        assert failed["status"] == "failed" and failed["image_execution"]["can_regenerate"]
+        creation = failed["state"]["quick_creation"]
+        shot = app.comic_storyboards.get_shot(creation["shot_id"])
+        repeated = app.create_core_run({"domain": "comic", "state": request})
+        assert repeated["id"] == failed["id"] and len(attempts) == 1
+        retry = app.create_core_run({"domain": "comic", "state": {
+            **request, "request_id": "workspace-explicit-retry",
+            "shot_id": shot.shot_id, "shot_version": shot.version,
+            "expected_project_version": app.comic_projects.get(
+                shot.project_id).project.current_version,
+        }})
+    finally:
+        logger.remove(sink)
+    assert retry["status"] == "completed" and len(attempts) == 2
+    assert attempts[0] != attempts[1] and retry["id"] != failed["id"]
+    assert app.runtime_store.get_run(failed["id"]).status.value == "failed"
+    assert app.comic_projects.get(shot.project_id).project.director_version == request[
+        "director_version"]
+    failed_event = next(e.payload for e in app.runtime_store.list_events(failed["id"])
+                        if e.payload.get("kind") == "COMIC_IMAGE_GENERATION_FAILED")
+    assert failed_event["http_status"] == "403"
+    assert failed_event["provider_error_code"] == "AccessDenied.Unpurchased"
+    assert failed_event["cost_cny"] == 0
+    assert "sk-testsecret12345" not in json.dumps(failed_event)
+    output = "\n".join(lines)
+    for field in ("trace_id=", "project_id=", "shot_id=", "provider=", "model=",
+                  "estimated_cost_cny=", "actual_cost_cny=0.3", "latency_ms=",
+                  "http_status=403", "provider_error_code=AccessDenied.Unpurchased"):
+        assert field in output

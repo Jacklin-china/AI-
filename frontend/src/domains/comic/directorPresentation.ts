@@ -53,7 +53,7 @@ export function directorPageFieldLabel(section: string, field: string, mode = 'p
 export const directorStateLabels: Record<string, string> = {
   pending: '未开始', running: '执行中', completed: '已完成', waiting: '需要审核',
   needs_review: '需要审核', failed: '失败', stale: '已过期', cancelled: '已取消',
-  needs_revision: '待调整', missing: '待补充', complete: '方案完整',
+  needs_revision: '待调整', missing: '待补充', complete: '方案完整', unavailable: '审核暂不可用',
 }
 export function publicDirectorSections(spec: Record<string, unknown> | null): { title: string; fields: Record<string, unknown> }[] {
   if (!spec) return []
@@ -154,8 +154,9 @@ export function canConfirmDirector(status: string | undefined, spec: Record<stri
   const review = spec?.critic_result as { verdict?: string; reviewed_spec_hash?: string; findings?: { severity: string; code: string }[] } | undefined
   return ['completed', 'waiting'].includes(status ?? '') && spec?.schema_version === 2 && !stale && !dirty &&
     publicDirectorSections(spec).length === 3 && (spec.cinematography as { status?: string })?.status === 'complete' &&
-    !!review?.reviewed_spec_hash && ['pass', 'needs_revision'].includes(review.verdict ?? '') &&
-    !review.findings?.some(item => item.severity === 'error' || ['REVIEW_EXECUTION_FAILED', 'CINEMATOGRAPHY_INCOMPLETE'].includes(item.code))
+    ((spec.critic_status === 'unavailable' && spec.critic_result === null) ||
+      (!!review?.reviewed_spec_hash && ['pass', 'needs_revision'].includes(review.verdict ?? '') &&
+      !review.findings?.some(item => item.severity === 'error' || ['REVIEW_EXECUTION_FAILED', 'CINEMATOGRAPHY_INCOMPLETE'].includes(item.code))))
 }
 export function stageDraftKey(projectId: string, runId: string, stage: string): string {
   return JSON.stringify([projectId, runId, stage])

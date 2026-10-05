@@ -527,7 +527,8 @@ class ComicProjectStore:
     def require_confirmed_director(self, spec: DirectorSpec, *, human_review: bool = False) -> None:
         from .critic import require_approved_director
 
-        require_approved_director(spec, allow_advisory=self.advisory_authorized(spec))
+        require_approved_director(spec, allow_advisory=self.advisory_authorized(spec),
+                                  allow_unavailable=self.human_director_confirmed(spec))
         confirmed = self.human_director_confirmed(spec) if human_review \
             else self.director_confirmed(spec)
         if not confirmed:
@@ -566,7 +567,15 @@ class ComicProjectStore:
             if (spec.version != version
                     or spec.creative_brief_version != snapshot.creative_brief.version):
                 raise ToolError("只能确认当前 Brief 下的当前导演版本")
-            require_approved_director(spec, allow_advisory=allow_advisory)
+            if spec.critic_status == "unavailable":
+                decision = spec.creative_decision
+                hard = snapshot.creative_brief.hard_constraints
+                if (decision is None or decision.hard_constraints != hard
+                        or any(item not in spec.constraints for item in hard)
+                        or spec.director_plan is None or not spec.director_plan.creative_choices):
+                    raise ToolError("导演方案的不可变约束或公开创作理由不完整")
+            require_approved_director(spec, allow_advisory=allow_advisory,
+                                      allow_unavailable=not bool(automatic_run_id))
             if self.runtime_store is None:
                 raise ToolError("导演确认尚未绑定现有 Runtime")
             # 审批库可能与作品库是同一 SQLite，先持有写锁验证，再提交后写审批。
@@ -591,6 +600,7 @@ class ComicProjectStore:
                 else "user_confirmation", "production_run_id": automatic_run_id,
                 "human_review": not bool(automatic_run_id),
                 "allow_advisory": allow_advisory,
+                "critic_status": spec.critic_status,
                 "status": "approved",
             })
             if not automatic_run_id:

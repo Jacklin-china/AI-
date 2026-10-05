@@ -143,6 +143,9 @@ def public_error(error: Exception, **context: Any) -> dict[str, Any]:
         "error_kind": kind.value,
         "safe_message": safe_message,
         "retryable": kind is ErrorKind.RETRYABLE,
+        **{key: context[key] for key in (
+            "http_status", "provider_error_code", "provider_error_message",
+        ) if key in context},
     }
     error._kantoku_public_failure = failure
     return failure

@@ -69,6 +69,10 @@ def execute_cinematography(
 def execute_director_critic(
     inputs: Mapping[str, Any], _context: Mapping[str, Any]
 ) -> Mapping[str, Any]:
+    raw = inputs.get("_contract_output")
+    if (isinstance(raw, Mapping) and raw.get("critic_status") == "unavailable"
+            and "critic_result" in raw and raw["critic_result"] is None):
+        return {"critic_status": "unavailable", "critic_result": None}
     return _contract_output(inputs, "critic_result", DirectorCriticResult)
 
 

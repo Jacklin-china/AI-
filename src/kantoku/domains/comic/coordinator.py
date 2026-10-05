@@ -121,7 +121,8 @@ def director_execution_summary(run: Any) -> dict[str, Any]:
         elif current == stage and status in {"running", "waiting"}:
             node_status = status
         node_status = run.state.get("stage_statuses", {}).get(key, node_status)
-        if stage == "director_critic" and status == "waiting" and node_status != "failed":
+        if (stage == "director_critic" and status == "waiting"
+                and node_status not in {"failed", "unavailable"}):
             node_status = "needs_revision"
         if node_status == "pending" and status in {"waiting", "failed"}:
             node_status = "waiting"
@@ -236,7 +237,7 @@ class DirectorStageRecord(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
 
     skill_id: str
-    status: Literal["completed", "failed", "needs_revision"] = "completed"
+    status: Literal["completed", "failed", "needs_revision", "unavailable"] = "completed"
     output_keys: list[str] = Field(default_factory=list)
 
 
@@ -472,7 +473,8 @@ class ComicDirectorCoordinator:
                         project_id=project.project_id,
                         execution_mode=request.execution_mode,
                         director_spec=None,
-                        critic_result=DirectorCriticResult.model_validate(outputs["critic_result"]),
+                        critic_result=DirectorCriticResult.model_validate(outputs["critic_result"])
+                        if outputs.get("critic_result") is not None else None,
                         director_draft=DirectorSpecDraft.model_validate(
                             state["director_candidate"]
                         ),
@@ -706,12 +708,16 @@ class ComicDirectorCoordinator:
                 state["director_candidate"] = candidate
                 state["revision_count"] = outcome.revision_count
                 state["needs_review"] = outcome.needs_review
+                state["critic_status"] = candidate.get("critic_status")
                 state["task_status"] = "needs_review" if outcome.needs_review else "planning"
                 state["draft_status"] = "needs_revision" if outcome.needs_review else "reviewed"
                 outputs.update({key: candidate[key] for key in (
                     "creative_decision", "director_plan", "cinematography",
                 )})
-                raw_output = {"critic_result": outcome.critic_result.model_dump()}
+                raw_output = {"critic_result": outcome.critic_result.model_dump()
+                              if outcome.critic_result is not None else None}
+                if outcome.critic_result is None:
+                    raw_output["critic_status"] = "unavailable"
             elif skill_id == "comic.director_assemble":
                 raw_output = {"director_spec": self._provisional_spec(
                     outputs, request, critic_result=outputs.get("critic_result"),
@@ -772,6 +778,8 @@ class ComicDirectorCoordinator:
         review_failed = skill_id in state["stage_failures"] and not camera_incomplete
         if camera_incomplete:
             state["stage_statuses"][skill_id] = "needs_revision"
+        elif skill_id == "comic.director_critic" and state.get("critic_status") == "unavailable":
+            state["stage_statuses"][skill_id] = "unavailable"
         elif review_failed:
             state["stage_statuses"][skill_id] = "failed"
         else:
@@ -804,7 +812,8 @@ class ComicDirectorCoordinator:
             run_id,
             RuntimeEventType.NODE_PROGRESS,
             "node_warning" if camera_incomplete else (
-                "director_stage_failed" if review_failed else "director_stage_completed"),
+                "node_warning" if state.get("critic_status") == "unavailable" and review_failed
+                else "director_stage_failed" if review_failed else "director_stage_completed"),
             trace_id=trace_id,
             project_id=request.snapshot.project.project_id,
             mode=request.execution_mode,

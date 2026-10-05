@@ -229,6 +229,12 @@ def _image_failure(
     return failure
 
 
+def _failure_diagnostics(failure: Mapping[str, object]) -> dict[str, object]:
+    return {key: failure[key] for key in (
+        "error_id", "trace_id", "http_status", "provider_error_code", "provider_error_message",
+    ) if key in failure}
+
+
 def _record_result(
     reservation_id: str,
     provider_job_id: str,
@@ -246,9 +252,7 @@ def _record_result(
             request_id=reservation_id, provider_job_id=provider_job_id,
             phase="query_result", started_at=started_at,
         )
-        normalized = normalized.model_copy(update={
-            "error_id": failure["error_id"], "trace_id": failure["trace_id"],
-        })
+        normalized = normalized.model_copy(update=_failure_diagnostics(failure))
     logger.bind(component="image-generation", generation_request_id=reservation_id,
                 provider_task_id=provider_job_id).info("result status={}", normalized.status)
     mark_outcome(
@@ -429,9 +433,7 @@ def gen_image(
         if _submit_rejected(error):
             mark_outcome(client_request_id, "failed")
             event.warning("submit rejected by provider detail={}", str(error)[:200])
-            rejected = _rejected_result(error).model_copy(update={
-                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
-            })
+            rejected = _rejected_result(error).model_copy(update=_failure_diagnostics(failure))
             save_generation_result(client_request_id, rejected)
             release(client_request_id)
             return rejected
@@ -440,9 +442,7 @@ def gen_image(
             "submit outcome unknown exception={} detail={}",
             type(error).__name__, str(error)[:200],
         )
-        result = _unknown_result(None, error).model_copy(update={
-            "error_id": failure["error_id"], "trace_id": failure["trace_id"],
-        })
+        result = _unknown_result(None, error).model_copy(update=_failure_diagnostics(failure))
         save_generation_result(client_request_id, result)
         return result
 
@@ -462,9 +462,7 @@ def gen_image(
                 error, provider=provider, request_id=client_request_id,
                 provider_job_id=provider_job_id, phase="query", started_at=started_at,
             )
-            result = result.model_copy(update={
-                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
-            })
+            result = result.model_copy(update=_failure_diagnostics(failure))
         event.bind(provider_task_id=provider_job_id).warning(
             "poll outcome unknown exception={}", type(error).__name__
         )
@@ -521,9 +519,7 @@ def reconcile_image(
                 provider_job_id=reservation.provider_job_id, run_id=reservation.run_id,
                 phase="reconcile", started_at=started_at,
             )
-            result = result.model_copy(update={
-                "error_id": failure["error_id"], "trace_id": failure["trace_id"],
-            })
+            result = result.model_copy(update=_failure_diagnostics(failure))
         save_generation_result(client_request_id, result)
         if isinstance(error, KeyboardInterrupt):
             raise

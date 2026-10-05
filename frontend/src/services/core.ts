@@ -79,6 +79,11 @@ export async function getComicAssets(id: string): Promise<ComicAssetView[]> {
 export async function getComicStoryboards(id: string): Promise<ComicStoryboardView[]> {
   return (await coreGet<{ storyboards: ComicStoryboardView[] }>(`/api/comic/projects/${encodeURIComponent(id)}/storyboards`, `comic-boards:${id}`))?.storyboards ?? []
 }
+export function createComicStoryboard(id: string, projectVersion: number, task: string): Promise<{ storyboard: ComicStoryboardView; shots: ComicShotView[] }> {
+  return corePost(`/api/comic/projects/${encodeURIComponent(id)}/storyboards`, {
+    expected_project_version: projectVersion, generate: true, task,
+  })
+}
 export async function getComicShots(id: string): Promise<ComicShotView[]> {
   return (await coreGet<{ shots: ComicShotView[] }>(`/api/comic/storyboards/${encodeURIComponent(id)}/shots`, `comic-shots:${id}`))?.shots ?? []
 }

@@ -85,6 +85,13 @@ def _run(runtime: RuntimeStore) -> str:
     return runtime.create_run("comic", "comic.prompt.compile", {}, "prompt.compile").id
 
 
+def test_first_shot_prompt_history_is_empty_not_a_generation_blocker(tmp_path: Path) -> None:
+    _runtime, _projects, _assets, _boards, prompts, shot, _unrelated = _setup(tmp_path / "db")
+    assert prompts.versions(shot.shot_id) == []
+    with pytest.raises(ToolError, match="找不到"):
+        prompts.versions("missing-shot")
+
+
 def test_compiler_uses_only_pinned_shot_context_and_checks_constraints(tmp_path: Path) -> None:
     runtime, projects, assets, boards, prompts, shot, unrelated = _setup(tmp_path / "db.sqlite")
     snapshot, director, storyboard, current_shot, selected = prompts.source(shot.shot_id)

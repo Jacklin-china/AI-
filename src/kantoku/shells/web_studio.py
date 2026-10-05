@@ -2437,7 +2437,7 @@ class StudioApplication:
                                 != current.creative_decision.hard_constraints):
                             raise ToolError("草稿编辑不能修改用户硬约束")
                     # 客户端或修改模型的 pass 不是真实审核；编辑保存后必须重新审核。
-                    draft = draft.model_copy(update={"critic_result": None})
+                    draft = draft.model_copy(update={"critic_result": None, "critic_status": None})
                     source = "manual"
                 step("checking", "director_draft_ready")
                 spec = self.comic_projects.save_director(
@@ -2945,6 +2945,7 @@ class StudioApplication:
                 shot=current_shot, assets=assets, model_target=model_target,
                 model_call=self._comic_storyboard_model,
                 allow_advisory=self.comic_projects.advisory_authorized(director),
+                allow_unavailable=self.comic_projects.human_director_confirmed(director),
             )
             progress("checking", "prompt_compiled")
             run_id = current_run_id()
@@ -3088,7 +3089,8 @@ class StudioApplication:
                 expected_project_version=request.expected_project_version,
                 automatic_run_id=automatic_run_id,
                 # Explicit human confirmation can accept artistic warnings, never
-                # conflicts, missing photography, failed review or a stale fingerprint.
+                # conflicts, missing photography or a stale fingerprint. Unavailable
+                # optional Critic requires explicit human confirmation of this version.
                 allow_advisory=True,
             )
         if not automatic_run_id:

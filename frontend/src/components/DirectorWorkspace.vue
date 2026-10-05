@@ -9,7 +9,9 @@ import ConversationHistory from './chat/ConversationHistory.vue'
 import { conversationTaskTitle, ownsConversationRun } from './chat/conversationPresentation'
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
-import ImageGenerationPlaceholder from './chat/ImageGenerationPlaceholder.vue'
+import ComicShotGeneration from './ComicShotGeneration.vue'
+import { shotGeneration } from '../domains/comic/shotGeneration'
+import { createComicStoryboard } from '../services/core'
 import { comicProductionProgress } from '../domains/comic/productionProgress'
 import { quickDirectorMessage } from '../domains/comic/directorPresentation'
 import { resumeRun, saveComicPrompt } from '../services/core'
@@ -64,6 +66,7 @@ const productionEvents = ref<RuntimeEvent[]>([])
 let productionAdvanced = false
 let pendingCreation: { text: string; mode: CreationMode; requestId: string } | null = null
 const productionRequests = new Map<string, string>()
+const productionPromptVersions = new Map<string, unknown>()
 const stageScroll = ref<HTMLElement | null>(null)
 const scrollPositions = new Map<string, number>()
 const referenceUrls = ref<Record<string, string>>({})
@@ -195,9 +198,6 @@ const productionProgress = computed(() => productionRun.value ? comicProductionP
 const executionLabel = computed(() => hasRunning.value
   ? productionProgress.value?.label ?? summary.value?.status_label ?? '正在执行'
   : busy.value ? '正在处理当前操作' : '')
-const imageExecution = computed(() => productionRun.value?.image_execution)
-const imageElapsed = computed(() => imageExecution.value?.started_at && imageExecution.value.finished_at
-  ? Math.max(0, Math.round((Date.parse(imageExecution.value.finished_at) - Date.parse(imageExecution.value.started_at)) / 1000)) : null)
 const draftKey = computed(() => stageDraftKey(project.value?.project.project_id ?? '', spec.value?.schema_version === 2 ? `version:${spec.value.version}` : active.value?.run_id ?? '', spec.value?.schema_version === 2 ? 'director_assemble' : selectedStage.value))
 const fields = computed(() => drafts.value[draftKey.value] ?? {})
 const editing = computed(() => selectedStage.value !== 'director_assemble' && (spec.value?.schema_version === 2
@@ -213,10 +213,31 @@ const productionEligible = computed(() => {
   const review = spec.value.critic_result as Record<string, unknown> | undefined
   const camera = spec.value.cinematography as Record<string, unknown> | undefined
   const findings = review?.findings as Record<string, unknown>[] | undefined
+  if (camera?.status === 'complete' && spec.value.critic_status === 'unavailable' && spec.value.critic_result === null) return confirmed.value
   return camera?.status === 'complete' && ['pass', 'needs_revision'].includes(String(review?.verdict))
     && typeof review?.reviewed_spec_hash === 'string'
     && !findings?.some(item => item.severity === 'error' || item.code === 'REVIEW_EXECUTION_FAILED')
 })
+function generationForShot(shotId: string): CoreRun | null {
+  return shotGeneration(Object.values(runs.value), project.value?.project.project_id ?? '', shotId)
+}
+function progressForShot(shotId: string) {
+  const run = generationForShot(shotId)
+  return run ? comicProductionProgress(run, run.id === productionRun.value?.id ? productionEvents.value : [], !!run.state.image_artifact_id) : null
+}
+function imageForShot(shotId: string): string | undefined {
+  const artifactId = generationForShot(shotId)?.state.image_artifact_id
+  return artifactId ? referenceUrls.value[String(artifactId)] : undefined
+}
+async function retryShot(shotId: string): Promise<void> {
+  selectedShot.value = shotId
+  await generateImage(true)
+}
+function editShotPrompt(shotId: string): void {
+  selectedShot.value = shotId
+  openSection('prompt')
+  void loadPrompts().then(editImagePrompt)
+}
 const editable = computed(() => spec.value?.schema_version === 2 ? !stale.value && editableDirectorNode(selectedStage.value) : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const visibleNodes = computed(() => mode.value === 'fast' ? fastDirectorNodeLabels : directorNodeLabels)
 const projectTitle = computed(() => conversations.value.find(item => item.id === activeConversationId.value)?.title ?? '新对话')
@@ -538,13 +559,20 @@ async function generateImage(newGeneration = false): Promise<void> {
   if (!productionEligible.value || (manualDirectorApproval.value && !confirmed.value) || !project.value || !spec.value || submittingImage.value || compiling.value || busy.value || hasRunning.value) return
   const epoch = conversationEpoch
   const shot = ['storyboard', 'prompt'].includes(section.value) ? shots.value.find(item => item.shot_id === selectedShot.value) : undefined
-  const promptVersion = section.value === 'prompt' && shot ? prompts.value[0]?.version : undefined
-  const key = `${activeConversationId.value}:${project.value.project.project_id}:${spec.value.version}:${shot?.shot_id ?? 'keyframe'}:${shot?.version ?? ''}:${manualDirectorApproval.value}:${promptVersion ?? ''}`
-  // A network retry keeps the same request identity; it must never submit a second image.
-  if (newGeneration) productionRequests.delete(key)
-  if (!productionRequests.has(key)) productionRequests.set(key, `production-${crypto.randomUUID()}`)
+  if (manualDirectorApproval.value && !shot) return
+  if (newGeneration && !generationForShot(shot?.shot_id ?? '')?.image_execution?.can_regenerate) return
   submittingImage.value = true; error.value = ''
   try {
+    const key = `${activeConversationId.value}:${project.value.project.project_id}:${spec.value.version}:${shot?.shot_id ?? 'keyframe'}:${shot?.version ?? ''}:${manualDirectorApproval.value}`
+    // A network retry keeps the same request identity; it must never submit a second image.
+    if (newGeneration) productionRequests.delete(key)
+    if (!productionRequests.has(key)) {
+      const currentPrompt = shot ? (await getComicPromptVersions(shot.shot_id))[0]?.version : undefined
+      if (epoch !== conversationEpoch) return
+      productionRequests.set(key, `production-${crypto.randomUUID()}`)
+      productionPromptVersions.set(key, currentPrompt)
+    }
+    const promptVersion = productionPromptVersions.get(key)
     const run = await createRun('comic', {
       production_project_id: project.value.project.project_id,
       expected_project_version: project.value.project.current_version,
@@ -563,21 +591,13 @@ async function generateImage(newGeneration = false): Promise<void> {
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) submittingImage.value = false }
 }
-async function recoverImage(): Promise<void> {
-  if (!productionRun.value || busy.value || hasRunning.value) return
+async function recoverImage(runId = productionRun.value?.id): Promise<void> {
+  if (!runId || busy.value || hasRunning.value) return
   const epoch = conversationEpoch
   busy.value = true; error.value = ''
-  try { const run = await resumeRun(productionRun.value.id); if (epoch === conversationEpoch) { productionRun.value = run; await refresh() } }
+  try { const run = await resumeRun(runId); if (epoch === conversationEpoch) { productionRun.value = run; await refresh() } }
   catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) busy.value = false }
-}
-async function regenerateImage(): Promise<void> {
-  if (!imageExecution.value?.can_regenerate || busy.value || hasRunning.value) return
-  if (productionEligible.value) await generateImage(true)
-  else {
-    const request = String((productionRun.value?.state.quick_creation as Record<string, unknown>)?.original_request ?? '')
-    if (request) await execute(request)
-  }
 }
 function editImagePrompt(): void {
   if (!selectedShot.value || !prompts.value[0]) { openSection('prompt'); void loadPage(); return }
@@ -603,7 +623,21 @@ function changeImageModel(): void {
 async function enterStoryboard(): Promise<void> {
   if (!confirmed.value || !productionEligible.value || busy.value || hasRunning.value) return
   openSection('storyboard')
-  await generateImage()
+  const epoch = conversationEpoch
+  busy.value = true; error.value = ''
+  try {
+    await loadPage()
+    if (epoch !== conversationEpoch || !project.value || !spec.value) return
+    if (!boards.value.some(board => board.director_spec_version === spec.value?.version)) {
+      const planned = await createComicStoryboard(project.value.project.project_id, project.value.project.current_version,
+        project.value.creative_brief.original_request)
+      if (epoch !== conversationEpoch) return
+      selectedBoard.value = planned.storyboard.storyboard_id
+      selectedShot.value = planned.shots[0]?.shot_id ?? ''
+      await refresh(); await loadPage()
+    }
+  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
+  finally { if (epoch === conversationEpoch) busy.value = false }
 }
 async function restore(version: number): Promise<void> {
   if (!project.value || busy.value || hasRunning.value) return
@@ -739,9 +773,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
           <main class="workspace-stage">
 
               <div v-if="!chatExpanded" :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll" aria-label="当前节点工作区">
-                <ImageGenerationPlaceholder v-if="productionProgress?.visible" :label="productionProgress.label" :percent="productionProgress.percent" :started-at="productionRun?.started_at" />
-                <ChatImageAttachment v-if="section !== 'director' && productionRun?.state.image_artifact_id && referenceUrls[String(productionRun.state.image_artifact_id)]" :media="{ url: referenceUrls[String(productionRun.state.image_artifact_id)]!, filename: `comic-${productionRun.state.image_artifact_id}.png` }" @open="previewReference" />
-                <template v-if="section === 'director' && !productionProgress?.active">
+                <template v-if="section === 'director'">
 <nav class="director-flow" aria-label="导演流程">
   <button v-for="(label, stage) in visibleNodes" :key="stage" :aria-current="selectedStage === stage ? 'step' : undefined" :data-status="nodeStatus(String(stage))" @click="visitStage(String(stage))">
     <span class="flow-marker"><Check v-if="nodeStatus(String(stage)) === 'completed'" :size="11" /></span>
@@ -751,6 +783,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <p v-if="restoredSpec && mode === 'professional'" class="pane-note">查看当前保存的版本；节点没有重新执行，不沿用其他版本的执行状态。</p>
                   <p v-if="summary?.mode === 'fast' && mode === 'professional' && selectedStage !== 'director_assemble'" class="pane-note">显示已保存方案的对应内容；此任务未公开逐节点执行记录。</p>
                   <p v-if="selectedStage === 'cinematography' && (spec?.cinematography as { status?: string })?.status && (spec?.cinematography as { status?: string })?.status !== 'complete'" class="review-notice">摄影方案待补充或调整。已保留真实草稿，不会自动进入制作。</p>
+                  <p v-if="spec?.critic_status === 'unavailable'" class="review-notice" role="status">导演审核暂不可用，未产生合法审核结果。导演方案已保留；你可以查看并确认最终方案后进入分镜。</p>
                   <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="visitStage" />
                   <div v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'" class="final-approval"><p>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '当前版本已确认，可以进入分镜制作' : dirty ? '请先保存编辑，再检查并确认' : '这是可修改的草稿，确认后才进入下一阶段。' }}</p><div class="draft-actions"><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">用对话修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed || !productionEligible || submittingImage || busy || hasRunning" @click="enterStoryboard">进入下一步</button></div></div>
                   <button v-if="spec && selectedStage !== 'director_assemble' && !editing && selectedStage !== 'director_critic'" class="ui-button quiet sm" @click="visitStage('director_assemble')">{{ mode === 'fast' ? '查看整体方案并确认' : '返回最终导演稿' }}</button>
@@ -774,10 +807,16 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   </div>
                   <button v-if="section === 'prompt' && prompts.length && !promptEdit" class="ui-button sm" :disabled="busy || hasRunning" @click="editImagePrompt">编辑当前 Prompt</button>
                   <p v-if="manualDirectorApproval && !confirmed" class="review-notice">请先确认当前导演方案再制作。</p>
-                  <button v-if="section === 'storyboard' && productionEligible" class="ui-button primary sm" :disabled="submittingImage || compiling || busy || hasRunning || (manualDirectorApproval && !confirmed)" @click="generateImage()">{{ submittingImage ? '正在创建分镜制作任务' : selectedShot ? '生成当前镜头图片' : '生成分镜并制作图片' }}</button>
+                  <button v-if="section === 'storyboard' && productionEligible && selectedShot" class="ui-button primary sm" :disabled="submittingImage || compiling || busy || hasRunning || (manualDirectorApproval && !confirmed)" @click="generateImage()">{{ submittingImage ? '正在提交当前镜头' : '生成当前镜头图片' }}</button>
                   <label v-if="boards.length">分镜 <select v-model="selectedBoard" @change="loadShots"><option v-for="board in boards" :key="board.storyboard_id" :value="board.storyboard_id">{{ board.title }} · v{{ board.version }}</option></select></label>
                   <p v-else class="pane-note">{{ productionProgress?.active ? '正在规划分镜，将继续编译提示词并生成图片。' : '尚无作品分镜。确认导演方案后，可开始分镜制作。' }}</p>
-                  <template v-if="section === 'storyboard'"><article v-for="shot in shots" :key="shot.shot_id" class="shot-row"><strong>镜头 {{ shot.sequence_number }} · {{ shot.subject }}</strong><p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[shot.status] ?? shot.status }} · 角色 {{ shot.character_asset_versions.map(ref => `${ref.asset_id} v${ref.version}`).join('、') || '未引用' }}</small></article></template>
+                  <template v-if="section === 'storyboard'">
+                    <article v-for="shot in shots" :key="shot.shot_id" class="shot-row" :data-shot-id="shot.shot_id" :data-status="generationForShot(shot.shot_id)?.status ?? shot.status">
+                      <button class="ui-button quiet sm" :aria-pressed="selectedShot === shot.shot_id" @click="selectedShot = shot.shot_id">镜头 {{ shot.sequence_number }} · {{ shot.subject }}{{ selectedShot === shot.shot_id ? ' · 当前镜头' : '' }}</button>
+                      <p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[generationForShot(shot.shot_id)?.status ?? shot.status] ?? shot.status }}</small>
+                      <ComicShotGeneration :run="generationForShot(shot.shot_id)" :progress="progressForShot(shot.shot_id)" :image-url="imageForShot(shot.shot_id)" :disabled="busy || hasRunning || submittingImage" @retry="retryShot(shot.shot_id)" @resume="recoverImage(generationForShot(shot.shot_id)?.id)" @edit-prompt="editShotPrompt(shot.shot_id)" @change-model="changeImageModel" @preview="previewReference" />
+                    </article>
+                  </template>
                   <template v-else><label v-if="shots.length">镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="shot in shots" :key="shot.shot_id" :value="shot.shot_id">{{ shot.sequence_number }} · {{ shot.subject }}</option></select></label><details v-for="prompt in prompts" :key="String(prompt.prompt_id) + prompt.version"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }}</summary><p>{{ prompt.positive_prompt }}</p><h3>负向约束</h3><p>{{ prompt.negative_prompt }}</p><small>导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }} · {{ prompt.compiler_version }}</small></details><p v-if="selectedShot && !prompts.length" class="pane-note">当前镜头没有已保存的 Prompt 版本。</p><button v-if="selectedShot" class="ui-button primary sm" :disabled="(manualDirectorApproval && !confirmed) || compiling || busy || hasRunning || boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" @click="compilePrompt">{{ compiling ? '正在编译 Prompt' : '编译当前镜头 Prompt' }}</button><p v-if="selectedShot && boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" class="pane-note">分镜引用的导演版本与当前方案不同。请先更新分镜，旧 Prompt 可继续查看。</p><button class="ui-button sm" @click="section = 'assets'">查看生成结果</button></template>
                 </template>
                 <template v-else-if="section === 'history'">
@@ -794,7 +833,6 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               <div v-if="manualDirectorApproval && !restoredSpec && active?.director_spec" class="draft-actions"><button class="ui-button sm" @click="openDraft(active.run_id)">进入导演方案 <ArrowRight :size="15" /></button><span>{{ stale ? '来源已变化' : confirmed ? '已确认' : '待确认草稿' }}</span></div>
               <UserMessageBubble v-if="pendingText && !transcript.some(entry => !previousRunIds.includes(entry.execution.run_id) && entry.text === pendingText)" :content="pendingText" :pending="busy ? 'replying' : 'failed'" />
               <p v-if="busy && !active" role="status">正在提交创意，等待真实执行状态…</p>
-              <ImageGenerationPlaceholder v-if="productionProgress?.visible" :label="productionProgress.label" :percent="productionProgress.percent" :started-at="productionRun?.started_at" />
               <p v-if="active?.status === 'cancelled'" class="pane-note" role="status">任务已取消。正在进行的模型请求可能仍需结束，但不会继续下一节点或保存导演方案。</p>
               <article v-for="input in queuedInputs" :key="input.id" class="queued-turn">
                 <UserMessageBubble :content="input.text" />
@@ -833,14 +871,6 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
           <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击"新作品"进入作品级创作。</p>
           <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ executionLabel }} · 可继续输入</span><button v-if="hasRunning" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
           <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
-          <div v-if="productionRun?.status === 'failed' || productionRun?.status === 'waiting'" class="draft-actions">
-            <button v-if="imageExecution?.can_resume" class="ui-button sm" :disabled="busy || hasRunning" @click="recoverImage">继续查询原任务</button>
-            <button v-if="productionRun.status === 'failed'" class="ui-button sm" :disabled="!imageExecution?.can_regenerate || busy || hasRunning" @click="regenerateImage">重新生成</button>
-            <button class="ui-button quiet sm" :disabled="busy || hasRunning" @click="editImagePrompt">修改 Prompt</button>
-            <button class="ui-button quiet sm" @click="changeImageModel">更换模型</button>
-            <span v-if="imageExecution?.needs_reconciliation">原请求账单未知，需先对账；不会自动重提。</span>
-          </div>
-          <p v-if="productionRun?.status === 'completed' && imageExecution" class="pane-note">模型：{{ imageExecution.model }}<template v-if="imageElapsed !== null"> · 生图耗时：{{ imageElapsed }}s</template> · 图片成本：{{ imageExecution.actual_fen === null ? '待结算（供应商未返回账单）' : `¥${(imageExecution.actual_fen / 100).toFixed(2)}` }}</p>
           <MessageComposer :key="activeConversationId" ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
           <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : manualDirectorApproval ? '方案先保存为草稿，审核并确认后再进入制作。' : '自动完成导演、分镜、提示词与图片制作。' }}</small>
         </div>

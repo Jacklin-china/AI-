@@ -103,6 +103,8 @@ QUALITY_WORDS = re.compile(r"\b(cinematic|masterpiece|beautiful|epic)\b", re.IGN
 
 def director_hash(spec: DirectorSpecDraft) -> str:
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
+    if payload.get("critic_status") is None:
+        payload.pop("critic_status", None)
     # 新增的可选表现字段为空时不改变历史审核指纹。
     plan = payload.get("director_plan")
     if isinstance(plan, dict):
@@ -124,7 +126,7 @@ def director_hash(spec: DirectorSpecDraft) -> str:
 
 
 def require_approved_director(
-    spec: DirectorSpecDraft, *, allow_advisory: bool = False,
+    spec: DirectorSpecDraft, *, allow_advisory: bool = False, allow_unavailable: bool = False,
 ) -> None:
     """旧 v1 保持兼容；v2 必须有绑定当前方案的实际审核凭据。"""
     if spec.schema_version == 1:
@@ -132,6 +134,8 @@ def require_approved_director(
     if spec.cinematography is None or spec.cinematography.status != "complete":
         raise ToolError("摄影方案待修订，不能进入下一步")
     review = spec.critic_result
+    if allow_unavailable and spec.critic_status == "unavailable" and review is None:
+        return
     if (
         review is None
         or review.review_version != REVIEW_VERSION
@@ -173,7 +177,7 @@ class SemanticReview(BaseModel):
 class DirectorReviewOutcome(BaseModel):
     model_config = ConfigDict(extra="forbid", strict=True)
     director_spec: DirectorSpecDraft
-    critic_result: DirectorCriticResult
+    critic_result: DirectorCriticResult | None
     revision_count: int = Field(ge=0, le=1)
     needs_review: bool
 
@@ -421,7 +425,7 @@ class DirectorCriticEngine:
             "allowed_field_paths": sorted(CRITIC_ALLOWED_FIELD_PATHS),
             "patch_fields": sorted(PATCH_FIELDS),
         }
-        raw = self.model_call([
+        messages = [
             {"role": "system", "content": (
                 "审核当前导演方案的视觉因果、用户约束语义、角色/场景/风格一致性、"
                 "构图/色彩/光影/人物关系的公开创作理由以及空泛模板词。"
@@ -441,34 +445,9 @@ class DirectorCriticEngine:
                 + json.dumps(SemanticReview.model_json_schema(), ensure_ascii=False)
             )},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
-        ])
-        try:
-            payload = json.loads(raw)
-            if not isinstance(payload, dict):
-                raise ValueError("invalid review object")
-            raw_patches = payload.get("suggested_patches")
-            if not isinstance(raw_patches, list) or len(raw_patches) > 20:
-                raise ValueError("invalid patch collection")
-            semantic = SemanticReview.model_validate({**payload, "suggested_patches": []})
-        except (ValueError, ValidationError) as error:
-            if isinstance(error, ValidationError):
-                issues = [{"path": redact_secrets(".".join(map(str, item["loc"])))[:160],
-                           "type": item["type"]}
-                          for item in error.errors(include_input=False, include_context=False,
-                                                   include_url=False)]
-            elif isinstance(error, json.JSONDecodeError):
-                issues = [{"path": "$", "type": "json_invalid",
-                           "line": error.lineno, "column": error.colno}]
-            else:
-                issues = [{"path": "$", "type": "review_collection_invalid"}]
-            logger.warning(
-                "Director Critic Schema validation failed issues={} output_chars={} "
-                "output_sha256={} trace_id={} run_id={}", issues, len(raw),
-                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
-                current_trace_id(), current_run_id(),
-            )
-            # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
-            raise ToolError("导演审核模型未返回有效的公开审核结构") from None
+        ]
+        raw = self.model_call(messages)
+        semantic, raw_patches = self._parse_review(raw, messages)
         invalid_patches: list[DirectorCriticFinding] = []
         for patch_data in raw_patches:
             try:
@@ -498,7 +477,6 @@ class DirectorCriticEngine:
                 or not item.suggested_action or not _has_evidence(evidence_context, item.evidence)
             ):
                 _critic_warning(item.field_path, action="needs_review_unverified_evidence")
-                # 不让模型引文格式问题炸掉整个 Run，也不能当成审核通过或应用 Patch。
                 unverified.append(DirectorCriticFinding(
                     code="UNVERIFIED_REVIEW_EVIDENCE", severity="warning",
                     field_path=item.field_path, evidence=item.evidence,
@@ -521,6 +499,47 @@ class DirectorCriticEngine:
             spec, findings, semantic.suggested_patches if not unverified else [],
             semantic.public_summary, semantic.confidence,
         )
+
+    def _parse_review(
+        self, raw: str, messages: list[dict[str, str]], *, repair: bool = True,
+    ) -> tuple[SemanticReview, list[Any]]:
+        try:
+            payload = json.loads(raw)
+            if not isinstance(payload, dict):
+                raise ValueError("invalid review object")
+            raw_patches = payload.get("suggested_patches")
+            if not isinstance(raw_patches, list) or len(raw_patches) > 20:
+                raise ValueError("invalid patch collection")
+            semantic = SemanticReview.model_validate({**payload, "suggested_patches": []})
+        except (ValueError, ValidationError) as error:
+            if isinstance(error, ValidationError):
+                issues = [{"path": redact_secrets(".".join(map(str, item["loc"])))[:160],
+                           "type": item["type"]}
+                          for item in error.errors(include_input=False, include_context=False,
+                                                   include_url=False)]
+            elif isinstance(error, json.JSONDecodeError):
+                issues = [{"path": "$", "type": "json_invalid",
+                           "line": error.lineno, "column": error.colno}]
+            else:
+                issues = [{"path": "$", "type": "review_collection_invalid"}]
+            logger.warning(
+                "Director Critic Schema validation failed issues={} output_chars={} "
+                "output_sha256={} trace_id={} run_id={}", issues, len(raw),
+                hashlib.sha256(raw.encode("utf-8")).hexdigest(),
+                current_trace_id(), current_run_id(),
+            )
+            if repair:
+                # Re-request only the public structure from the same bounded context.
+                # Never echo an invalid response that could contain private reasoning.
+                repaired = self.model_call([*messages, {"role": "user", "content": (
+                    "上次公开审核结构无效。只修复一次结构，依据原输入返回完整公开审核 JSON；"
+                    "不得改写导演方案或输出私有推理。Schema 问题："
+                    + json.dumps(issues, ensure_ascii=False)
+                )}])
+                return self._parse_review(repaired, messages, repair=False)
+            # ValidationError 会包含供应商原始值；不能把可能的 CoT 带入 traceback。
+            raise ToolError("导演审核模型未返回有效的公开审核结构") from None
+        return semantic, raw_patches
 
     @staticmethod
     def _result(
@@ -662,11 +681,11 @@ class DirectorCriticEngine:
         shot: ComicShot | None = None,
         emit: EventSink | None = None,
     ) -> DirectorReviewOutcome:
-        current = spec
+        current = spec.model_copy(update={"critic_status": None, "critic_result": None})
         revision_count = 0
         result: DirectorCriticResult | None = None
 
-        def failed_review(error: Exception, event: str) -> DirectorCriticResult:
+        def failed_review(error: Exception, event: str) -> DirectorCriticResult | None:
             failure = getattr(error, "_kantoku_public_failure", None) or public_error(
                 error,
                 component="comic.director_critic",
@@ -681,6 +700,8 @@ class DirectorCriticEngine:
                     {**failure, "error_type": type(error).__name__, "review_attempt": attempt,
                      "exception_module": type(error).__module__},
                 )
+            if event == "director_critic_failed":
+                return None
             retained = list(result.findings) if result is not None else []
             retained.append(
                 DirectorCriticFinding(
@@ -708,8 +729,18 @@ class DirectorCriticEngine:
                     shot=shot,
                 )
             except Exception as error:
-                result = failed_review(error, "director_critic_failed")
-                break
+                # No valid review exists: retain the candidate, never fabricate Critic content.
+                failed_review(error, "director_critic_failed")
+                current = current.model_copy(update={
+                    "critic_status": "unavailable", "critic_result": None,
+                })
+                if emit:
+                    emit("critic_unavailable", {"critic_status": "unavailable",
+                                              "critic_result": None, "warning": True})
+                return DirectorReviewOutcome(
+                    director_spec=current, critic_result=None,
+                    revision_count=revision_count, needs_review=True,
+                )
             if emit:
                 emit("director_critic_completed", {
                     "review_attempt": attempt, "critic_result": result.model_dump(),

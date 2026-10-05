@@ -303,6 +303,7 @@ class DirectorSpecDraft(BaseModel):
     director_plan: DirectorPlan | None = None
     cinematography: CinematographyPlan | None = None
     critic_result: DirectorCriticResult | None = None
+    critic_status: Literal["unavailable"] | None = None
     knowledge_refs: list[BriefItem] = Field(default_factory=list, max_length=50)
     asset_versions: dict[str, int] = Field(default_factory=dict, max_length=50)
     storyboard_version: int | None = Field(default=None, ge=1)

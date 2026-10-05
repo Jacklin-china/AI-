@@ -14,8 +14,9 @@ output_schema:
   required: [critic_result]
   properties:
     critic_result:
-      type: object
+      type: [object, "null"]
       required: [verdict, public_summary, findings, suggested_patches, allowed_patches, confidence, review_version, reviewed_spec_hash]
+    critic_status: {type: string, enum: [unavailable]}
 execution_policy:
   allowed_execution_modes: [fast, professional]
   side_effects: []

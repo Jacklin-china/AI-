@@ -23,6 +23,9 @@ class ImageGenerationResult(BaseModel):
     error: NonBlank | None = None
     error_id: NonBlank | None = None
     trace_id: NonBlank | None = None
+    http_status: str | None = None
+    provider_error_code: str | None = None
+    provider_error_message: str | None = None
 
     @model_validator(mode="after")
     def validate_state(self) -> Self:

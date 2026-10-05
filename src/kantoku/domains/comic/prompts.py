@@ -45,6 +45,7 @@ class BasePromptCompiler(Protocol):
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
         model_target: str, model_call: Callable[[list[dict[str, str]]], str],
         allow_advisory: bool = False,
+        allow_unavailable: bool = False,
     ) -> ComicPromptDraft: ...
 
 
@@ -61,8 +62,10 @@ class StructuredImagePromptCompiler:
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
         model_target: str, model_call: Callable[[list[dict[str, str]]], str],
         allow_advisory: bool = False,
+        allow_unavailable: bool = False,
     ) -> ComicPromptDraft:
-        require_approved_director(director, allow_advisory=allow_advisory)
+        require_approved_director(director, allow_advisory=allow_advisory,
+                                  allow_unavailable=allow_unavailable)
         if director.schema_version == 2 and any(
             director.asset_versions.get(f"asset:{asset.asset_id}") != asset.version
             for asset in assets
@@ -197,6 +200,12 @@ class ComicPromptStore:
             ))
 
     def versions(self, shot_id: str) -> list[ComicPromptArtifact]:
+        self.storyboards.get_shot(shot_id)
+        with self.projects._connect() as connection:
+            if connection.execute(
+                "SELECT 1 FROM comic_prompts WHERE shot_id=?", (shot_id,),
+            ).fetchone() is None:
+                return []
         current = self.get(shot_id)
         with self.projects._connect() as connection:
             rows = connection.execute(

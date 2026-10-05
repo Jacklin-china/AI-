@@ -51,6 +51,14 @@ test('only real completed reviewed v2 can be confirmed; draft changes invalidate
   }
   assert.equal(canConfirmDirector('completed', { ...spec, schema_version: 1 }, false, false), false)
 })
+test('unavailable critic is explicit and confirmable without inventing a review', () => {
+  const unavailable = { ...spec, critic_status: 'unavailable', critic_result: null }
+  assert.equal(canConfirmDirector('waiting', unavailable, false, false), true)
+  assert.equal(canConfirmDirector('waiting', unavailable, true, false), false)
+  assert.equal(canConfirmDirector('waiting', unavailable, false, true), false)
+  assert.equal(canConfirmDirector('waiting', { ...unavailable, cinematography: { status: 'missing' } }, false, false), false)
+  assert.equal(canConfirmDirector('waiting', { ...unavailable, critic_status: null }, false, false), false)
+})
 test('Vue reactive drafts can be copied and saved without DataCloneError or changing the source', () => {
   const original = reactive(structuredClone(spec))
   const saved = editableDirectorDraft(original, { 'creative_decision.emotional_target': '期待' })
@@ -299,7 +307,7 @@ test('automatic workspace submits one durable production Run, not a director-onl
   assert.match(view, /quick_creation as Record<string, unknown> \| undefined\)\?\.director_run_id === entry.execution.run_id/)
   assert.match(view, /section.value = 'storyboard'/)
   assert.match(view, /turn.artifactId && referenceUrls\[turn.artifactId\]/)
-  assert.match(view, /productionProgress\?\.visible/)
+  assert.match(view, /<ComicShotGeneration/)
 })
 
 test('professional confirmation enables a persistent transition to storyboard, never image controls in director', async () => {
@@ -314,14 +322,22 @@ test('professional confirmation enables a persistent transition to storyboard, n
   const body = view.slice(view.indexOf('async function enterStoryboard'), view.indexOf('async function restore('))
   const code = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
   const ref = value => ({ value })
-  const state = { confirmed: ref(false), productionEligible: ref(true), busy: ref(false), hasRunning: ref(false) }
+  const state = { confirmed: ref(false), productionEligible: ref(true), busy: ref(false), hasRunning: ref(false),
+    error: ref(''), project: ref({ project: { project_id: 'project', current_version: 2 }, creative_brief: { original_request: '少女竹林' } }),
+    spec: ref({ version: 1 }), boards: ref([]), selectedBoard: ref(''), selectedShot: ref('') }
   const actions = []
-  const enter = new Function('state', 'actions', `const {confirmed,productionEligible,busy,hasRunning}=state; function openSection(value){actions.push(value)}; async function generateImage(){actions.push('production')}; ${code}; return enterStoryboard`)(state, actions)
+  const enter = new Function('state', 'actions', `const {${Object.keys(state).join(',')}}=state;
+    const conversationEpoch=1; function openSection(value){actions.push(value)};
+    async function loadPage(){}; async function refresh(){}; function failureText(e){return String(e)};
+    async function createComicStoryboard(id,version,task){actions.push(['plan',id,version,task]);return {storyboard:{storyboard_id:'board'},shots:[{shot_id:'shot'}]}};
+    async function generateImage(){throw new Error('Entering storyboard must not generate images')};
+    ${code}; return enterStoryboard`)(state, actions)
   await enter()
   assert.deepEqual(actions, [])
   state.confirmed.value = true
   await enter()
-  assert.deepEqual(actions, ['storyboard', 'production'])
+  assert.deepEqual(actions, ['storyboard', ['plan', 'project', 2, '少女竹林']])
+  assert.equal(state.selectedShot.value, 'shot')
   assert.match(view, /section === 'storyboard' && productionEligible/)
   const production = view.slice(view.indexOf('async function generateImage'), view.indexOf('async function enterStoryboard'))
   assert.match(production, /productionRun.value = run/)
@@ -338,7 +354,8 @@ test('ordinary mode is automatic; explicit Professional keeps director consent o
   assert.match(view, /v-if="mode === 'professional'" class="toolbar-mode"/)
   assert.doesNotMatch(view, /处理制作审批|name: 'tasks'/)
   assert.match(view, /quickDirectorMessage\(item.content\)/)
-  assert.match(view, /imageExecution.actual_fen === null \? '待结算/)
+  const shotView = readFileSync(new URL('../src/components/ComicShotGeneration.vue', import.meta.url), 'utf8')
+  assert.match(shotView, /run.image_execution.actual_fen === null \? '待结算/)
 })
 
 test('regenerate is explicit new generation; unknown recovery only resumes the same run', async () => {
@@ -353,14 +370,11 @@ test('regenerate is explicit new generation; unknown recovery only resumes the s
     const conversationEpoch=1; async function generateImage(isNew){actions.push(['new',isNew])};
     async function resumeRun(id){actions.push(['resume',id]);return {id}};
     async function refresh(){}; function failureText(e){return String(e)}; ${code};
-    return { recoverImage,regenerateImage }`)(state, actions)
-  await result.regenerateImage()
-  assert.deepEqual(actions, [])
+    return { recoverImage }`)(state, actions)
   await result.recoverImage()
   assert.deepEqual(actions, [['resume', 'original']])
-  state.imageExecution.value.can_regenerate = true
-  await result.regenerateImage()
-  assert.deepEqual(actions, [['resume', 'original'], ['new', true]])
+  await result.recoverImage('shot-original')
+  assert.deepEqual(actions, [['resume', 'original'], ['resume', 'shot-original']])
   assert.match(view, /if \(newGeneration\) productionRequests.delete\(key\)/)
   assert.match(view, /request_id: productionRequests.get\(key\)/)
   assert.match(view, /prompt_version: promptVersion/)

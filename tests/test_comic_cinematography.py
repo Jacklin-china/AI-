@@ -172,6 +172,7 @@ def test_current_tree_village_request_gets_real_director_spec_with_parsed_camera
 def test_complete_legacy_camera_fingerprint_is_unchanged_and_incomplete_cannot_pass():
     spec = DirectorSpecDraft.model_validate(_parts()[SKILLS[4]]["director_spec"])
     payload = spec.model_dump(exclude={"critic_result"})
+    payload.pop("critic_status")
     payload["cinematography"].pop("status")
     payload["cinematography"].pop("public_decision")
     payload["cinematography"].pop("creative_reason")

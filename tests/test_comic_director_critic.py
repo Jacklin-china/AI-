@@ -157,6 +157,7 @@ def test_whitespace_only_evidence_difference_is_not_a_failure() -> None:
 def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> None:
     spec = _spec()
     payload = spec.model_dump(include=set(DirectorSpecDraft.model_fields) - {"critic_result"})
+    payload.pop("critic_status")
     for field in ("style_boundary", "character_expression", "character_pose", "character_presence"):
         payload["director_plan"].pop(field)
     for field in ("status", "public_decision", "creative_reason"):
@@ -623,7 +624,9 @@ def test_review_failure_preserves_real_draft_without_approving_it(tmp_path: Path
     assert run.state["error_id"].startswith("ERR-")
     assert run.state["completed_stages"] == SKILLS[:3]
     assert run.state["last_completed_step"] == "cinematography"
-    assert run.state["stage_statuses"][SKILLS[3]] == "failed"
+    assert run.state["stage_statuses"][SKILLS[3]] == "unavailable"
+    assert result.critic_result is None and result.director_draft.critic_result is None
+    assert result.director_draft.critic_status == "unavailable"
     failure = run.state["stage_failures"][SKILLS[3]]
     assert failure["trace_id"] == result.trace_id
     assert failure["input_version"]["creative_brief"] == 1
@@ -632,7 +635,7 @@ def test_review_failure_preserves_real_draft_without_approving_it(tmp_path: Path
     names = [event.payload["director_event"] for event in runtime.list_events(run.id)]
     assert "director_draft_created" in names
     assert "director_critic_failed" in names
-    assert "director_stage_failed" in names
+    assert "critic_unavailable" in names and "node_warning" in names
     assert "director_critic_completed" not in names
     with pytest.raises(ToolError):
         require_approved_director(result.director_draft)

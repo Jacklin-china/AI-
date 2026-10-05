@@ -347,7 +347,8 @@ def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restar
         assert statuses[3] == "needs_revision"
         assert "补充构图理由" in summary["status_label"]
     else:
-        assert statuses[3] == "failed"
+        assert statuses[3] == "unavailable"
+        assert draft["critic_result"] is None and draft["critic_status"] == "unavailable"
         assert summary["error_id"].startswith("ERR-")
         assert summary["failure"]["output_before_failure"]
     assert bool(summary["stages"]) == (mode == "professional")

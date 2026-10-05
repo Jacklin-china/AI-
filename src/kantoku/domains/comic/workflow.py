@@ -166,14 +166,19 @@ def build_comic_workflow(
                 "director_version": creation.get("director_spec_version"),
                 "prompt_version": creation.get("prompt_version"),
                 "prompt_hash": sha256(state.prompt.encode()).hexdigest(),
+                "generation_attempt_id": state.request_id,
             }
 
             def emit(kind: str, **extra: Any) -> None:
                 payload = {**fields, **extra, "kind": kind}
                 logger.bind(**payload).info(
-                    "{} stage={} shot_id={} artifact_id={} actual_fen={} duration_seconds={}",
-                    kind, context.node_id, payload.get("shot_id"), payload.get("artifact_id"),
-                    payload.get("actual_fen"), payload.get("duration_seconds"),
+                    "{} trace_id={} project_id={} shot_id={} generation_attempt_id={} "
+                    "provider={} model={} estimated_cost_cny={} artifact_id={} "
+                    "actual_cost_cny={} latency_ms={}",
+                    kind, state.trace_id, state.project, payload.get("shot_id"), state.request_id,
+                    fields["provider"], fields["model"], payload.get("estimated_cost_cny"),
+                    payload.get("artifact_id"), payload.get("actual_cost_cny"),
+                    payload.get("latency_ms"),
                 )
                 context.store.append_event(context.run_id, RuntimeEventType.NODE_PROGRESS,
                                            node_id=context.node_id, payload=payload)
@@ -183,7 +188,9 @@ def build_comic_workflow(
                   "prompt": "prompt_compilation_started",
                   "generate": "COMIC_IMAGE_GENERATION_STARTED",
                   "archive": "comic_artifact_save_started"}.get(
-                      context.node_id, "comic_production_stage_started"))
+                      context.node_id, "comic_production_stage_started"),
+                 **({"estimated_cost_cny": state.estimate_fen / 100}
+                    if context.node_id == "generate" else {}))
             if context.node_id == "storyboard":
                 emit("shot_selected" if creation.get("shot_id") else "shot_generation_started")
             try:
@@ -199,11 +206,20 @@ def build_comic_workflow(
                            "error": failure["safe_message"],
                            "provider_response": redact_secrets(result.error or "")
                            if result else None,
-                           "actual_fen": result.actual_fen if result else None}
+                           "actual_fen": result.actual_fen if result else None,
+                           "cost_cny": result.actual_fen / 100
+                           if result and result.actual_fen is not None else None,
+                           "http_status": result.http_status if result else None,
+                           "provider_error_code": result.provider_error_code if result else None,
+                           "provider_error_message": result.provider_error_message
+                           if result else None}
                 logger.bind(**payload).error(
                     "COMIC_IMAGE_GENERATION_FAILED stage={} shot_id={} error={} "
-                    "provider_response={} actual_fen={}", context.node_id, fields["shot_id"],
-                    failure["safe_message"], payload["provider_response"], payload["actual_fen"],
+                    "provider_response={} cost_cny={} http_status={} provider_error_code={} "
+                    "provider_error_message={}", context.node_id, fields["shot_id"],
+                    failure["safe_message"], payload["provider_response"], payload["cost_cny"],
+                    payload["http_status"], payload["provider_error_code"],
+                    payload["provider_error_message"],
                 )
                 context.store.append_event(context.run_id, RuntimeEventType.NODE_PROGRESS,
                                            node_id=context.node_id, payload=payload)
@@ -216,6 +232,9 @@ def build_comic_workflow(
                 run = context.store.get_run(context.run_id)
                 emit("COMIC_IMAGE_GENERATION_COMPLETED", artifact_id=update["image_artifact_id"],
                      actual_fen=result.actual_fen if result else None,
+                     actual_cost_cny=result.actual_fen / 100
+                     if result and result.actual_fen is not None else None,
+                     latency_ms=max(0, round((utc_now() - run.started_at).total_seconds() * 1000)),
                      duration_seconds=max(0, (utc_now() - run.started_at).total_seconds()))
             return update
         return execute

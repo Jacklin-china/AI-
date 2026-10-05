@@ -83,6 +83,9 @@ class StudioComicServices:
                     needs_reconciliation="NEEDS_RECONCILIATION" in reason,
                 )
             error = ToolError("图片生成失败；请按错误编号查看后端日志。")
+            error.status_code = int(result.http_status) if result.http_status else None
+            error.provider_error_code = result.provider_error_code
+            error.provider_error_message = result.provider_error_message
             if result.error_id:
                 error._kantoku_public_failure = {
                     "error_id": result.error_id, "trace_id": result.trace_id or "-",
