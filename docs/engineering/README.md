@@ -406,3 +406,19 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   模型/protocol 仍只读取 settings.yaml，更换兼容型号无需代码白名单；前端换模型入口提示配置步骤，
   不虚构未实现的单任务模型覆盖。日志贯通 image_generation_started、provider_request_sent、
   provider_response_received、artifact_saved、image_generation_completed/failed，并保留脱敏异常链。
+
+### 创作域按镜头生图诊断（2026-10-04）
+
+- 已确认导演方案的创作域请求继续复用 `comic.production.v1`；不修改首页、Commerce 或任务中心。
+  所选镜头必须通过当前导演/资产/Prompt 版本校验，生成任务使用实际 `sequence_number`，不可固定为 1。
+  创作域分镜列表优先返回当前导演版本下的最新分镜，再返回历史分镜；历史仍可显式查看。
+  过期分镜仍明确拒绝，不能为绕过错误而静默换成新导演方案或其他镜头。
+- 创作域节点追加 `COMIC_IMAGE_GENERATION_STARTED/COMPLETED/FAILED` 日志和既有 Runtime Event，
+  携带 project/run/shot/task/trace、provider/model、Prompt 指纹与版本。失败标明
+  `shot_validation/storyboard/prompt/prepare/generate/qc/human_review/archive`，原 error_id 和异常链保留。
+  图片 Artifact 元数据绑定 Shot、Storyboard 和 Prompt 版本，不新增 Artifact 系统。
+- 成功记录 Artifact、真实已结算分值与端到端耗时；供应商明确拒绝并释放预算才记录 0。
+  图片已计费而归档失败不能记录 0；提交结果未知保持 waiting/待对账，不伪装失败也不自动重提。
+- 排查实际供应商响应先于修改链路：2026-10-04 两个创作域 Run 已完成分镜和 Prompt，
+  在 `generate` 收到 `403 AccessDenied.Unpurchased`，当时配置为 `qwen-image-2.1-pro`。
+  这属于平台模型权限，不是导演 Approval；不得通过删除审核、重写 Provider 或盲目重试掩盖。

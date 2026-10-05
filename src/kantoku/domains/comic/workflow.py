@@ -3,13 +3,17 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from dataclasses import replace
+from hashlib import sha256
 from typing import Any
 
 from loguru import logger
 
 from kantoku.capabilities.video import VideoGenerationRequest, VideoService
-from kantoku.config import ToolError, get_settings
-from kantoku.core.budget import attach_image_artifact
+from kantoku.config import ExternalJobPending, ToolError, get_settings
+from kantoku.config.logging_setup import redact_secrets
+from kantoku.config.observability import public_error
+from kantoku.core.budget import attach_image_artifact, load_generation_result
 from kantoku.core.conversations import MessageRole, MessageType
 from kantoku.core.runtime.graph import (
     END,
@@ -19,7 +23,7 @@ from kantoku.core.runtime.graph import (
     WorkflowDefinition,
     WorkflowNode,
 )
-from kantoku.core.runtime.models import ApprovalDecision, ArtifactType
+from kantoku.core.runtime.models import ApprovalDecision, ArtifactType, RuntimeEventType, utc_now
 
 from .models import ComicState
 from .services import ComicWorkflowServices, StudioComicServices
@@ -85,6 +89,13 @@ def build_comic_workflow(
             metadata={
                 "request_id": state.request_id,
                 "domain": "comic",
+                **({"project_id": state.project,
+                    "shot_id": state.quick_creation.get("shot_id"),
+                    "storyboard_id": state.quick_creation.get("storyboard_id"),
+                    "prompt_artifact_id": state.quick_creation.get("prompt_artifact_id"),
+                    "prompt_version": state.quick_creation.get("prompt_version")}
+                   if (state.quick_creation or {}).get("use_confirmed_director")
+                   or (state.quick_creation or {}).get("use_existing_director") else {}),
                 **({"origin": "real"} if isinstance(service, StudioComicServices) else {}),
             },
         )
@@ -135,6 +146,79 @@ def build_comic_workflow(
         ):
             return "revise"
         return "reject"
+
+    def workspace_observed(handler: Callable) -> Callable:
+        """Observe the existing nodes, without changing Home or execution policy."""
+        def execute(state: ComicState, context: RuntimeContext) -> dict[str, Any]:
+            creation = state.quick_creation or {}
+            if not (creation.get("use_confirmed_director")
+                    or creation.get("use_existing_director")):
+                return handler(state, context)
+            identity = (service.provider.generation_identity()
+                        if isinstance(service, StudioComicServices) else {})
+            fields = {
+                "project_id": state.project, "run_id": context.run_id,
+                "shot_id": creation.get("shot_id"), "task_id": state.request_id,
+                "trace_id": state.trace_id, "stage": context.node_id,
+                "provider": identity.get("provider", get_settings().image.provider),
+                "model": (service.provider.model_id if isinstance(service, StudioComicServices)
+                          else get_settings().image.model),
+                "director_version": creation.get("director_spec_version"),
+                "prompt_version": creation.get("prompt_version"),
+                "prompt_hash": sha256(state.prompt.encode()).hexdigest(),
+            }
+
+            def emit(kind: str, **extra: Any) -> None:
+                payload = {**fields, **extra, "kind": kind}
+                logger.bind(**payload).info(
+                    "{} stage={} shot_id={} artifact_id={} actual_fen={} duration_seconds={}",
+                    kind, context.node_id, payload.get("shot_id"), payload.get("artifact_id"),
+                    payload.get("actual_fen"), payload.get("duration_seconds"),
+                )
+                context.store.append_event(context.run_id, RuntimeEventType.NODE_PROGRESS,
+                                           node_id=context.node_id, payload=payload)
+
+            emit({"storyboard": "storyboard_selected" if creation.get("shot_id")
+                  else "storyboard_generation_started",
+                  "prompt": "prompt_compilation_started",
+                  "generate": "COMIC_IMAGE_GENERATION_STARTED",
+                  "archive": "comic_artifact_save_started"}.get(
+                      context.node_id, "comic_production_stage_started"))
+            if context.node_id == "storyboard":
+                emit("shot_selected" if creation.get("shot_id") else "shot_generation_started")
+            try:
+                update = dict(handler(state, context))
+            except ExternalJobPending:
+                # A pending/unknown bill is not a zero-cost failure or permission to retry.
+                emit("comic_image_generation_pending", billing_status="unresolved")
+                raise
+            except Exception as error:
+                failure = public_error(error, component="comic-production", **fields)
+                result = load_generation_result(state.request_id) if state.request_id else None
+                payload = {**fields, **failure, "kind": "COMIC_IMAGE_GENERATION_FAILED",
+                           "error": failure["safe_message"],
+                           "provider_response": redact_secrets(result.error or "")
+                           if result else None,
+                           "actual_fen": result.actual_fen if result else None}
+                logger.bind(**payload).error(
+                    "COMIC_IMAGE_GENERATION_FAILED stage={} shot_id={} error={} "
+                    "provider_response={} actual_fen={}", context.node_id, fields["shot_id"],
+                    failure["safe_message"], payload["provider_response"], payload["actual_fen"],
+                )
+                context.store.append_event(context.run_id, RuntimeEventType.NODE_PROGRESS,
+                                           node_id=context.node_id, payload=payload)
+                raise
+            if context.node_id == "storyboard":
+                emit("shot_ready",
+                     shot_id=update.get("quick_creation", creation).get("shot_id"))
+            if context.node_id == "archive":
+                result = load_generation_result(state.request_id) if state.request_id else None
+                run = context.store.get_run(context.run_id)
+                emit("COMIC_IMAGE_GENERATION_COMPLETED", artifact_id=update["image_artifact_id"],
+                     actual_fen=result.actual_fen if result else None,
+                     duration_seconds=max(0, (utc_now() - run.started_at).total_seconds()))
+            return update
+        return execute
 
     nodes = {
         "director": WorkflowNode("director", lambda s, c: plan("director", s, c)),
@@ -202,6 +286,8 @@ def build_comic_workflow(
         "archive": WorkflowNode("archive", archive),
         "video": WorkflowNode("video", video),
     }
+    nodes = {key: replace(node, handler=workspace_observed(node.handler))
+             for key, node in nodes.items()}
     edges = {
         START: ConditionalEdge(
             lambda state: "quick" if state.quick_creation else "legacy",

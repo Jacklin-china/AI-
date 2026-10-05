@@ -2824,8 +2824,14 @@ class StudioApplication:
         )
 
     def list_comic_storyboards(self, project_id: str) -> dict[str, Any]:
+        current_director = self.comic_projects.get(project_id).project.director_version
+        # Workspace selects the first result on entry. Prefer the current director's
+        # newest board, while retaining historical boards for explicit inspection.
+        boards = sorted(self.comic_storyboards.list(project_id), key=lambda board: (
+            board.director_spec_version == current_director, board.created_at, board.storyboard_id,
+        ), reverse=True)
         return {"storyboards": [item.model_dump(mode="json")
-                for item in self.comic_storyboards.list(project_id)]}
+                for item in boards]}
 
     def get_comic_storyboard(self, storyboard_id: str) -> dict[str, Any]:
         storyboard = self.comic_storyboards.get(storyboard_id)
@@ -3245,10 +3251,24 @@ class StudioApplication:
                   "asset_ids": [key.removeprefix("asset:") for key in spec.asset_versions
                                 if key.startswith("asset:")]}
         if data.get("shot_id"):
-            _snapshot, _spec, board, shot, _assets = self.comic_prompts.source(data["shot_id"])
+            try:
+                _snapshot, _spec, board, shot, _assets = self.comic_prompts.source(data["shot_id"])
+            except Exception as error:
+                failure = public_error(
+                    error, component="comic-production", stage="shot_validation",
+                    project_id=project_id, shot_id=data["shot_id"],
+                    director_version=spec.version,
+                )
+                logger.bind(**failure, project_id=project_id, shot_id=data["shot_id"],
+                            stage="shot_validation", run_id=None).error(
+                    "COMIC_IMAGE_GENERATION_FAILED stage=shot_validation shot_id={} error={}",
+                    data["shot_id"], failure["safe_message"],
+                )
+                raise
             if shot.project_id != project_id or data.get("shot_version") != shot.version:
                 raise ToolError("镜头绑定或版本不一致，未调用生图")
-            source.update(shot_id=shot.shot_id, storyboard_id=board.storyboard_id)
+            source.update(shot_id=shot.shot_id, storyboard_id=board.storyboard_id,
+                          sequence_number=shot.sequence_number)
             if data.get("prompt_version") is not None:
                 prompt = self.comic_prompts.get(shot.shot_id)
                 if (prompt.version != data["prompt_version"]
@@ -3290,7 +3310,8 @@ class StudioApplication:
                      "conversation_id": conversation_id, "message_id": message_id,
                      "trace_id": current_trace_id() or f"trace-{uuid4().hex[:12]}",
                      "execution_mode": "fast", "quick_creation": source,
-                     "shot_no": 1, "estimate_fen": budget.estimate_image_fen(),
+                     "shot_no": source.get("sequence_number", 1),
+                     "estimate_fen": budget.estimate_image_fen(),
                      "total_estimate_fen": total,
                      "confirmed": not unpriced and total <= int(
                          get_settings().budget.autonomous_image_auto_cny * 100)}
