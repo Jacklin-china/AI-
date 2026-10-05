@@ -689,6 +689,12 @@ class ComicPromptDraft(BaseModel):
     director_summary: BriefText
     positive_prompt: BriefText
     negative_prompt: str = Field(default="", max_length=4000)
+    context_version: Literal["image-bibles-1"] | None = None
+    character_context: str = Field(default="", max_length=2000)
+    world_context: str = Field(default="", max_length=2000)
+    style_context: str = Field(default="", max_length=2000)
+    shot_context: str = Field(default="", max_length=2000)
+    context_sources: dict[str, Any] = Field(default_factory=dict, max_length=20)
 
 
 class ComicPromptArtifact(ComicPromptDraft):
@@ -719,6 +725,9 @@ class ComicPromptCompileRequest(BaseModel):
 
     expected_project_version: int = Field(ge=1)
     expected_shot_version: int = Field(ge=1)
+    image_mode: Literal["provider", "external"] = "provider"
+    conversation_id: str | None = None
+    complete_prompt: bool = False
 
 
 class ComicPromptEditRequest(BaseModel):
@@ -727,3 +736,32 @@ class ComicPromptEditRequest(BaseModel):
     expected_project_version: int = Field(ge=1)
     expected_version: int = Field(ge=1)
     draft: ComicPromptDraft
+
+
+class ComicPromptConfirmRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_project_version: int = Field(ge=1)
+    expected_version: int = Field(ge=1)
+    conversation_id: BriefItem
+
+
+class ComicShotImageRequest(BaseModel):
+    """Future capability：未暴露路由，外部图片主流程不使用此请求。"""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_project_version: int = Field(ge=1)
+    expected_shot_version: int = Field(ge=1)
+    prompt_version: int = Field(ge=1)
+    conversation_id: BriefItem
+    request_id: BriefItem
+    model: ProjectText | None = None
+
+
+class ComicExternalImageRequest(BaseModel):
+    """用户上传的文件，不是图片生成请求。"""
+    model_config = ConfigDict(extra="forbid", strict=True)
+    expected_project_version: int = Field(ge=1)
+    expected_shot_version: int = Field(ge=1)
+    expected_prompt_version: int = Field(ge=1)
+    conversation_id: BriefItem
+    filename: ProjectText
+    data_url: str = Field(min_length=1, max_length=7_000_000)

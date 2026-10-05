@@ -76,7 +76,7 @@ test('switching conversation during submission keeps the original owner and igno
   assert.equal(environment.error.value, '')
 })
 
-test('automatic creation late response cannot bind its project or image to the new conversation', async () => {
+test('external workspace late director response cannot bind its project to the new conversation', async () => {
   const comic = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
   const start = comic.indexOf('async function execute(')
   const body = comic.slice(start, comic.indexOf('\nfunction sendInput(', start))
@@ -87,24 +87,27 @@ test('automatic creation late response cannot bind its project or image to the n
   const response = new Promise(resolve => { release = resolve })
   const submissions = []
   const environment = {
-    epoch: 1, disposed: false, busy: ref(false), hasRunning: ref(false), project: ref(null),
+    epoch: 1, disposed: false, busy: ref(false), hasRunning: ref(false), project: ref({ project: { project_id: 'old-project', current_version: 1 } }),
     composer: ref(null), draftKey: ref('draft'), activeConversationId: ref('old'),
-    mode: ref('fast'), manualDirectorApproval: ref(false), pendingText: ref(''),
+    mode: ref('professional'), manualDirectorApproval: ref(true), pendingText: ref(''),
     previousRunIds: ref([]), executions: ref([]), error: ref(''), restoredSpec: ref(null),
     productionRun: ref(null), runs: ref({}), invalidate() {},
-    createRun(domain, payload) { submissions.push({ domain, payload }); return response },
-    getComicProject() { throw new Error('must not load a late project into the new view') },
+    selectedRun: ref(''), drafts: ref({}),
+    createDirectorExecution(id, payload) { submissions.push({ id, payload }); return response },
+    async getComicProject() { return { project: { project_id: 'old-project', current_version: 1 } } },
     refresh() { throw new Error('must not refresh another conversation') },
     failureText: String,
   }
   const names = Object.keys(environment).filter(name => name !== 'epoch' && name !== 'disposed')
   const execute = new Function('environment', `const {${names.join(',')}}=environment; let pendingCreation=null,productionAdvanced=false; ${output}; return execute`)(environment)
   const pending = execute('少女竹林')
+  await new Promise(resolve => setImmediate(resolve))
   environment.epoch++
   environment.activeConversationId.value = 'new'
   environment.busy.value = false
   environment.pendingText.value = ''
-  release({ id: 'old-production', state: { quick_creation: { project_id: 'old-project' } } })
+  environment.project.value = null
+  release({ run_id: 'old-director' })
   await pending
   assert.equal(submissions.length, 1)
   assert.equal(submissions[0].payload.conversation_id, 'old')

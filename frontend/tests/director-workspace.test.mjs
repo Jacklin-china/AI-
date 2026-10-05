@@ -107,7 +107,7 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /id: 'conversation', label: '对话'/)
   assert.match(view, /id: 'director', label: '导演'/)
   assert.match(view, /id: 'storyboard', label: '分镜'/)
-  assert.match(view, /id: 'prompt', label: 'Prompt'/)
+  assert.match(view, /id: 'prompt', label: 'Prompt资产库'/)
   assert.match(view, /id: 'assets', label: '资产'/)
   assert.match(view, /id: 'history', label: '历史'/)
   assert.doesNotMatch(view, /id: 'creative'|id: 'works'|原始创意/)
@@ -126,21 +126,16 @@ test('workspace reuses chat and existing APIs without a second workflow or asset
   assert.match(view, /if \(failedRun\) \{ selectedRun\.value = failedRun\.run_id/)
 })
 
-test('confirmed workspace submits version-bound production through existing Run API', () => {
+test('new workspace prepares external Prompt through existing API without starting production', () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
-  assert.match(view, /async function generateImage\(newGeneration = false\)/)
-  assert.match(view, /if \(!productionEligible\.value/)
-  assert.match(view, /const manualDirectorApproval = ref\(false\)/)
-  assert.match(view, /approval_required: manualDirectorApproval\.value/)
-  assert.match(view, /manualDirectorApproval\.value && !confirmed\.value/)
-  assert.match(view, /createRun\('comic', \{/)
-  assert.match(view, /production_project_id: project\.value\.project\.project_id/)
-  assert.match(view, /director_version: spec\.value\.version/)
-  assert.match(view, /request_id: productionRequests\.get\(key\)/)
-  assert.match(view, /@click="generateImage\(\)"/)
+  assert.match(view, /const imageMode = 'external'/)
+  assert.match(view, /const manualDirectorApproval = ref\(true\)/)
+  assert.match(view, /compileComicPrompt\(shot.shot_id, project.value.project.current_version, shot.version, activeConversationId.value, true\)/)
+  assert.match(view, /@click="compilePrompt"/)
+  assert.doesNotMatch(view, /createRun\(|async function generateImage|provider\.submit|images\/generations/)
   assert.doesNotMatch(view, /name: 'tasks', tab: 'waiting'/)
-  assert.doesNotMatch(view, /provider\.submit|images\/generations/)
 })
+
 
 test('Chat gives a concise entry to the real draft, never another technical director report', () => {
   const text = directorConversationSummary({ ...spec, director_plan: { visual_strategy: 'do not repeat the report' }, cinematography: { camera_angle: 'hidden camera' } })
@@ -269,7 +264,7 @@ test('discarding one node preserves other edits; saving uses the same immutable 
   assert.equal(next.critic_result, null)
 })
 
-test('automatic workspace submits one durable production Run, not a director-only task', async () => {
+test('new workspace submits a director draft and preserves mandatory user consent', async () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
   const body = view.slice(view.indexOf('async function execute('), view.indexOf('\nfunction sendInput('))
   const code = ts.transpileModule(body, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
@@ -278,37 +273,24 @@ test('automatic workspace submits one durable production Run, not a director-onl
   const state = {
     busy: ref(false), hasRunning: ref(false), project: ref(null), composer: ref(null),
     draftKey: ref('draft'), mode: ref('professional'), activeConversationId: ref('current'),
-    manualDirectorApproval: ref(false), pendingText: ref(''), previousRunIds: ref([]),
-    executions: ref([]), error: ref(''), restoredSpec: ref(null), productionRun: ref(null),
-    runs: ref({}), section: ref('director'), selectedStage: ref('director_assemble'),
+    manualDirectorApproval: ref(true), pendingText: ref(''), previousRunIds: ref([]),
+    executions: ref([]), error: ref(''), restoredSpec: ref(null), selectedRun: ref(''), drafts: ref({}),
     invalidate() {}, failureText: String, refresh() {}, loadConversations() {},
-    createDirectorExecution() { throw new Error('automatic mode must not stop at director analysis') },
-    async createRun(domain, payload) {
-      submissions.push({ domain, payload })
-      return { id: 'production', state: { quick_creation: { project_id: 'fresh-project' } } }
-    },
-    async getComicProject(id) { return { project: { project_id: id } } },
+    async createComicProject() { return { project: { project_id: 'project', current_version: 1 } } },
+    async createDirectorExecution(id, payload) { submissions.push({ id, payload }); return { run_id: 'director' } },
+    createRun() { throw new Error('external workspace cannot start image production') },
   }
-  const names = Object.keys(state)
-  const execute = new Function('state', `const {${names.join(',')}} = state; let pendingCreation=null,productionAdvanced=false; const conversationEpoch=1,disposed=false; ${code}; return execute`)(state)
+  const execute = new Function('state', `const {${Object.keys(state).join(',')}}=state; const conversationEpoch=1,disposed=false; ${code}; return execute`)(state)
   await execute('少女竹林')
   assert.equal(submissions.length, 1)
-  assert.deepEqual({ ...submissions[0].payload, request_id: 'stable-id' }, {
-    creative_request: '少女竹林', conversation_id: 'current', creation_mode: 'professional',
-    approval_required: false, request_id: 'stable-id',
-  })
-  assert.equal(state.productionRun.value.id, 'production')
-  assert.equal(state.pendingText.value, '')
-  assert.match(view, /manualDirectorApproval = ref\(false\)/)
-  assert.match(view, /manualDirectorApproval.value = !!latest && \(!productionRun.value/)
+  assert.equal(submissions[0].payload.creation_mode, 'professional')
+  assert.equal(submissions[0].payload.conversation_id, 'current')
+  assert.equal(state.selectedRun.value, 'director')
   assert.match(view, /v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'"/)
   assert.match(view, /productionRun.value.id\), getEvents\(productionRun.value.id\)/)
-  assert.match(view, /if \(run\) runs.value\[run.id\] = run/)
-  assert.match(view, /quick_creation as Record<string, unknown> \| undefined\)\?\.director_run_id === entry.execution.run_id/)
-  assert.match(view, /section.value = 'storyboard'/)
   assert.match(view, /turn.artifactId && referenceUrls\[turn.artifactId\]/)
-  assert.match(view, /<ComicShotGeneration/)
 })
+
 
 test('professional confirmation enables a persistent transition to storyboard, never image controls in director', async () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
@@ -339,24 +321,18 @@ test('professional confirmation enables a persistent transition to storyboard, n
   assert.deepEqual(actions, ['storyboard', ['plan', 'project', 2, '少女竹林']])
   assert.equal(state.selectedShot.value, 'shot')
   assert.match(view, /section === 'storyboard' && productionEligible/)
-  const production = view.slice(view.indexOf('async function generateImage'), view.indexOf('async function enterStoryboard'))
-  assert.match(production, /productionRun.value = run/)
-  assert.match(production, /openSection\('storyboard'\)/)
-  assert.doesNotMatch(production, /navigate\(\{ name: 'task_run'/)
+  assert.doesNotMatch(view, /async function generateImage|createRun\(/)
 })
 
-test('ordinary mode is automatic; explicit Professional keeps director consent only', () => {
+test('external workspace preserves manual director consent regardless of director depth', () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
-  assert.match(view, /manualDirectorApproval = ref\(false\)/)
-  assert.match(view, /manualDirectorApproval.value = value === 'professional'/)
-  assert.match(view, /const executionLabel = computed\(\(\) => hasRunning\.value/)
-  assert.match(view, /busy\.value \? '正在处理当前操作'/)
-  assert.match(view, /v-if="mode === 'professional'" class="toolbar-mode"/)
+  assert.match(view, /manualDirectorApproval = ref\(true\)/)
+  assert.doesNotMatch(view, /manualDirectorApproval.value = false|v-model="manualDirectorApproval"/)
+  assert.match(view, /导演方案需人工确认 · 外部图片/)
   assert.doesNotMatch(view, /处理制作审批|name: 'tasks'/)
   assert.match(view, /quickDirectorMessage\(item.content\)/)
-  const shotView = readFileSync(new URL('../src/components/ComicShotGeneration.vue', import.meta.url), 'utf8')
-  assert.match(shotView, /run.image_execution.actual_fen === null \? '待结算/)
 })
+
 
 test('regenerate is explicit new generation; unknown recovery only resumes the same run', async () => {
   const view = readFileSync(new URL('../src/components/DirectorWorkspace.vue', import.meta.url), 'utf8')
@@ -375,8 +351,6 @@ test('regenerate is explicit new generation; unknown recovery only resumes the s
   assert.deepEqual(actions, [['resume', 'original']])
   await result.recoverImage('shot-original')
   assert.deepEqual(actions, [['resume', 'original'], ['resume', 'shot-original']])
-  assert.match(view, /if \(newGeneration\) productionRequests.delete\(key\)/)
-  assert.match(view, /request_id: productionRequests.get\(key\)/)
-  assert.match(view, /prompt_version: promptVersion/)
+  assert.doesNotMatch(view, /async function generateImage|productionRequests/)
   assert.match(view, /保存为新版本/)
 })

@@ -23,6 +23,7 @@ from kantoku.perception.review import (
 from kantoku.schemas.qc import HumanQcLabel, QcResult
 from kantoku.tools.archive import archive_reviewed_image
 from kantoku.tools.image_gen import ImageProvider
+from kantoku.tools.openai_image import OpenAIImageProvider
 from kantoku.tools.studio import create_task, execute_task, list_tasks
 
 from .models import ComicState
@@ -51,6 +52,24 @@ class StudioComicServices:
 
     def __init__(self, provider: ImageProvider) -> None:
         self.provider = provider
+        self._model_providers: dict[str, ImageProvider] = {}
+
+    def provider_for(self, state: ComicState) -> ImageProvider:
+        """Future capability：必须显式启用，Comic Prompt 主流程不调用。"""
+        if not (state.quick_creation or {}).get("future_image_model_selection"):
+            return self.provider
+        model = (state.quick_creation or {}).get("image_model")
+        if not model or model == self.provider.model_id:
+            return self.provider
+        if not isinstance(self.provider, OpenAIImageProvider):
+            raise ToolError("当前适配器不支持请求级模型选择")
+        if model not in self.provider.settings.pricing.cny_per_image_by_model:
+            raise ToolError("图片模型未在配置价格表中启用", detail=model)
+        if model not in self._model_providers:
+            self._model_providers[model] = type(self.provider)(
+                settings=self.provider.settings.model_copy(update={"model": model}),
+            )
+        return self._model_providers[model]
 
     def prepare(self, state: ComicState) -> Mapping[str, Any]:
         """付费前先保存不可变任务。"""
@@ -68,8 +87,10 @@ class StudioComicServices:
         if task is None:
             raise ToolError("找不到 Comic 生成任务", detail=state.request_id)
         try:
-            result = execute_task(task, provider=self.provider, confirmed=state.confirmed,
-                                  conversation_id=state.conversation_id)
+            result = execute_task(
+                task, provider=self.provider_for(state), confirmed=state.confirmed,
+                conversation_id=state.conversation_id,
+            )
         except Exception:
             reservation = budget.get_reservation(state.request_id)
             if reservation is not None and reservation.status == "reserved":
@@ -82,7 +103,8 @@ class StudioComicServices:
                     reason[:120],
                     needs_reconciliation="NEEDS_RECONCILIATION" in reason,
                 )
-            error = ToolError("图片生成失败；请按错误编号查看后端日志。")
+            message = result.provider_error_message or result.error or "供应商未返回图片"
+            error = ToolError("图片供应商请求失败", detail=message[:1000])
             error.status_code = int(result.http_status) if result.http_status else None
             error.provider_error_code = result.provider_error_code
             error.provider_error_message = result.provider_error_message

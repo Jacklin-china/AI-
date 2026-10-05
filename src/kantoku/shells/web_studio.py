@@ -110,9 +110,11 @@ from kantoku.domains.comic.models import (
     ComicAssetLockRequest,
     ComicAssetRef,
     ComicAssetVersionRequest,
+    ComicExternalImageRequest,
     ComicProjectInput,
     ComicProjectSnapshot,
     ComicPromptCompileRequest,
+    ComicPromptConfirmRequest,
     ComicPromptDraft,
     ComicPromptEditRequest,
     ComicShotCreateRequest,
@@ -131,7 +133,12 @@ from kantoku.domains.comic.models import (
     StoryboardStatus,
 )
 from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
-from kantoku.domains.comic.prompts import ComicPromptStore, compiler_for_model
+from kantoku.domains.comic.prompts import (
+    CONTEXT_VERSION,
+    ComicPromptStore,
+    compiler_for_model,
+    prompt_fingerprint,
+)
 from kantoku.domains.comic.services import StudioComicServices
 from kantoku.domains.comic.storyboards import ComicStoryboardStore, plan_storyboard
 from kantoku.domains.comic.workflow import WORKFLOW_ID as COMIC_WORKFLOW_ID
@@ -2672,6 +2679,7 @@ class StudioApplication:
         action: Callable[[Callable[[str, str | None], None]], dict[str, Any]],
         *, storyboard_id: str | None = None, shot_id: str | None = None,
         expected_project_version: int, expected_version: int | None = None,
+        conversation_id: str | None = None,
     ) -> dict[str, Any]:
         """作品写操作复用 Core Run/Event；不创建 Comic 专属任务表。"""
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
@@ -2684,6 +2692,8 @@ class StudioApplication:
             "expected_version": expected_version,
             "worker_instance_id": self._instance_id,
         }
+        if conversation_id:
+            state["conversation_id"] = conversation_id
         parent_id = current_run_id()
         parent = self.runtime_store.get_run(parent_id) if parent_id else None
         if parent and parent.state.get("quick_creation"):
@@ -2732,7 +2742,8 @@ class StudioApplication:
                 if artifact_id := entity.get("artifact_id"):
                     self.runtime_store.append_event(
                         run.id, RuntimeEventType.ARTIFACT_CREATED, node_id=task_type,
-                        payload={"artifact_id": artifact_id, "type": "prompt",
+                        payload={"artifact_id": artifact_id,
+                                 "type": entity.get("artifact_type", "prompt"),
                                  "version": saved_version},
                     )
                 state.update(
@@ -2740,6 +2751,26 @@ class StudioApplication:
                     storyboard_id=saved_storyboard_id, shot_id=saved_shot_id,
                     result_version=saved_version,
                 )
+                if preparation := entity.get("media_preparation"):
+                    state["media_preparation"] = preparation
+                    media_status = preparation["status"]
+                    self.runtime_store.append_event(
+                        run.id, RuntimeEventType.NODE_PROGRESS, node_id=task_type,
+                        payload={"kind": "comic_external_image_uploaded"
+                                 if media_status == "image_uploaded"
+                                 else "comic_external_prompt_ready", **preparation},
+                    )
+                    logger.info(
+                        "COMIC_EXTERNAL_MEDIA_READY shot_id={} prompt_artifact_id={} "
+                        "media_status={}", saved_shot_id,
+                        preparation.get("prompt_artifact_id"), media_status,
+                    )
+                if confirmation := entity.get("prompt_confirmation"):
+                    state["prompt_confirmation"] = confirmation
+                    self.runtime_store.append_event(
+                        run.id, RuntimeEventType.NODE_PROGRESS, node_id=task_type,
+                        payload={"kind": "comic_prompt_confirmed", **confirmation},
+                    )
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.COMPLETED, state=state,
                     current_node=task_type,
@@ -2929,6 +2960,20 @@ class StudioApplication:
     def compile_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = ComicPromptCompileRequest.model_validate(data)
         shot = self.comic_storyboards.get_shot(shot_id)
+        if request.complete_prompt and request.image_mode != "external":
+            raise ToolError("完整 Prompt 生产当前只用于外部图片流程")
+        if request.image_mode == "external":
+            conversation = self.runtime_store.get_conversation(request.conversation_id or "")
+            if (conversation.interaction_mode is not InteractionMode.GUIDED
+                    or conversation.domain != "comic"
+                    or not any(run.workflow == "comic.director"
+                               and run.state.get("project_id") == shot.project_id
+                               for run in self.runtime_store.list_runs(
+                                   conversation_id=conversation.id))):
+                raise ToolError("外部图片准备必须绑定当前 Comic 创作会话")
+            self.comic_projects.require_confirmed_director(
+                self.comic_projects.get_director(shot.project_id), human_review=True,
+            )
 
         def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
             snapshot, director, storyboard, current_shot, assets = self.comic_prompts.source(
@@ -2938,7 +2983,8 @@ class StudioApplication:
                 raise ToolError("作品已由其他操作更新，请刷新后重试")
             if current_shot.version != request.expected_shot_version:
                 raise ToolError("镜头版本已变化，请重新编译 Prompt")
-            model_target = get_settings().image.model
+            model_target = "external" if request.image_mode == "external" \
+                else get_settings().image.model
             compiler = compiler_for_model(model_target)
             progress("generating", "context_selected")
             draft = compiler.compile(
@@ -2947,6 +2993,9 @@ class StudioApplication:
                 model_call=self._comic_storyboard_model,
                 allow_advisory=self.comic_projects.advisory_authorized(director),
                 allow_unavailable=self.comic_projects.human_director_confirmed(director),
+                complete_prompt=request.complete_prompt,
+                reused_context=self.comic_prompts.reused_context(current_shot, director)
+                if request.complete_prompt else None,
             )
             progress("checking", "prompt_compiled")
             run_id = current_run_id()
@@ -2957,14 +3006,64 @@ class StudioApplication:
                 expected_shot_version=request.expected_shot_version,
                 model_target=model_target, compiler_version=compiler.version, run_id=run_id,
             )
-            return prompt.model_dump(mode="json")
+            result = self.comic_prompts.payload(prompt)
+            if request.image_mode == "external":
+                result["media_preparation"] = {
+                    "image_mode": "external", "status": "awaiting_external_image",
+                    "prompt_status": "ready", "project_id": prompt.project_id,
+                    "shot_id": prompt.shot_id, "shot_version": prompt.shot_version,
+                    "prompt_artifact_id": prompt.artifact_id, "prompt_version": prompt.version,
+                }
+            return result
 
         return self._comic_tracked_action(
             shot.project_id, "prompt.compile", execute,
             storyboard_id=shot.storyboard_id, shot_id=shot_id,
             expected_project_version=request.expected_project_version,
             expected_version=request.expected_shot_version,
+            conversation_id=request.conversation_id if request.image_mode == "external" else None,
         )
+
+    def confirm_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """只冻结用户查看的 Prompt 修订；不创建生图审批或付费任务。"""
+        request = ComicPromptConfirmRequest.model_validate(data)
+        prompt = self.comic_prompts.get(shot_id)
+        conversation = self.runtime_store.get_conversation(request.conversation_id)
+        if (conversation.interaction_mode is not InteractionMode.GUIDED
+                or conversation.domain != "comic"
+                or not any(run.workflow == "comic.director"
+                           and run.state.get("project_id") == prompt.project_id
+                           for run in self.runtime_store.list_runs(
+                               conversation_id=conversation.id))):
+            raise ToolError("Prompt 确认必须绑定当前 Comic 创作会话")
+
+        def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            snapshot, director, _board, _shot, _assets = self.comic_prompts.source(shot_id)
+            self.comic_projects.require_confirmed_director(director, human_review=True)
+            current = self.comic_prompts.get(shot_id)
+            if (request.expected_project_version != snapshot.project.current_version
+                    or current.version != request.expected_version
+                    or current.context_version != CONTEXT_VERSION
+                    or current.shot_version != _shot.version
+                    or current.storyboard_version != _board.version
+                    or current.creative_brief_version != snapshot.creative_brief.version
+                    or current.director_spec_version != director.version):
+                raise ToolError("Prompt 来源或版本已变化，请刷新后确认")
+            result = {"shot_id": current.shot_id, "storyboard_id": current.storyboard_id,
+                      "version": current.version}
+            result["prompt_confirmation"] = {
+                "artifact_id": current.artifact_id, "version": current.version,
+                "sha256": prompt_fingerprint(current),
+            }
+            return result
+
+        self._comic_tracked_action(
+            prompt.project_id, "prompt.confirm", execute,
+            storyboard_id=prompt.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_version, conversation_id=conversation.id,
+        )
+        return self.comic_prompts.payload(self.comic_prompts.get(shot_id))
 
     def edit_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = ComicPromptEditRequest.model_validate(data)
@@ -2976,21 +3075,56 @@ class StudioApplication:
             run_id = current_run_id()
             if run_id is None:
                 raise ToolError("Prompt 编辑缺少 Run 追踪")
+            draft = request.draft
+            if current.context_version == CONTEXT_VERSION:
+                draft = draft.model_copy(update={"context_version": CONTEXT_VERSION})
             prompt = self.comic_prompts.save(
-                shot_id, request.draft,
+                shot_id, draft,
                 expected_project_version=request.expected_project_version,
                 expected_shot_version=self.comic_storyboards.get_shot(shot_id).version,
                 expected_version=request.expected_version,
                 model_target=current.model_target,
                 compiler_version=current.compiler_version, run_id=run_id, source="edited",
             )
-            return prompt.model_dump(mode="json")
+            return self.comic_prompts.payload(prompt)
 
         return self._comic_tracked_action(
             current.project_id, "prompt.edit", execute,
             storyboard_id=current.storyboard_id, shot_id=shot_id,
             expected_project_version=request.expected_project_version,
             expected_version=request.expected_version,
+        )
+
+    def import_comic_external_image(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        request = ComicExternalImageRequest.model_validate(data)
+        shot = self.comic_storyboards.get_shot(shot_id)
+        conversation = self.runtime_store.get_conversation(request.conversation_id)
+        if (conversation.interaction_mode is not InteractionMode.GUIDED
+                or conversation.domain != "comic"
+                or not any(run.workflow == "comic.director"
+                           and run.state.get("project_id") == shot.project_id
+                           for run in self.runtime_store.list_runs(
+                               conversation_id=conversation.id))):
+            raise ToolError("外部图片上传必须绑定当前 Comic 创作会话")
+
+        def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            output_dir = get_settings().image.output_dir
+            output_dir = (
+                output_dir if output_dir.is_absolute() else ROOT / output_dir
+            ) / "external"
+            return self.comic_prompts.import_image(
+                shot_id, data_url=request.data_url, filename=request.filename,
+                run_id=current_run_id(), conversation_id=conversation.id, output_dir=output_dir,
+                expected_project_version=request.expected_project_version,
+                expected_shot_version=request.expected_shot_version,
+                expected_prompt_version=request.expected_prompt_version,
+            )
+
+        return self._comic_tracked_action(
+            shot.project_id, "external_image.import", execute, shot_id=shot_id,
+            storyboard_id=shot.storyboard_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.expected_prompt_version, conversation_id=conversation.id,
         )
 
     def restore_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
@@ -3013,15 +3147,14 @@ class StudioApplication:
             if run_id is None:
                 raise ToolError("Prompt 恢复缺少 Run 追踪")
             prompt = self.comic_prompts.save(
-                shot_id, ComicPromptDraft.model_validate(old.model_dump(include={
-                    "director_summary", "positive_prompt", "negative_prompt",
-                })),
+                shot_id, ComicPromptDraft.model_validate(old.model_dump(
+                    include=set(ComicPromptDraft.model_fields))),
                 expected_project_version=request.expected_project_version,
                 expected_shot_version=shot.version, expected_version=request.expected_version,
                 model_target=old.model_target, compiler_version=old.compiler_version,
                 run_id=run_id, source="restored", restored_from_version=request.version,
             )
-            return prompt.model_dump(mode="json")
+            return self.comic_prompts.payload(prompt)
 
         return self._comic_tracked_action(
             current.project_id, "prompt.restore", execute,
@@ -3775,6 +3908,11 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         self.json_reply(200, app.list_comic_project_tasks(comic_parts[2]))
                     elif len(comic_parts) == 4 and comic_parts[3] == "storyboards":
                         self.json_reply(200, app.list_comic_storyboards(comic_parts[2]))
+                    elif len(comic_parts) == 4 and comic_parts[3] == "prompts":
+                        self.json_reply(200, {"prompts": [
+                            app.comic_prompts.payload(item)
+                            for item in app.comic_prompts.list(comic_parts[2])
+                        ]})
                     elif len(comic_parts) == 5 and comic_parts[3] == "assets":
                         self.json_reply(200, app.get_comic_asset(
                             comic_parts[2], comic_parts[4], version=version,
@@ -3826,12 +3964,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                             for item in app.comic_storyboards.shot_versions(shot_id)
                         ]})
                     elif len(comic_parts) == 5 and comic_parts[4] == "prompt":
-                        self.json_reply(200, app.comic_prompts.get(
+                        self.json_reply(200, app.comic_prompts.payload(app.comic_prompts.get(
                             shot_id, version=version,
-                        ).model_dump(mode="json"))
+                        )))
                     elif len(comic_parts) == 6 and comic_parts[4:] == ["prompt", "versions"]:
                         self.json_reply(200, {"versions": [
-                            item.model_dump(mode="json")
+                            app.comic_prompts.payload(item)
                             for item in app.comic_prompts.versions(shot_id)
                         ]})
                     else:
@@ -3940,11 +4078,15 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 self.json_reply(403, {"error": "会话验证失败，请刷新页面"})
                 return
             try:
+                request_path = urlsplit(self.path).path
                 length = int(self.headers.get("Content-Length", "0"))
-                if not 0 < length <= 65536:
+                # File import alone accepts a larger body; existing routes keep their limit.
+                maximum = 7 * 1024 * 1024 if re.fullmatch(
+                    r"/api/comic/shots/[^/]+/external-image", request_path,
+                ) else 65536
+                if not 0 < length <= maximum:
                     raise ToolError("请求内容过长或为空")
                 data = json.loads(self.rfile.read(length))
-                request_path = urlsplit(self.path).path
                 if not isinstance(data, dict) or not (
                     request_path.startswith(("/api/", "/comic/projects"))
                 ):
@@ -3980,6 +4122,12 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
                         and parts[4:] == ["prompt", "compile"]:
                     self.json_reply(201, app.compile_comic_prompt(parts[3], data))
+                elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4:] == ["prompt", "confirm"]:
+                    self.json_reply(200, app.confirm_comic_prompt(parts[3], data))
+                elif len(parts) == 5 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4] == "external-image":
+                    self.json_reply(201, app.import_comic_external_image(parts[3], data))
                 elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
                         and parts[4:] == ["prompt", "restore"]:
                     self.json_reply(201, app.restore_comic_prompt(parts[3], data))

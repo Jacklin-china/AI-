@@ -79,9 +79,9 @@ export async function getComicAssets(id: string): Promise<ComicAssetView[]> {
 export async function getComicStoryboards(id: string): Promise<ComicStoryboardView[]> {
   return (await coreGet<{ storyboards: ComicStoryboardView[] }>(`/api/comic/projects/${encodeURIComponent(id)}/storyboards`, `comic-boards:${id}`))?.storyboards ?? []
 }
-export function createComicStoryboard(id: string, projectVersion: number, task: string): Promise<{ storyboard: ComicStoryboardView; shots: ComicShotView[] }> {
+export function createComicStoryboard(id: string, projectVersion: number, task: string, assetIds: string[] = []): Promise<{ storyboard: ComicStoryboardView; shots: ComicShotView[] }> {
   return corePost(`/api/comic/projects/${encodeURIComponent(id)}/storyboards`, {
-    expected_project_version: projectVersion, generate: true, task,
+    expected_project_version: projectVersion, generate: true, task, asset_ids: assetIds,
   })
 }
 export async function getComicShots(id: string): Promise<ComicShotView[]> {
@@ -105,9 +105,35 @@ export function confirmDirectorVersion(id: string, version: number, projectVersi
 export async function getComicPromptVersions(id: string): Promise<Record<string, unknown>[]> {
   return (await coreGet<{ versions: Record<string, unknown>[] }>(`/api/comic/shots/${encodeURIComponent(id)}/prompt/versions`, `comic-prompt-versions:${id}`))?.versions ?? []
 }
-export function compileComicPrompt(id: string, projectVersion: number, shotVersion: number): Promise<Record<string, unknown>> {
+export function compileComicPrompt(id: string, projectVersion: number, shotVersion: number,
+  externalConversationId?: string, completePrompt = false): Promise<Record<string, unknown>> {
   return corePost(`/api/comic/shots/${encodeURIComponent(id)}/prompt/compile`, {
     expected_project_version: projectVersion, expected_shot_version: shotVersion,
+    ...(externalConversationId ? { image_mode: 'external', conversation_id: externalConversationId } : {}),
+    ...(completePrompt ? { complete_prompt: true } : {}),
+  })
+}
+export async function getProjectPrompts(projectId: string): Promise<Record<string, unknown>[]> {
+  return (await coreGet<{ prompts: Record<string, unknown>[] }>(
+    `/api/comic/projects/${encodeURIComponent(projectId)}/prompts`, `comic-prompts:${projectId}`,
+  ))?.prompts ?? []
+}
+export function confirmComicPrompt(id: string, projectVersion: number, version: number,
+  conversationId: string): Promise<Record<string, unknown>> {
+  return corePost(`/api/comic/shots/${encodeURIComponent(id)}/prompt/confirm`, {
+    expected_project_version: projectVersion, expected_version: version, conversation_id: conversationId,
+  })
+}
+export async function uploadComicExternalImage(id: string, file: File,
+  source: Record<string, unknown>): Promise<Record<string, unknown>> {
+  const dataUrl = await new Promise<string>((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onload = () => resolve(String(reader.result))
+    reader.onerror = () => reject(new Error('无法读取所选图片'))
+    reader.readAsDataURL(file)
+  })
+  return corePost(`/api/comic/shots/${encodeURIComponent(id)}/external-image`, {
+    ...source, data_url: dataUrl, filename: file.name,
   })
 }
 export function saveComicPrompt(id: string, body: Record<string, unknown>): Promise<Record<string, unknown>> {

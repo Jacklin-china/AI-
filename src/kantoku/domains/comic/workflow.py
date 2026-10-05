@@ -154,20 +154,29 @@ def build_comic_workflow(
             if not (creation.get("use_confirmed_director")
                     or creation.get("use_existing_director")):
                 return handler(state, context)
-            identity = (service.provider.generation_identity()
+            provider = (service.provider_for(state)
+                        if isinstance(service, StudioComicServices) else None)
+            identity = (provider.generation_identity()
                         if isinstance(service, StudioComicServices) else {})
             fields = {
                 "project_id": state.project, "run_id": context.run_id,
                 "shot_id": creation.get("shot_id"), "task_id": state.request_id,
                 "trace_id": state.trace_id, "stage": context.node_id,
                 "provider": identity.get("provider", get_settings().image.provider),
-                "model": (service.provider.model_id if isinstance(service, StudioComicServices)
+                "model": (provider.model_id if isinstance(service, StudioComicServices)
                           else get_settings().image.model),
                 "director_version": creation.get("director_spec_version"),
                 "prompt_version": creation.get("prompt_version"),
                 "prompt_hash": sha256(state.prompt.encode()).hexdigest(),
                 "generation_attempt_id": state.request_id,
             }
+            if context.node_id == "generate" and creation.get("prompt_confirmation_required"):
+                logger.bind(**fields).info(
+                    "COMIC_IMAGE_REQUEST trace_id={} project_id={} shot_id={} request_id={} "
+                    "model={} prompt={} status=started",
+                    state.trace_id, state.project, creation.get("shot_id"), state.request_id,
+                    fields["model"], redact_secrets(state.prompt),
+                )
 
             def emit(kind: str, **extra: Any) -> None:
                 payload = {**fields, **extra, "kind": kind}

@@ -439,6 +439,19 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
   `403 AccessDenied.Unpurchased`；镜头可直接重试、预算释放且记录 ¥0.00。
   真实图片交付验收为 **BLOCKED（供应商模型权限）**，不得用离线测试图片冒充成功。
 
+### Comic 新工作区外部图片策略（Module 1，2026-10-05）
+
+- 新 Comic Guided Workspace 固定要求人工确认当前导演版本；进入下一步仍复用 Storyboard API。
+  镜头按钮改为准备 Prompt，通过现有 Prompt 编译 API 传入 `image_mode=external` 和会话 ID。
+  后端验证 Comic Guided 会话、项目归属及当前导演人工确认后，复用 PromptCompiler 和原子
+  Prompt 修订 / Core Prompt Artifact 保存。编译 Run 完成，媒体派生状态为 `awaiting_external_image`。
+- `external` 是工作区图片策略及编译目标，不是图片模型名称；不改变 Shot 的创作审核状态。
+  准备状态只显示在当前镜头；刷新后从匹配当前 Shot / Director 版本的 Prompt Artifact 恢复。
+  此入口不创建 StudioTask，不调用 gen_image、ImageProvider、QC、图片 Archive 或图片费用预占/结算。
+- 未指定策略的 Prompt API 保持原 provider 目标；`comic.production.v1`、旧 Studio/CLI/API、
+  首页 Fast、ConversationImageService、共享 Core/Provider/预算/审批继续保留。
+  不迁移 `auto_create_image`，不新增 Runtime、Artifact 或 Workflow。上传及 ChatGPT 集成属于后续模块。
+
 ### Director Skill 知识实际加载（2026-10-05）
 
 - 现有五个导演 Skill 的 Registry/handler 保持不变；原 `knowledge_refs` 过去只有名称，
@@ -478,3 +491,26 @@ Conversation 分别管理，切换节点只替换中央内容；标题来自 Con
 - 本模块未增加 Skill、Registry、Agent、Runtime、Workflow、Artifact 或依赖；不修改 UI、
   Prompt Compiler、Canvas、图片上传或 Video。真实文本实测在隔离数据库执行，另行授权
   上限，记录用量与配置价格估算，不把估算称为最终账单，也不自动代表用户完成方案验收。
+
+### Comic Prompt Production Pipeline（Module 2，2026-10-05）
+
+- Comic 新工作区保持 `external` 策略及导演人工确认。确认后规划分镜，在当前镜头调用
+  原 Prompt Compiler 的 `complete_prompt=true`，输出 Character / World / Style Bible、
+  Shot Direction 与 Negative Constraint。默认 `false` 保持首页及旧 API 的输入兼容。
+  未绑定资产的外貌、服装等是可编辑的模型选择，不冒充用户事实。
+- Compiler 读取当前 Brief、固定镜头资产版本、已确认的 DirectorSpec 和已有字段来源。
+  相同角色资产的镜头复用已保存身份 Bible，同场景/风格沿用对应内容；不会跨项目或角色
+  继承。镜头局部景别与机位优先于导演总体摄影，整体色彩与主光继续来自导演方案。
+  模型请求、Brief/资产版本及 hash、导演 Skill 方法证据、复用 Artifact 和人工编辑来源
+  保存在既有 Prompt 修订与 Core PROMPT Artifact。方法证据不等同逐字段因果证明。
+- 工作区可以预览、编辑、复制和导出完整正向正文与负向约束。Prompt 资产库管理项目镜头、
+  历史版本、差异及来源；编译入口只在分镜。确认 Prompt 仅记录当前内容指纹，不涉及费用审批。
+  编辑与恢复生成新修订，不能覆盖历史、删除固定资产事实或继承旧版本确认。
+- 用户外部图片上传只登记文件到 Core IMAGE Artifact，关联 Conversation/Project/Shot/
+  Prompt 版本和 trace。支持 PNG/JPEG/WebP，文件不超过 5 MB；仅该 Comic 导入路由允许
+  7 MB JSON 请求，其余路由保持原大小限制。上传验证版本并保留原 Shot 的创作状态，
+  媒体投影为 `image_uploaded`；不代表视频已实现或图片由内部模型生成。
+- 已写的内部单镜头请求 DTO、服务按模型选择与生产日志扩展保留为 **future capability**。
+  模型选择须显式 `quick_creation.future_image_model_selection`，不是默认路径；没有新增
+  Comic 图片生成路由，新工作区不调用 Image Provider、图片预算、Task Center 或生产工作流。
+  原生产流程、首页、Commerce、Core/Skill/Director/Critic 及全局导航保持兼容。

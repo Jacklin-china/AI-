@@ -10,14 +10,14 @@ import { conversationTaskTitle, ownsConversationRun } from './chat/conversationP
 import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import ComicShotGeneration from './ComicShotGeneration.vue'
-import { shotGeneration } from '../domains/comic/shotGeneration'
+import { externalShotPrompt, finalImagePrompt, promptVersionDiff } from '../domains/comic/shotGeneration'
 import { createComicStoryboard } from '../services/core'
 import { comicProductionProgress } from '../domains/comic/productionProgress'
 import { quickDirectorMessage } from '../domains/comic/directorPresentation'
-import { resumeRun, saveComicPrompt } from '../services/core'
+import { confirmComicPrompt, getProjectPrompts, resumeRun, saveComicPrompt, uploadComicExternalImage } from '../services/core'
 import { navigate, route } from '../router'
 import { canConfirmDirector, canDispatchDirectorInput, chronologicalDirectorExecutions, directorConversationSummary, directorDraftFields, discardDirectorNodeDraft, editableDirectorDraft, directorFieldLabels, directorIsStale, directorNodeLabels, directorStageSections, fastDirectorNodeLabels, directorStateLabels, directorSummary, editableDirectorNode, selectDirectorExecution, stageDraftKey } from '../domains/comic/directorPresentation'
-import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, createRun, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
+import { CoreApiError, cancelRun, compileComicPrompt, confirmDirectorVersion, saveDirectorDraft, createComicProject, createConversation, createDirectorExecution, deleteConversation, getArtifactContentUrl, getComicAssets, getComicProject, getComicPromptVersions, getComicShots, getComicStoryboards, getConversation, getConversations, getDirectorExecutions, getDirectorVersions, getEvents, getRun, renameConversation, restoreDirectorVersion, type ComicAssetView, type ComicProjectContext, type ComicShotView, type ComicStoryboardView, type CreationMode, type DirectorExecution, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage } from '../types'
 import type { CoreRun } from '../types'
 
@@ -25,7 +25,7 @@ const props = defineProps<{ initialRunId?: string }>()
 defineEmits<{ newProject: [] }>()
 const legacyOnly = ref(false)
 const project = ref<ComicProjectContext | null>(null)
-const mode = ref<CreationMode>('fast')
+const mode = ref<CreationMode>('professional')
 const executions = ref<DirectorExecution[]>([])
 const runs = ref<Record<string, CoreRun>>({})
 const assets = ref<ComicAssetView[]>([])
@@ -58,15 +58,20 @@ const revisionVersion = ref<number | null>(null)
 const restoredSpec = ref<Record<string, unknown> | null>(null)
 const events = ref<RuntimeEvent[]>([])
 const compiling = ref(false)
-const submittingImage = ref(false)
-const manualDirectorApproval = ref(false)
+const imageMode = 'external' as const
+const manualDirectorApproval = ref(true)
+const preparingShot = ref('')
+const shotPrompts = ref<Record<string, Record<string, unknown>[]>>({})
+const projectPrompts = ref<Record<string, unknown>[]>([])
+const promptPreview = ref<Record<string, unknown> | null>(null)
+const copiedPrompt = ref('')
+const compareVersions = ref<number[]>([])
+const uploadingShot = ref('')
+const shotErrors = ref<Record<string, string>>({})
 const promptEdit = ref<{ shotId: string; version: number; director_summary: string; positive_prompt: string; negative_prompt: string } | null>(null)
 const productionRun = ref<CoreRun | null>(null)
 const productionEvents = ref<RuntimeEvent[]>([])
 let productionAdvanced = false
-let pendingCreation: { text: string; mode: CreationMode; requestId: string } | null = null
-const productionRequests = new Map<string, string>()
-const productionPromptVersions = new Map<string, unknown>()
 const stageScroll = ref<HTMLElement | null>(null)
 const scrollPositions = new Map<string, number>()
 const referenceUrls = ref<Record<string, string>>({})
@@ -83,7 +88,7 @@ const navigation = [
   { id: 'director', label: '导演', icon: Clapperboard },
   { id: 'storyboard', label: '分镜', icon: Film },
   { id: 'assets', label: '资产', icon: Layers },
-  { id: 'prompt', label: 'Prompt', icon: FileText },
+  { id: 'prompt', label: 'Prompt资产库', icon: FileText },
   { id: 'history', label: '历史', icon: History },
 ]
 /* 对话线程与工作流执行记录是两类数据：左侧只列用户 ↔ AI 的聊天线程。 */
@@ -151,7 +156,6 @@ async function openConversation(id: string): Promise<void> {
     owned.forEach(run => { runs.value[run.id] = run })
     const latest = owned.find(run => (run.state.project_id && run.workflow.startsWith('comic.director')) || (run.workflow === 'comic.production.v1' && run.state.quick_creation))
     productionRun.value = latest?.workflow === 'comic.production.v1' ? latest : owned.find(run => (run.state.quick_creation as Record<string, unknown> | undefined)?.director_run_id === latest?.id) ?? null
-    manualDirectorApproval.value = !!latest && (!productionRun.value || (productionRun.value.state.quick_creation as Record<string, unknown>)?.approval_required === true)
     const productionProject = (productionRun.value?.state.quick_creation as Record<string, unknown> | undefined)?.project_id
     if (latest || productionProject) {
       const context = await getComicProject(String(productionProject ?? latest?.state.project_id))
@@ -218,25 +222,17 @@ const productionEligible = computed(() => {
     && typeof review?.reviewed_spec_hash === 'string'
     && !findings?.some(item => item.severity === 'error' || item.code === 'REVIEW_EXECUTION_FAILED')
 })
-function generationForShot(shotId: string): CoreRun | null {
-  return shotGeneration(Object.values(runs.value), project.value?.project.project_id ?? '', shotId)
+function externalPromptForShot(shot: ComicShotView): Record<string, unknown> | null {
+  const prompt = externalShotPrompt(shotPrompts.value[shot.shot_id] ?? [], shot.version, Number(spec.value?.version))
+  return prompt?.context_version === 'image-bibles-1' ? prompt : null
 }
-function progressForShot(shotId: string) {
-  const run = generationForShot(shotId)
-  return run ? comicProductionProgress(run, run.id === productionRun.value?.id ? productionEvents.value : [], !!run.state.image_artifact_id) : null
-}
-function imageForShot(shotId: string): string | undefined {
-  const artifactId = generationForShot(shotId)?.state.image_artifact_id
-  return artifactId ? referenceUrls.value[String(artifactId)] : undefined
-}
-async function retryShot(shotId: string): Promise<void> {
-  selectedShot.value = shotId
-  await generateImage(true)
-}
-function editShotPrompt(shotId: string): void {
-  selectedShot.value = shotId
-  openSection('prompt')
-  void loadPrompts().then(editImagePrompt)
+const comparison = computed(() => {
+  const before = prompts.value.find(prompt => Number(prompt.version) === compareVersions.value[0])
+  const after = prompts.value.find(prompt => Number(prompt.version) === compareVersions.value[1])
+  return before && after ? promptVersionDiff(finalImagePrompt(before), finalImagePrompt(after)) : []
+})
+function uploadedArtifact(prompt: Record<string, unknown> | null): string {
+  return String((prompt?.external_image as Record<string, unknown> | undefined)?.artifact_id ?? '')
 }
 const editable = computed(() => spec.value?.schema_version === 2 ? !stale.value && editableDirectorNode(selectedStage.value) : !!node.value && editableDirectorNode(node.value.stage) && summary.value?.mode === 'professional' && !!summary.value?.available_actions.includes('edit_stage'))
 const visibleNodes = computed(() => mode.value === 'fast' ? fastDirectorNodeLabels : directorNodeLabels)
@@ -281,13 +277,16 @@ async function confirm(): Promise<void> {
   if (!confirmable.value || !project.value || !spec.value) return
   busy.value = true
   const epoch = conversationEpoch
+  let accepted = false
   try {
     const saved = await confirmDirectorVersion(project.value.project.project_id, Number(spec.value.version), project.value.project.current_version)
     if (epoch !== conversationEpoch) return
     restoredSpec.value = saved; await refresh()
+    accepted = true
   }
   catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) busy.value = false }
+  if (accepted && epoch === conversationEpoch) await enterStoryboard()
 }
 function invalidate(): void { revisionVersion.value = null }
 function beginEdit(): void {
@@ -400,20 +399,6 @@ async function execute(text: string, options: Record<string, unknown> = {}, sele
   busy.value = true; pendingText.value = text; previousRunIds.value = executions.value.map(item => item.run_id); error.value = ''; invalidate()
   restoredSpec.value = null
   try {
-    if (text.trim() && !manualDirectorApproval.value && !Object.keys(options).length) {
-      if (!pendingCreation || pendingCreation.text !== text || pendingCreation.mode !== selectedMode) pendingCreation = { text, mode: selectedMode, requestId: `creation-${crypto.randomUUID()}` }
-      const run = await createRun('comic', { creative_request: text, conversation_id: owner,
-        creation_mode: selectedMode, approval_required: false, request_id: pendingCreation.requestId })
-      if (disposed || epoch !== conversationEpoch || owner !== activeConversationId.value) return
-      pendingCreation = null; productionRun.value = run; productionAdvanced = false; runs.value[run.id] = run
-      const creation = run.state.quick_creation as Record<string, unknown>
-      const context = await getComicProject(String(creation.project_id))
-      if (disposed || epoch !== conversationEpoch) return
-      project.value = context
-      pendingText.value = ''; section.value = 'director'; selectedStage.value = 'director_assemble'
-      await refresh(); await loadConversations()
-      return
-    }
     // Navigation detaches the view, not the already submitted request's ownership.
     const target = sourceProject
       ? await getComicProject(sourceProject.project.project_id) ?? sourceProject
@@ -506,12 +491,23 @@ async function loadPage(): Promise<void> {
   if (!id) return
   error.value = ''
   try {
-    if (section.value === 'storyboard' || section.value === 'prompt') {
+    if (section.value === 'storyboard') {
       const next = await getComicStoryboards(id)
       if (requestId !== pageRequest) return
       boards.value = next
       if (!next.some(item => item.storyboard_id === selectedBoard.value)) selectedBoard.value = next[0]?.storyboard_id ?? ''
       await loadShots()
+    }
+    if (section.value === 'prompt' || section.value === 'assets') {
+      const next = await getProjectPrompts(id)
+      if (requestId !== pageRequest) return
+      projectPrompts.value = next
+      await Promise.all(next.filter(prompt => uploadedArtifact(prompt)).map(prompt => openReference(uploadedArtifact(prompt))))
+      if (requestId !== pageRequest) return
+      if (section.value === 'prompt') {
+        if (!next.some(prompt => prompt.shot_id === selectedShot.value)) selectedShot.value = String(next[0]?.shot_id ?? '')
+        await loadPrompts()
+      }
     }
     if (section.value === 'history') {
       const next = await getDirectorVersions(id)
@@ -525,10 +521,14 @@ async function loadShots(): Promise<void> {
   if (!id) { shots.value = []; return }
   try {
     const next = await getComicShots(id)
-    if (id !== selectedBoard.value || disposed) return
+    if (epoch !== conversationEpoch || id !== selectedBoard.value || disposed) return
     shots.value = next
+    const histories = await Promise.all(next.map(async shot => [shot.shot_id, await getComicPromptVersions(shot.shot_id)] as const))
+    if (epoch !== conversationEpoch || id !== selectedBoard.value || disposed) return
+    shotPrompts.value = Object.fromEntries(histories)
+    await Promise.all(histories.flatMap(([, history]) => history.filter(prompt => uploadedArtifact(prompt)).map(prompt => openReference(uploadedArtifact(prompt)))))
+    if (epoch !== conversationEpoch || id !== selectedBoard.value || disposed) return
     if (!next.some(item => item.shot_id === selectedShot.value)) selectedShot.value = next[0]?.shot_id ?? ''
-    if (section.value === 'prompt') await loadPrompts()
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
 }
 async function loadPrompts(): Promise<void> {
@@ -538,7 +538,10 @@ async function loadPrompts(): Promise<void> {
   if (!id) return
   try {
     const next = await getComicPromptVersions(id)
-    if (id === selectedShot.value && !disposed) prompts.value = next
+    if (epoch === conversationEpoch && id === selectedShot.value && !disposed) {
+      prompts.value = next; shotPrompts.value[id] = next
+      compareVersions.value = [Number(next[1]?.version ?? next[0]?.version), Number(next[0]?.version)]
+    }
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
 }
 async function compilePrompt(): Promise<void> {
@@ -546,50 +549,60 @@ async function compilePrompt(): Promise<void> {
   const board = boards.value.find(item => item.storyboard_id === selectedBoard.value)
   if (!project.value || !shot || (manualDirectorApproval.value && !confirmed.value) || board?.director_spec_version !== spec.value?.version || compiling.value || busy.value || hasRunning.value) return
   const epoch = conversationEpoch
-  compiling.value = true; error.value = ''
+  if (!activeConversationId.value) return
+  compiling.value = true; preparingShot.value = shot.shot_id; error.value = ''
+  shotErrors.value[shot.shot_id] = ''
   try {
-    await compileComicPrompt(shot.shot_id, project.value.project.current_version, shot.version)
+    const prepared = await compileComicPrompt(shot.shot_id, project.value.project.current_version, shot.version, activeConversationId.value, true)
     if (epoch !== conversationEpoch) return
+    shotPrompts.value[shot.shot_id] = [prepared, ...(shotPrompts.value[shot.shot_id] ?? [])]
+    promptPreview.value = prepared
     await refresh()
     if (epoch === conversationEpoch) await loadPrompts()
-  } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
-  finally { if (epoch === conversationEpoch) compiling.value = false }
+  } catch (failure) { if (epoch === conversationEpoch) { error.value = failureText(failure); shotErrors.value[shot.shot_id] = error.value } }
+  finally { if (epoch === conversationEpoch) { compiling.value = false; preparingShot.value = '' } }
 }
-async function generateImage(newGeneration = false): Promise<void> {
-  if (!productionEligible.value || (manualDirectorApproval.value && !confirmed.value) || !project.value || !spec.value || submittingImage.value || compiling.value || busy.value || hasRunning.value) return
+async function viewImagePrompt(shot: ComicShotView): Promise<void> {
+  selectedShot.value = shot.shot_id
+  promptPreview.value = externalPromptForShot(shot)
+  await loadPrompts()
+}
+async function copyImagePrompt(prompt: Record<string, unknown>): Promise<void> {
+  copiedPrompt.value = ''
+  try { await navigator.clipboard.writeText(finalImagePrompt(prompt)); copiedPrompt.value = String(prompt.artifact_id) }
+  catch (failure) { error.value = `无法复制 Prompt：${failureText(failure)}` }
+}
+function exportImagePrompt(prompt: Record<string, unknown>): void {
+  const url = URL.createObjectURL(new Blob([finalImagePrompt(prompt)], { type: 'text/plain;charset=utf-8' }))
+  const anchor = document.createElement('a')
+  anchor.href = url; anchor.download = `${String(prompt.shot_id)}-prompt-v${Number(prompt.version)}.txt`
+  anchor.click(); URL.revokeObjectURL(url)
+}
+async function confirmImagePrompt(prompt: Record<string, unknown>): Promise<void> {
+  if (!project.value || busy.value || hasRunning.value) return
   const epoch = conversationEpoch
-  const shot = ['storyboard', 'prompt'].includes(section.value) ? shots.value.find(item => item.shot_id === selectedShot.value) : undefined
-  if (manualDirectorApproval.value && !shot) return
-  if (newGeneration && !generationForShot(shot?.shot_id ?? '')?.image_execution?.can_regenerate) return
-  submittingImage.value = true; error.value = ''
+  busy.value = true
   try {
-    const key = `${activeConversationId.value}:${project.value.project.project_id}:${spec.value.version}:${shot?.shot_id ?? 'keyframe'}:${shot?.version ?? ''}:${manualDirectorApproval.value}`
-    // A network retry keeps the same request identity; it must never submit a second image.
-    if (newGeneration) productionRequests.delete(key)
-    if (!productionRequests.has(key)) {
-      const currentPrompt = shot ? (await getComicPromptVersions(shot.shot_id))[0]?.version : undefined
-      if (epoch !== conversationEpoch) return
-      productionRequests.set(key, `production-${crypto.randomUUID()}`)
-      productionPromptVersions.set(key, currentPrompt)
-    }
-    const promptVersion = productionPromptVersions.get(key)
-    const run = await createRun('comic', {
-      production_project_id: project.value.project.project_id,
-      expected_project_version: project.value.project.current_version,
-      director_version: spec.value.version, conversation_id: activeConversationId.value,
-      approval_required: manualDirectorApproval.value,
-      request_id: productionRequests.get(key),
-      ...(shot ? { shot_id: shot.shot_id, shot_version: shot.version } : {}),
-      ...(promptVersion ? { prompt_version: promptVersion } : {}),
-    })
-    if (epoch !== conversationEpoch || disposed) return
-    productionRun.value = run; runs.value[run.id] = run; productionEvents.value = []
-    productionAdvanced = true
-    openSection('storyboard')
-    await refresh()
-    if (epoch === conversationEpoch) await loadPage()
+    const saved = await confirmComicPrompt(String(prompt.shot_id), project.value.project.current_version, Number(prompt.version), activeConversationId.value)
+    if (epoch !== conversationEpoch) return
+    promptPreview.value = saved; await loadPrompts()
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
-  finally { if (epoch === conversationEpoch) submittingImage.value = false }
+  finally { if (epoch === conversationEpoch) busy.value = false }
+}
+async function importExternalImage(shot: ComicShotView, file: File): Promise<void> {
+  const prompt = externalPromptForShot(shot)
+  if (!prompt || !project.value || uploadingShot.value || hasRunning.value) return
+  const epoch = conversationEpoch
+  uploadingShot.value = shot.shot_id; shotErrors.value[shot.shot_id] = ''
+  try {
+    if (file.size > 5 * 1024 * 1024) throw new Error('请选择不超过 5 MB 的 PNG、JPEG 或 WebP 图片')
+    await uploadComicExternalImage(shot.shot_id, file, {
+      expected_project_version: project.value.project.current_version, expected_prompt_version: Number(prompt.version),
+      expected_shot_version: shot.version, conversation_id: activeConversationId.value,
+    })
+    if (epoch === conversationEpoch) { await refresh(); await loadPage() }
+  } catch (failure) { if (epoch === conversationEpoch) shotErrors.value[shot.shot_id] = failureText(failure) }
+  finally { if (epoch === conversationEpoch) uploadingShot.value = '' }
 }
 async function recoverImage(runId = productionRun.value?.id): Promise<void> {
   if (!runId || busy.value || hasRunning.value) return
@@ -599,11 +612,11 @@ async function recoverImage(runId = productionRun.value?.id): Promise<void> {
   catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) busy.value = false }
 }
-function editImagePrompt(): void {
-  if (!selectedShot.value || !prompts.value[0]) { openSection('prompt'); void loadPage(); return }
-  const prompt = prompts.value[0]!
-  promptEdit.value = { shotId: selectedShot.value, version: Number(prompt.version), director_summary: String(prompt.director_summary), positive_prompt: String(prompt.positive_prompt), negative_prompt: String(prompt.negative_prompt ?? '') }
-  openSection('prompt')
+function editImagePrompt(prompt?: Record<string, unknown>): void {
+  if (prompt) { selectedShot.value = String(prompt.shot_id); promptPreview.value = prompt }
+  const current = prompt ?? prompts.value[0]
+  if (!selectedShot.value || !current) return
+  promptEdit.value = { shotId: selectedShot.value, version: Number(current.version), director_summary: String(current.director_summary), positive_prompt: String(current.positive_prompt), negative_prompt: String(current.negative_prompt ?? '') }
 }
 async function saveImagePrompt(): Promise<void> {
   if (!promptEdit.value || !project.value || busy.value || hasRunning.value) return
@@ -611,9 +624,10 @@ async function saveImagePrompt(): Promise<void> {
   busy.value = true; error.value = ''
   const { shotId, version, ...draft } = promptEdit.value
   try {
-    await saveComicPrompt(shotId, { expected_project_version: project.value.project.current_version, expected_version: version, draft })
+    const saved = await saveComicPrompt(shotId, { expected_project_version: project.value.project.current_version, expected_version: version, draft })
     if (epoch !== conversationEpoch) return
-    promptEdit.value = null; await refresh(); await loadPrompts()
+    promptEdit.value = null; promptPreview.value = saved; await refresh(); await loadPrompts()
+    if (section.value === 'prompt') projectPrompts.value = await getProjectPrompts(project.value.project.project_id)
   } catch (failure) { if (epoch === conversationEpoch) error.value = failureText(failure) }
   finally { if (epoch === conversationEpoch) busy.value = false }
 }
@@ -630,7 +644,8 @@ async function enterStoryboard(): Promise<void> {
     if (epoch !== conversationEpoch || !project.value || !spec.value) return
     if (!boards.value.some(board => board.director_spec_version === spec.value?.version)) {
       const planned = await createComicStoryboard(project.value.project.project_id, project.value.project.current_version,
-        project.value.creative_brief.original_request)
+        project.value.creative_brief.original_request,
+        Object.keys((spec.value.asset_versions ?? {}) as Record<string, number>).map(key => key.replace(/^asset:/, '')))
       if (epoch !== conversationEpoch) return
       selectedBoard.value = planned.storyboard.storyboard_id
       selectedShot.value = planned.shots[0]?.shot_id ?? ''
@@ -659,8 +674,11 @@ function newProject(): void {
   void startConversation()
 }
 function resetConversationView(): void {
-  productionRun.value = null; productionEvents.value = []; pendingCreation = null; productionAdvanced = false
-  submittingImage.value = false; mode.value = 'fast'; manualDirectorApproval.value = false; promptEdit.value = null
+  productionRun.value = null; productionEvents.value = []; productionAdvanced = false
+  mode.value = 'professional'; manualDirectorApproval.value = true; promptEdit.value = null
+  preparingShot.value = ''; shotPrompts.value = {}
+  projectPrompts.value = []; promptPreview.value = null; copiedPrompt.value = ''
+  compareVersions.value = []; uploadingShot.value = ''; shotErrors.value = {}
   refreshing = false
   busy.value = false; cancelling.value = false; compiling.value = false; legacyOnly.value = false
   queuedInputs.value = []; previousRunIds.value = []; events.value = []; restoreChoice.value = null
@@ -704,7 +722,6 @@ watch([section, selectedStage, chatExpanded], () => {
   }
 })
 watch(mode, value => {
-  if (!loading.value) manualDirectorApproval.value = value === 'professional'
   if (value === 'fast' && selectedStage.value === 'director_critic') selectedStage.value = 'director_assemble'
   if (project.value) sessionStorage.setItem(`kantoku-comic-view-mode:${project.value.project.project_id}`, value)
 }, { flush: 'sync' })
@@ -759,7 +776,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
           <option value="fast">普通模式</option><option value="professional">专业导演模式</option>
         </select>
       </label>
-      <label v-if="mode === 'professional'" class="toolbar-mode"><input v-model="manualDirectorApproval" type="checkbox" :disabled="busy || hasRunning"> 人工审核模式</label>
+      <span class="toolbar-mode">导演方案需人工确认 · 外部图片</span>
       <span class="toolbar-status" role="status">{{ executionLabel }}</span>
       <button class="ui-button quiet sm toolbar-new" :disabled="busy || hasRunning" @click="newProject">新作品</button>
     </template>
@@ -785,7 +802,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <p v-if="selectedStage === 'cinematography' && (spec?.cinematography as { status?: string })?.status && (spec?.cinematography as { status?: string })?.status !== 'complete'" class="review-notice">摄影方案待补充或调整。已保留真实草稿，不会自动进入制作。</p>
                   <p v-if="spec?.critic_status === 'unavailable'" class="review-notice" role="status">导演审核暂不可用，未产生合法审核结果。导演方案已保留；你可以查看并确认最终方案后进入分镜。</p>
                   <DirectorNodeView :mode="mode" :stage="selectedStage" :node="node" :spec="spec" :fields="fields" :editing="editing" :editable="editable" :rerunnable="mode === 'professional' && !restoredSpec && !!node && !!summary?.available_actions.includes('rerun_stage') && !dirty" :busy="busy || hasRunning" :critic="summary?.critic_result" @edit="beginEdit" @field="updateField" @cancel="discardNode" @save="spec?.schema_version === 2 ? saveFinal() : rerun(true)" @rerun="rerun()" @revise="editFinal('visual_direction')" @open="visitStage" />
-                  <div v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'" class="final-approval"><p>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '当前版本已确认，可以进入分镜制作' : dirty ? '请先保存编辑，再检查并确认' : '这是可修改的草稿，确认后才进入下一阶段。' }}</p><div class="draft-actions"><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">用对话修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed || !productionEligible || submittingImage || busy || hasRunning" @click="enterStoryboard">进入下一步</button></div></div>
+                  <div v-if="manualDirectorApproval && spec && selectedStage === 'director_assemble'" class="final-approval"><p>{{ stale ? '来源已变化，需要更新方案' : confirmed ? '当前版本已确认，可以进入分镜制作' : dirty ? '请先保存编辑，再检查并确认' : '这是可修改的草稿，确认后才进入下一阶段。' }}</p><div class="draft-actions"><button class="ui-button sm" :disabled="busy || hasRunning || stale || dirty" @click="reviewFinal">检查当前方案</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || stale || dirty" @click="reviseByInstruction">用对话修改</button><button class="ui-button quiet sm" :disabled="busy || hasRunning || dirty" @click="regenerate">重新生成</button><button class="ui-button primary sm" :disabled="!confirmable || confirmed" @click="confirm">确认最终方案</button><button class="ui-button sm" :disabled="!confirmed || !productionEligible || busy || hasRunning" @click="enterStoryboard">进入下一步</button></div></div>
                   <button v-if="spec && selectedStage !== 'director_assemble' && !editing && selectedStage !== 'director_critic'" class="ui-button quiet sm" @click="visitStage('director_assemble')">{{ mode === 'fast' ? '查看整体方案并确认' : '返回最终导演稿' }}</button>
                   <p v-if="spec?.schema_version !== 2 && spec" class="pane-note">这是旧版方案，仅保留历史查看。请在对话中重新生成 v2 导演方案。</p>
                 </template>
@@ -795,29 +812,43 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                     <p v-if="!assets.some(item => item.details.kind === kind)" class="pane-note">暂无{{ label }}。</p>
                   </section>
                   <h3>参考素材</h3><div v-for="id in [...new Set(assets.flatMap(asset => asset.reference_artifact_ids))]" :key="id"><button class="ui-button quiet sm" @click="openReference(id)">查看参考图 · {{ id }}</button><ChatImageAttachment v-if="referenceUrls[id]" :media="{ url: referenceUrls[id]!, filename: `reference-${id}.png` }" @open="previewReference" /><p v-if="referenceErrors[id]" role="alert">{{ referenceErrors[id] }}</p></div>
-                  <p class="pane-note">参考素材沿用资产里的真实 Artifact 引用；本轮没有新增上传或资产生产能力。</p>
-                  <h3>生成结果</h3><slot name="works" />
+                  <p class="pane-note">参考素材沿用资产版本；外部图片由上传文件登记为真实 Artifact。</p>
+                  <h3>外部图片</h3><article v-for="prompt in projectPrompts.filter(item => uploadedArtifact(item))" :key="uploadedArtifact(prompt)"><p>镜头 {{ prompt.shot_sequence_number }} · {{ prompt.shot_subject }} · Prompt v{{ prompt.version }}</p><ChatImageAttachment v-if="referenceUrls[uploadedArtifact(prompt)]" :media="{ url: referenceUrls[uploadedArtifact(prompt)]!, filename: 'external-image.png' }" @open="previewReference" /></article>
+                  <!-- Future capability: legacy internal production remains off the external path. -->
+                  <template v-if="imageMode !== 'external'"><h3>生成结果</h3><slot name="works" /></template>
                 </template>
                 <template v-else-if="section === 'storyboard' || section === 'prompt'">
-                  <div v-if="section === 'prompt' && promptEdit" class="draft-actions">
+                  <div v-if="promptEdit" class="draft-actions prompt-editor">
                     <label>正向 Prompt<textarea v-model="promptEdit.positive_prompt" rows="6" /></label>
                     <label>负向约束<textarea v-model="promptEdit.negative_prompt" rows="3" /></label>
                     <button class="ui-button primary sm" :disabled="busy || hasRunning || !promptEdit.positive_prompt.trim()" @click="saveImagePrompt">保存为新版本</button>
                     <button class="ui-button quiet sm" @click="promptEdit = null">取消修改</button>
                   </div>
-                  <button v-if="section === 'prompt' && prompts.length && !promptEdit" class="ui-button sm" :disabled="busy || hasRunning" @click="editImagePrompt">编辑当前 Prompt</button>
-                  <p v-if="manualDirectorApproval && !confirmed" class="review-notice">请先确认当前导演方案再制作。</p>
-                  <button v-if="section === 'storyboard' && productionEligible && selectedShot" class="ui-button primary sm" :disabled="submittingImage || compiling || busy || hasRunning || (manualDirectorApproval && !confirmed)" @click="generateImage()">{{ submittingImage ? '正在提交当前镜头' : '生成当前镜头图片' }}</button>
-                  <label v-if="boards.length">分镜 <select v-model="selectedBoard" @change="loadShots"><option v-for="board in boards" :key="board.storyboard_id" :value="board.storyboard_id">{{ board.title }} · v{{ board.version }}</option></select></label>
-                  <p v-else class="pane-note">{{ productionProgress?.active ? '正在规划分镜，将继续编译提示词并生成图片。' : '尚无作品分镜。确认导演方案后，可开始分镜制作。' }}</p>
+                  <section v-if="promptPreview && !promptEdit" class="prompt-preview" aria-label="完整 Image Prompt">
+                    <header><strong>完整 Image Prompt · v{{ promptPreview.version }}</strong><button class="ui-button quiet sm" @click="promptPreview = null">关闭</button></header>
+                    <pre>{{ finalImagePrompt(promptPreview) }}</pre>
+                    <div class="draft-actions"><button class="ui-button sm" @click="copyImagePrompt(promptPreview)">复制生图 Prompt</button><button class="ui-button sm" @click="exportImagePrompt(promptPreview)">导出 Prompt</button><button class="ui-button sm" :disabled="busy || hasRunning" @click="editImagePrompt(promptPreview)">编辑为新版本</button><button v-if="promptPreview.context_version === 'image-bibles-1'" class="ui-button sm" :disabled="busy || hasRunning || promptPreview.user_confirmed === true" @click="confirmImagePrompt(promptPreview)">{{ promptPreview.user_confirmed ? '当前 Prompt 已确认' : '确认当前 Prompt' }}</button></div>
+                    <p v-if="copiedPrompt === String(promptPreview.artifact_id)" role="status">完整生图 Prompt 已复制，含禁止内容。</p>
+                    <details><summary>查看来源</summary><p>导演 v{{ promptPreview.director_spec_version }} · 镜头 v{{ promptPreview.shot_version }} · {{ promptPreview.compiler_version }}</p><pre>{{ JSON.stringify(promptPreview.context_sources, null, 2) }}</pre></details>
+                  </section>
+                  <p v-if="section === 'storyboard' && manualDirectorApproval && !confirmed" class="review-notice">请先确认当前导演方案再制作。</p>
+                  <button v-if="section === 'storyboard' && productionEligible && selectedShot" class="ui-button primary sm" :disabled="compiling || busy || hasRunning || !confirmed" @click="compilePrompt">{{ compiling ? '正在生成完整 Prompt' : '生成当前镜头完整 Image Prompt' }}</button>
+                  <label v-if="section === 'storyboard' && boards.length">分镜 <select v-model="selectedBoard" @change="loadShots"><option v-for="board in boards" :key="board.storyboard_id" :value="board.storyboard_id">{{ board.title }} · v{{ board.version }}</option></select></label>
+                  <p v-if="section === 'storyboard' && !boards.length" class="pane-note">尚无作品分镜。确认导演方案后，可开始分镜制作。</p>
                   <template v-if="section === 'storyboard'">
-                    <article v-for="shot in shots" :key="shot.shot_id" class="shot-row" :data-shot-id="shot.shot_id" :data-status="generationForShot(shot.shot_id)?.status ?? shot.status">
+                    <article v-for="shot in shots" :key="shot.shot_id" class="shot-row" :data-shot-id="shot.shot_id" :data-status="shot.status">
                       <button class="ui-button quiet sm" :aria-pressed="selectedShot === shot.shot_id" @click="selectedShot = shot.shot_id">镜头 {{ shot.sequence_number }} · {{ shot.subject }}{{ selectedShot === shot.shot_id ? ' · 当前镜头' : '' }}</button>
-                      <p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[generationForShot(shot.shot_id)?.status ?? shot.status] ?? shot.status }}</small>
-                      <ComicShotGeneration :run="generationForShot(shot.shot_id)" :progress="progressForShot(shot.shot_id)" :image-url="imageForShot(shot.shot_id)" :disabled="busy || hasRunning || submittingImage" @retry="retryShot(shot.shot_id)" @resume="recoverImage(generationForShot(shot.shot_id)?.id)" @edit-prompt="editShotPrompt(shot.shot_id)" @change-model="changeImageModel" @preview="previewReference" />
+                      <p>{{ shot.purpose }} · {{ shot.action }}</p><small>v{{ shot.version }} · {{ directorStateLabels[shot.status] ?? shot.status }}</small>
+                      <ComicShotGeneration :run="null" :image-mode="imageMode" :preparing="preparingShot === shot.shot_id" :external-prompt="externalPromptForShot(shot)" :external-image-url="referenceUrls[uploadedArtifact(externalPromptForShot(shot))]" :uploading="uploadingShot === shot.shot_id" :prompt-error="shotErrors[shot.shot_id]" :disabled="busy || hasRunning || compiling" @view-prompt="viewImagePrompt(shot)" @copy-prompt="copyImagePrompt(externalPromptForShot(shot)!)" @edit-prompt="editImagePrompt(externalPromptForShot(shot)!)" @upload="importExternalImage(shot, $event)" @preview="previewReference" />
                     </article>
                   </template>
-                  <template v-else><label v-if="shots.length">镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="shot in shots" :key="shot.shot_id" :value="shot.shot_id">{{ shot.sequence_number }} · {{ shot.subject }}</option></select></label><details v-for="prompt in prompts" :key="String(prompt.prompt_id) + prompt.version"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }}</summary><p>{{ prompt.positive_prompt }}</p><h3>负向约束</h3><p>{{ prompt.negative_prompt }}</p><small>导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }} · {{ prompt.compiler_version }}</small></details><p v-if="selectedShot && !prompts.length" class="pane-note">当前镜头没有已保存的 Prompt 版本。</p><button v-if="selectedShot" class="ui-button primary sm" :disabled="(manualDirectorApproval && !confirmed) || compiling || busy || hasRunning || boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" @click="compilePrompt">{{ compiling ? '正在编译 Prompt' : '编译当前镜头 Prompt' }}</button><p v-if="selectedShot && boards.find(board => board.storyboard_id === selectedBoard)?.director_spec_version !== spec?.version" class="pane-note">分镜引用的导演版本与当前方案不同。请先更新分镜，旧 Prompt 可继续查看。</p><button class="ui-button sm" @click="section = 'assets'">查看生成结果</button></template>
+                  <template v-else>
+                    <p>项目 Prompt 资产：{{ projectPrompts.length }} 个镜头。此处管理版本；生成入口在分镜页。</p>
+                    <label v-if="projectPrompts.length">绑定镜头 <select v-model="selectedShot" @change="loadPrompts"><option v-for="prompt in projectPrompts" :key="String(prompt.prompt_id)" :value="String(prompt.shot_id)">镜头 {{ prompt.shot_sequence_number }} · {{ prompt.shot_subject }} · 当前 v{{ prompt.version }}</option></select></label>
+                    <details v-for="prompt in prompts" :key="String(prompt.artifact_id)"><summary>Prompt v{{ prompt.version }} · {{ prompt.model_target }} · {{ prompt.source }}</summary><pre class="prompt-text">{{ finalImagePrompt(prompt) }}</pre><small>绑定 Shot：{{ prompt.shot_id }} · 导演 v{{ prompt.director_spec_version }} · 镜头 v{{ prompt.shot_version }}</small><div class="draft-actions"><button class="ui-button sm" @click="promptPreview = prompt">查看完整 Prompt 与来源</button><button class="ui-button sm" @click="copyImagePrompt(prompt)">复制 Prompt</button><button class="ui-button sm" @click="exportImagePrompt(prompt)">导出 Prompt</button><button v-if="prompt === prompts[0]" class="ui-button sm" :disabled="busy || hasRunning" @click="editImagePrompt(prompt)">编辑为新版本</button></div><p v-if="copiedPrompt === String(prompt.artifact_id)" role="status">已复制完整 Prompt。</p></details>
+                    <section v-if="prompts.length > 1"><h3>对比版本</h3><label>旧版本<select v-model.number="compareVersions[0]"><option v-for="prompt in prompts" :key="Number(prompt.version)" :value="Number(prompt.version)">v{{ prompt.version }}</option></select></label><label>新版本<select v-model.number="compareVersions[1]"><option v-for="prompt in prompts" :key="Number(prompt.version)" :value="Number(prompt.version)">v{{ prompt.version }}</option></select></label><table><thead><tr><th>旧内容</th><th>新内容</th></tr></thead><tbody><tr v-for="(line, index) in comparison" :key="index"><td>{{ line.before }}</td><td>{{ line.after }}</td></tr></tbody></table><p v-if="!comparison.length">所选版本内容相同。</p></section>
+                    <p v-if="!projectPrompts.length" class="pane-note">当前项目暂无 Prompt 资产，请在分镜页生成完整 Prompt。</p>
+                  </template>
                 </template>
                 <template v-else-if="section === 'history'">
                   <h3>方案版本</h3><article v-for="version in versions" :key="Number(version.version)" class="history-row"><header><div><strong>导演方案 v{{ version.version }}</strong><small>{{ version.created_at }}</small></div><button class="ui-button sm" :disabled="busy || hasRunning" @click="restoreChoice = Number(version.version)">恢复为新版本</button></header><details><summary>查看版本摘要</summary><AssistantMessageBlock :content="directorSummary(version, mode) || '旧版方案（只读）'" :show-mark="false" /></details><div v-if="restoreChoice === Number(version.version)" class="review-notice" role="status"><p>将 v{{ version.version }} 恢复为新版本。历史保留，当前确认状态会清除。</p><button class="ui-button primary sm" :disabled="busy || hasRunning" @click="restore(Number(version.version))">确认恢复</button><button class="ui-button quiet sm" :disabled="busy" @click="restoreChoice = null">取消</button></div></article><p v-if="!versions.length" class="pane-note">暂无已保存方案版本。</p>
@@ -825,7 +856,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 </template>
               </div>
             <section v-show="chatExpanded" ref="timeline" class="workspace-messages" aria-label="连续创作对话" @scroll="scrollState">
-              <p v-if="!chatTurns.length && !pendingText" class="conversation-welcome">描述你想创作的画面，AI 会自动理解并制作图片。需要逐节点修改与确认时，可主动选择专业导演模式。</p>
+              <p v-if="!chatTurns.length && !pendingText" class="conversation-welcome">描述你的故事与画面，生成导演方案后可修改并确认，再进入分镜准备镜头 Prompt。</p>
               <article v-for="turn in chatTurns" :key="turn.id" class="creative-turn">
                 <UserMessageBubble v-if="turn.role === 'user'" :content="turn.content" />
                 <template v-else><AssistantMessageBlock :content="turn.content" :show-mark="false" /><ChatImageAttachment v-if="turn.artifactId && referenceUrls[turn.artifactId]" :media="{ url: referenceUrls[turn.artifactId]!, filename: `comic-${turn.artifactId}.png` }" @open="previewReference" /><p v-if="turn.artifactId && referenceErrors[turn.artifactId]" role="alert">{{ referenceErrors[turn.artifactId] }}</p></template>
@@ -872,7 +903,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
           <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ executionLabel }} · 可继续输入</span><button v-if="hasRunning" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
           <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
           <MessageComposer :key="activeConversationId" ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
-          <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : manualDirectorApproval ? '方案先保存为草稿，审核并确认后再进入制作。' : '自动完成导演、分镜、提示词与图片制作。' }}</small>
+          <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '确认导演方案，生成完整 Prompt，复制到外部模型后上传图片。' }}</small>
         </div>
 </template>
   </WorkspaceShell>
@@ -930,6 +961,11 @@ select { color:var(--text-primary); background:transparent; border:1px solid var
 .final-approval > p { color:var(--text-secondary); font-size:13px; margin:0 0 12px; }
 .final-approval .draft-actions { margin:0; }
 .asset-group, .shot-row, .history-row { padding-bottom:16px; margin-bottom:20px; border-bottom:1px solid var(--border-muted); }
+.prompt-preview { border:1px solid var(--border-muted); border-radius:8px; padding:16px; margin:16px 0; }
+.prompt-preview header { display:flex; justify-content:space-between; align-items:center; gap:12px; }
+.prompt-preview pre, .prompt-text { white-space:pre-wrap; overflow-wrap:anywhere; font:inherit; max-height:420px; overflow:auto; }
+.prompt-editor { display:grid; }
+.prompt-editor label { display:grid; gap:6px; }
 .asset-group h3 { margin-top:0; }
 .history-row header { display:flex; gap:12px; align-items:center; justify-content:space-between; }
 .history-row small { display:block; color:var(--text-muted); font-size:11px; margin-top:4px; }
