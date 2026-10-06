@@ -2,6 +2,14 @@
 
 根目录 `AGENTS.md` 是 AI 改动入口。本文件只记录实施细节；产品里程碑与配置约束仍见 `docs/01`–`04`。
 
+## 后续 AI 修改的必读入口（治理 Module 0，2026-10-05）
+
+每次修改前依次阅读：根目录 [AGENTS.md](../../AGENTS.md) → [AI_CODE_RULES.md](AI_CODE_RULES.md) → [product-principles.md](../product/product-principles.md) → 本手册；核对[架构例外清单](../architecture/exceptions.md)及当前实现。旧章节是阶段记录，不得据此复制旧架构例外或改动用户冻结的流程。
+
+当前 Comic 新工作区以已验收 Module 2 为准：DirectorSpec → 原 PromptCompiler → Core Prompt Artifact → 外部复制/上传。规范阅读入口已接入；跨层检查和 Trace 统一仍待独立模块，不表示 CI 已覆盖全部规则。
+
+危险维护脚本的引用、动态加载、启动和测试审计见 [Module 0 风险报告](../architecture/governance-module-0.md)。原 `_tail_errors.py` 已原样隔离为 `scripts/archive/_tail_errors.py.disabled`，禁止执行、导入、恢复后缀或自动扫描归档；没有运行对账或修改任何业务账单。
+
 ## 架构边界与改动顺序
 
 改动前先读产品原则、本文件和实际代码，再确认问题属于哪一层。目标调用方向是 **Conversation → Unified Agent Orchestrator → Action / Plan → Direct Capability 或 Domain Workflow → Core Infrastructure → Provider**。这是收口方向，不代表当前已有独立的统一编排模块；禁止为了满足图示另起第二套运行时。

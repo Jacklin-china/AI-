@@ -1,0 +1,17 @@
+"""一次性对账：submit 阶段被供应商明确拒绝（无任务 ID）的 unknown 记录标记失败并释放。"""
+
+from kantoku.core import budget
+
+connection = budget._connect()
+rows = connection.execute(
+    "SELECT reservation_id FROM ledger WHERE status = 'unknown' AND provider_job_id IS NULL"
+).fetchall()
+connection.close()
+
+for (reservation_id,) in rows:
+    budget.mark_outcome(reservation_id, "failed")
+    budget.release(reservation_id)
+    print(f"released: {reservation_id}")
+
+if not rows:
+    print("no zombie records")
