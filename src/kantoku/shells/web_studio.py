@@ -16,7 +16,6 @@ import webbrowser
 from collections.abc import Callable
 from contextlib import contextmanager, suppress
 from contextvars import ContextVar
-from dataclasses import replace
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -53,6 +52,7 @@ from kantoku.config.observability import (
     request_trace,
     run_trace,
 )
+from kantoku.config.runtime_paths import get_runtime_paths, resolve_runtime_path
 from kantoku.config.settings import (
     CONFIG_PATH,
     EXAMPLE_PATH,
@@ -74,6 +74,7 @@ from kantoku.core.conversations import (
     MessageRole,
     MessageType,
 )
+from kantoku.core.database import database_manager
 from kantoku.core.llm import chat, stream_chat
 from kantoku.core.runtime.batch import BatchService
 from kantoku.core.runtime.graph import GraphRuntime, RuntimeContext
@@ -96,12 +97,13 @@ from kantoku.domains.comic.coordinator import (
     DirectorCoordinatorRequest,
     director_execution_summary,
 )
-from kantoku.domains.comic.critic import DirectorCriticEngine
+from kantoku.domains.comic.critic import DirectorCriticEngine, public_critic_feedback
 from kantoku.domains.comic.director import (
     execute_director_stage,
     plan_director_spec,
     revise_director_spec,
 )
+from kantoku.domains.comic.director_provenance import record_changes
 from kantoku.domains.comic.models import (
     ComicAsset,
     ComicAssetCreateRequest,
@@ -123,9 +125,11 @@ from kantoku.domains.comic.models import (
     ComicStoryboardCreateRequest,
     ComicStoryboardDraft,
     ComicStoryboardEditRequest,
+    ComicVersionDeleteRequest,
     ComicVersionRestoreRequest,
     CreativeBriefFork,
     CreativeBriefUpdate,
+    DirectorEvidence,
     DirectorSpecDraft,
     DirectorSpecRequest,
     DirectorSpecRestore,
@@ -158,6 +162,7 @@ from kantoku.perception.review import (
 from kantoku.schemas.qc import HumanQcLabel, QcResult
 from kantoku.shells.conversation_router import (
     ConversationAction,
+    conversation_memory,
     route_conversation,
     selected_fast_domain,
 )
@@ -407,6 +412,11 @@ def _image_result_summary(requirement: str, prompt: str, trace_id: str) -> str:
 _comic_single_attempt: ContextVar[bool] = ContextVar("comic_single_attempt", default=False)
 
 
+def request_mode_fallback(run: RunRecord) -> str:
+    """投影失败时从Run 真实状态取创作模式，不猜测也不伪造。"""
+    return str(run.state.get("execution_mode") or "professional")
+
+
 @contextmanager
 def _comic_model_policy(state: ComicState):
     """Scope the priced primary-only policy to this worker, never other conversations."""
@@ -426,7 +436,7 @@ class StudioApplication:
         self.lock = threading.Lock()
         self.job: dict[str, Any] = {"state": "idle"}
         configured = get_settings().storage.sqlite_path
-        database_path = configured if configured.is_absolute() else ROOT / configured
+        database_path = resolve_runtime_path(configured)
         self.runtime_store = RuntimeStore(database_path)
         self.comic_projects = ComicProjectStore(self.runtime_store.path)
         self.comic_assets = ComicAssetStore(self.comic_projects, self.runtime_store)
@@ -1262,6 +1272,30 @@ class StudioApplication:
         content = str(data.get("content", "")).strip()
         if not content:
             raise ToolError("消息内容不能为空")
+        generation_request_id = str(
+            data.get("generation_request_id") or f"generation-{uuid4().hex}"
+        )
+        if not _SAFE_TRACE.fullmatch(generation_request_id):
+            raise ToolError("生成请求 ID 格式无效")
+        prior_user = self.runtime_store.get_conversation_message_by_event(
+            conversation_id, f"generation-user:{generation_request_id}")
+        if prior_user:
+            if prior_user.content != content:
+                raise ToolError("生成请求 ID 已用于不同内容")
+            response = self.runtime_store.get_conversation_message_by_event(
+                conversation_id, f"conversation-response:{prior_user.id}")
+            if response:
+                yield "intent", {"intent": "chat", "tool": "chat", "needs_execution": False,
+                                 "user_message_id": prior_user.id, "trace_id": trace_id}
+                yield "message", response.model_dump(mode="json")
+                yield "done", {"run_id": response.run_id}
+                return
+        saved_generation = self.runtime_store.get_conversation_generation(generation_request_id)
+        if saved_generation is not None:
+            saved_user = self.runtime_store.get_conversation_message_by_event(
+                conversation_id, f"generation-user:{generation_request_id}")
+            if saved_user is None or saved_user.content != content:
+                raise ToolError("生成请求 ID 不属于当前会话或已用于不同内容")
         if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
                 and content.strip().rstrip("。！! ") in {"继续任务", "继续生图", "继续刚才的任务"}):
             yield from self._resume_home_image(conversation_id, content)
@@ -1275,7 +1309,7 @@ class StudioApplication:
         elif conversation.fast_domain_task_id:
             conversation = conversation.model_copy(update={"domain": None})
         conversation_history = self.runtime_store.list_conversation_messages(conversation_id)
-        history_before = conversation_history[-16:]
+        history_before = conversation_history
         image_context = any(
             message.event_id and message.event_id.startswith(
                 ("generation-user:", "generation-artifact:")
@@ -1284,6 +1318,7 @@ class StudioApplication:
         )
         creative_decision: CreativeDecision | None = None
         prior_image: CreativeContext | None = None
+        prepared = None
         if selected_domain in {"comic", "commerce"}:
             # A deliberate quick-domain selection is already an execution decision.
             # Do not let a second image/chat planner reinterpret it or load old image context.
@@ -1291,16 +1326,51 @@ class StudioApplication:
                               confidence=1.0, suggested_domain=selected_domain)
         elif conversation.interaction_mode == InteractionMode.AUTONOMOUS:
             prior_image = self._recent_image_context(conversation_id)
-            creative_decision = plan_creative_turn(
-                content, prior_image, trace_id=trace_id,
-            )
-            if (prior_image is None and creative_decision.action.startswith("image.")
-                    and content.strip().rstrip("。！! ") in _GENERIC_IMAGE_REQUESTS):
-                inherited_request = _image_requirement(content, conversation_history)
-                creative_decision = replace(
-                    creative_decision,
-                    subject=_image_subject(inherited_request) if inherited_request else "",
-                )
+            if saved_generation is not None:
+                saved_context = json.loads(saved_generation["context_json"])
+                reference_id = saved_generation["reference_artifact_id"]
+                creative_decision = CreativeDecision(
+                    action="image.edit" if reference_id else "image.generate", request=content,
+                    **{key: str(saved_context.get(key) or "") for key in
+                       ("subject", "style", "composition", "background")},
+                    use_reference=bool(reference_id), reference_artifact_id=reference_id)
+            else:
+                try:
+                    memory_user = self.runtime_store.add_conversation_message(
+                        conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+                        content=content, event_id=f"generation-user:{generation_request_id}")
+                    if memory_user.content != content:
+                        raise ToolError("生成请求 ID 已用于不同内容")
+                    prepared = self._prepare_conversation_context(
+                        conversation_id, content, through_message_id=memory_user.id)
+                    conversation_memory(self.runtime_store, get_settings().runtime).remember(
+                        conversation_id, prepared, memory_user.id)
+                    if prepared.understanding.action in {"chat", "clarify"}:
+                        creative_decision = CreativeDecision(action="chat", request=content)
+                    else:
+                        creative_decision = plan_creative_turn(
+                            content, prior_image, trace_id=trace_id,
+                            context_messages=prepared.messages,
+                        )
+                        if prepared.understanding.action.startswith(("image.", "video.")):
+                            creative_decision = CreativeDecision(
+                                **{**creative_decision.__dict__,
+                                   "action": prepared.understanding.action,
+                                   "subject": creative_decision.subject or
+                                       prepared.understanding.goal})
+                except Exception:
+                    self.runtime_store.add_conversation_message(
+                        conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+                        content=content, event_id=f"generation-user:{generation_request_id}")
+                    raise
+            if creative_decision.reference_artifact_id:
+                reference = self.runtime_store.get_artifact(creative_decision.reference_artifact_id)
+                if (reference.conversation_id != conversation_id
+                        or reference.type != ArtifactType.IMAGE or reference.status != "ready"):
+                    raise ToolError("参考图片不属于当前会话或尚未完成")
+                prior_image = CreativeContext(artifact_id=reference.id, **{
+                    key: str(reference.metadata.get("context", {}).get(key) or "")
+                    for key in ("subject", "style", "composition", "background")})
             plan = IntentPlan(
                 intent=creative_decision.action,
                 needs_execution=creative_decision.action != "chat",
@@ -1308,20 +1378,12 @@ class StudioApplication:
                     "studio" if creative_decision.action.startswith("image.") else None
                 ),
             )
-            if creative_decision.action == "chat":
-                existing_plan = self.intent_planner.plan(
-                    content, domain_hint=hint, image_context=image_context,
-                )
-                if existing_plan.needs_execution and existing_plan.intent in {
-                    "image.generate", "image.edit", "video.generate",
-                    "comic_production", "commerce_production",
-                }:
-                    plan = existing_plan
-                    if existing_plan.intent.startswith("image."):
-                        creative_decision = replace(
-                            creative_decision, action=existing_plan.intent,
-                            subject=_image_requirement(content, conversation_history),
-                        )
+            if prepared and prepared.understanding.action in {
+                "comic_production", "commerce_production"
+            }:
+                domain = prepared.understanding.action.removesuffix("_production")
+                plan = IntentPlan(intent=prepared.understanding.action, needs_execution=True,
+                                  confidence=0.9, suggested_domain=domain)
         else:
             plan = self.intent_planner.plan(
                 content, domain_hint=hint, image_context=image_context,
@@ -1331,9 +1393,6 @@ class StudioApplication:
         route = route_conversation(conversation, plan, confirmed=confirmed,
                                    selected_domain=selected_domain, user_request=content)
         action = route.action
-        generation_request_id = str(
-            data.get("generation_request_id") or f"generation-{uuid4().hex}"
-        )
         if (
             action in {ConversationAction.IMAGE_GENERATE, ConversationAction.IMAGE_EDIT,
                        ConversationAction.WORKFLOW_START}
@@ -1346,7 +1405,7 @@ class StudioApplication:
         user_message = self.runtime_store.add_conversation_message(
             conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
             content=content,
-            event_id=(f"generation-user:{generation_request_id}" if image_action else
+            event_id=(f"generation-user:{generation_request_id}" if image_action or prepared else
                       f"workflow-user:{generation_request_id}"
                       if action is ConversationAction.WORKFLOW_START else None),
         )
@@ -1571,31 +1630,6 @@ class StudioApplication:
                 yield "message", summary.model_dump(mode="json")
             yield "done", {"generation_request_id": generation_request_id}
             return
-        if (conversation.interaction_mode == InteractionMode.AUTONOMOUS
-                and action is ConversationAction.CHAT
-                and any(cue in content for cue in (
-                    "图片在哪里", "图片在哪", "图在哪里", "图在哪", "刚才的图呢",
-                ))):
-            latest = self._recent_image_context(conversation_id)
-            if latest is not None and latest.artifact_id:
-                reminder = self.runtime_store.add_conversation_message(
-                    conversation_id, role=MessageRole.ASSISTANT,
-                    type=MessageType.ARTIFACT, artifact_id=latest.artifact_id,
-                    content="这是当前聊天最近完成的图片。",
-                )
-            else:
-                generating = any(
-                    job.status in {MediaJobStatus.PENDING, MediaJobStatus.GENERATING}
-                    for job in self.runtime_store.list_media_jobs(conversation_id)
-                )
-                reminder = self.runtime_store.add_conversation_message(
-                    conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
-                    content=("图片仍在生成中，完成后会直接出现在当前聊天。" if generating
-                             else "这个聊天里还没有成功生成的图片。你可以直接描述想画的内容。"),
-                )
-            yield "message", reminder.model_dump(mode="json")
-            yield "done", {"run_id": None}
-            return
         if action is ConversationAction.VIDEO_GENERATE:
             message = self.runtime_store.add_conversation_message(
                 conversation_id, role=MessageRole.ASSISTANT,
@@ -1631,7 +1665,7 @@ class StudioApplication:
                     conversation_id, selected_task_id,
                 )
             return
-        history = self.runtime_store.list_conversation_messages(conversation_id)[-16:]
+        history = self.runtime_store.list_conversation_messages(conversation_id)
         # 首页简单生图走共享能力；选定领域的复杂请求复用同一个 Graph。
         target_domain = route.domain
         execute = action is ConversationAction.WORKFLOW_START
@@ -1707,6 +1741,24 @@ class StudioApplication:
             *[{"role": item.role.value, "content": item.content} for item in model_history
               if item.role in {MessageRole.USER, MessageRole.ASSISTANT}],
         ]
+        if not execute:
+            if prepared is None:
+                prepared = self._prepare_conversation_context(
+                    conversation_id, content, through_message_id=user_message.id)
+                conversation_memory(self.runtime_store, get_settings().runtime).remember(
+                    conversation_id, prepared, user_message.id)
+            messages = [messages[0], *prepared.messages]
+            yield "context", prepared.public()
+            if prepared.understanding.action == "clarify":
+                question = prepared.understanding.question
+                assistant = self.runtime_store.add_conversation_message(
+                    conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.TEXT, content=question,
+                    event_id=f"conversation-response:{user_message.id}")
+                yield "delta", {"content": question}
+                yield "message", assistant.model_dump(mode="json")
+                yield "done", {"run_id": None}
+                return
         searched = False
         visited_sites = 0
         if (not guided and action is ConversationAction.CHAT
@@ -1810,6 +1862,8 @@ class StudioApplication:
         assistant = self.runtime_store.add_conversation_message(
             conversation_id, role=MessageRole.ASSISTANT, type=message_type, content=complete,
             run_id=run["id"] if run else None,
+            artifact_id=prepared.understanding.response_artifact_id if prepared else None,
+            event_id=f"conversation-response:{user_message.id}",
         )
         if selected_task_id and not execute:
             self.runtime_store.finish_fast_domain_task(
@@ -2237,6 +2291,80 @@ class StudioApplication:
         """边界检查复用同一文本出口，不绑定模型或新增 Skill。"""
         return self._comic_director_model(messages)
 
+    def _conversation_context_model(self, messages: list[dict[str, str]]) -> str:
+        return self._comic_director_model(messages)
+
+    def _prepare_conversation_context(self, conversation_id: str, content: str, *,
+                                      interpret: bool = True, through_message_id=None):
+        """Inject scoped existing readers into the shared, provider-free memory mechanism."""
+        cutoff = None
+        if through_message_id:
+            anchor = self.runtime_store.list_conversation_messages(
+                conversation_id, message_ids=[through_message_id])
+            if not anchor:
+                raise ToolError("上下文锚点不属于当前会话")
+            cutoff = anchor[0].created_at
+        def read(kind, identifier):
+            if kind == "artifact":
+                artifact = self.runtime_store.get_artifact(identifier)
+                if artifact.conversation_id != conversation_id or artifact.metadata.get("internal"):
+                    raise ToolError("不能引用其他会话或内部记忆产物")
+                if cutoff and artifact.created_at > cutoff:
+                    raise ToolError("不能引用本轮请求之后产生的内容")
+                return {"id": artifact.id, "kind": "artifact", "version": artifact.version,
+                        "type": artifact.type.value,
+                        "status": artifact.status if artifact.lifecycle_state.value == "active"
+                            else "unavailable",
+                        "content": artifact.metadata,
+                        "asset_fact": artifact.source in {"user", "upload", "external_upload"}}
+            run = self.runtime_store.get_run(identifier)
+            if run.state.get("conversation_id") != conversation_id:
+                raise ToolError("不能引用其他会话的任务")
+            if cutoff and run.started_at > cutoff:
+                raise ToolError("不能引用本轮请求之后创建的任务")
+            result = {"id": run.id, "kind": "run", "task": run.state.get("task"),
+                      "status": run.status.value, "project_id": run.state.get("project_id"),
+                      "version": run.state.get("director_spec_version")}
+            if run.workflow in {"comic.director", "comic.director-spec"} and result["version"]:
+                spec = self.comic_projects.get_director(result["project_id"],
+                    version=result["version"], spec_id=run.state.get("director_spec_id"))
+                self.comic_assets.director_assets(spec)
+                result["director"] = spec.model_dump(mode="json", include={
+                    "creative_decision", "director_plan", "cinematography", "visual_direction",
+                    "storytelling_goal", "character_focus", "camera_language", "composition",
+                    "lighting", "color_language", "emotion"})
+                result["field_origins"] = {key: {
+                    "origin": value.source_type, "trust": value.trust_status}
+                    for key, value in spec.field_provenance.items()}
+                briefs = self.comic_projects.brief_versions(result["project_id"])
+                result["brief"] = next(item for item in briefs
+                                       if item.version == spec.creative_brief_version).model_dump(
+                                           include={"original_request", "hard_constraints",
+                                                    "soft_preferences", "creative_freedom"})
+            return result
+        runs = self.runtime_store.list_runs(limit=40, conversation_id=conversation_id)
+        candidates = [{"id": run.id, "kind": "run", "task": run.state.get("task"),
+                       "project_id": run.state.get("project_id"),
+                       "version": run.state.get("director_spec_version"),
+                       "status": run.status.value,
+                       "read_required": True} for run in runs
+                      if not cutoff or run.started_at <= cutoff]
+        candidates.extend({"id": artifact.id, "kind": "artifact", "version": artifact.version,
+                           "type": artifact.type.value, "read_required": True}
+                          for artifact in self.runtime_store.list_artifacts(
+                              conversation_id=conversation_id)[:40]
+                          if not cutoff or artifact.created_at <= cutoff)
+        try:
+            return conversation_memory(self.runtime_store, get_settings().runtime).prepare(
+                conversation_id, content, model_call=self._conversation_context_model,
+                candidates=candidates, reader=read, interpret=interpret,
+                through_message_id=through_message_id,
+            )
+        except Exception as error:
+            error._kantoku_public_failure = public_error(
+                error, component="conversation.context", conversation_id=conversation_id)
+            raise
+
     def _resolve_comic_creative_context(
         self, snapshot: ComicProjectSnapshot, request: DirectorSpecRequest, trace_id: str,
     ) -> tuple[ComicProjectSnapshot, dict[str, Any]]:
@@ -2244,7 +2372,8 @@ class StudioApplication:
         reason = "same request"
         fork_created = False
         if (request.creative_operation == "new" and request.task is not None
-                and request.task.strip() != brief.original_request
+                and (request.task.strip() != brief.original_request
+                     or snapshot.project.director_version is not None)
                 and not (request.resume_run_id or request.previous_run_id)):
             if request.storyboard_id or request.shot_id:
                 raise ToolError("新创意不能继承旧分镜或镜头")
@@ -2330,20 +2459,67 @@ class StudioApplication:
     def create_comic_director(self, project_id: str, data: dict[str, Any]) -> dict[str, Any]:
         request = DirectorSpecRequest.model_validate(data)
         if request.creation_mode is not None:
+            if request.independent_plan and request.request_id:
+                if not _SAFE_TRACE.fullmatch(request.request_id):
+                    raise ToolError("导演请求 ID 格式无效")
+                owner = request.conversation_id
+                envelope = {"project_id": project_id, **request.model_dump(mode="json")}
+                key = f"director-request:{request.request_id}"
+                index = hash((owner, key)) % len(self._workflow_dispatch_locks)
+                with self._workflow_dispatch_locks[index]:
+                    existing = self.runtime_store.get_conversation_message_by_event(owner, key)
+                    if existing:
+                        if existing.content != request.task:
+                            raise ToolError("导演请求 ID 已用于不同内容")
+                        if existing.run_id:
+                            run = self.runtime_store.get_run(existing.run_id)
+                            if run.state.get("creative_context", {}).get("request") != envelope:
+                                raise ToolError("重试必须沿用原请求、项目及输入版本")
+                            return self._comic_director_result(run)
+                        saved = next((item for item in self.runtime_store.list_artifacts(
+                            conversation_id=owner, type=ArtifactType.JSON, include_internal=True)
+                            if item.node_id == "conversation.request"
+                            and item.metadata.get("message_id") == existing.id), None)
+                        if saved and saved.metadata.get("request") == envelope:
+                            return saved.metadata["response"]
+                        raise ToolError("原请求尚未绑定执行结果，请查看原错误或稍后读取状态")
+                    claimed = self.runtime_store.add_conversation_message(
+                        owner, role=MessageRole.USER, type=MessageType.TEXT,
+                        content=request.task, event_id=key, require_new=True)
+                    result = self._create_comic_director_mode(project_id, request)
+                    if "conversation_response" in result:
+                        self.runtime_store.create_artifact(
+                            type=ArtifactType.JSON, conversation_id=owner,
+                            node_id="conversation.request", source="request_result",
+                            metadata={"internal": True, "message_id": claimed.id,
+                                      "request": envelope, "response": result})
+                    return result
             return self._create_comic_director_mode(project_id, request)
         snapshot = self.comic_projects.get(project_id)
         if snapshot.project.current_version != request.expected_project_version:
             raise ToolError("作品已由其他操作更新，请刷新后重试")
+        if ((request.draft is not None or request.revision_instruction is not None)
+                and request.conversation_id and not self._comic_conversation_owns_director(
+                    project_id, request.conversation_id)):
+            raise ToolError("当前对话不能修改其他对话的导演方案")
         configured_model = get_settings().llm.model_chat
         task_id = f"task-{uuid4().hex}"
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
         snapshot, creative_context = self._resolve_comic_creative_context(
             snapshot, request, trace_id,
         ) if request.draft is None and request.revision_instruction is None else (snapshot, {})
+        # 只有用户真的说过的话才算用户输入；草稿保存与仅审核都是系统动作。
+        user_task = request.revision_instruction or request.task
+        fallback_task = ("保存导演草稿修改" if request.draft
+                         else snapshot.creative_brief.original_request)
         state: dict[str, Any] = {
             "project_id": project_id, "task_id": task_id, "trace_id": trace_id,
             "conversation_id": request.conversation_id,
             "task_type": "director_spec", "task_status": "draft",
+            "generation_mode": "USER_EDIT" if request.draft or request.revision_instruction
+            else "NEW_CONTEXT" if creative_context.get("fork_created") else "FIRST_GENERATION",
+            "review_required": bool(request.draft or request.revision_instruction),
+            "revision_instruction": request.revision_instruction,
             "last_completed_step": None,
             "creative_brief_version": snapshot.creative_brief.version,
             "project_version": snapshot.project.current_version,
@@ -2353,8 +2529,10 @@ class StudioApplication:
             "input_brief_id": snapshot.creative_brief.brief_id,
             "input_brief_version": snapshot.creative_brief.version,
             "creative_context": creative_context,
-            "task": request.revision_instruction or request.task
-            or ("保存导演草稿修改" if request.draft else snapshot.creative_brief.original_request),
+            "task": user_task or fallback_task,
+            # 标注这次输入是否真的来自用户。草稿保存与仅审核都没有用户输入，
+            # 若不标注，前端会把系统兜底文案当成用户说的话显示在对话里。
+            "task_system": user_task is None,
         }
         run = self.runtime_store.create_run(
             "comic", "comic.director-spec", state, "director_spec",
@@ -2421,11 +2599,30 @@ class StudioApplication:
                         raise ToolError("导演草稿已更新，请刷新后修改")
                     if request.revision_instruction is not None:
                         bound = self.comic_assets.director_assets(current)
+                        context_lock = (
+                            self._comic_context_lock(project_id, request.conversation_id,
+                                                     require_confirmed=False)
+                            if request.conversation_id else None
+                        )
                         draft = revise_director_spec(
                             snapshot, DirectorSpecDraft.model_validate(current.model_dump(
                                 include=set(DirectorSpecDraft.model_fields))),
                             request.revision_instruction, assets=bound,
                             model_call=self._comic_director_model,
+                            creative_lock={
+                                "anchors": context_lock,
+                                "director_confirmed": self.comic_projects.human_director_confirmed(
+                                    current),
+                                "bibles": self.comic_projects.locked_bibles(
+                                    project_id, context_lock),
+                                "sources": context_lock["bible_sources"],
+                                "released_fields": sorted(
+                                    ComicContextBuilder.explicit_context_changes(
+                                        request.revision_instruction)),
+                                "confirmed_director_decision": current.model_dump(
+                                    mode="json", include={"spec_id", "version", "creative_decision",
+                                                          "director_plan", "cinematography"}),
+                            } if context_lock else None,
                         )
                     else:
                         draft = DirectorSpecDraft.model_validate(request.draft)
@@ -2445,17 +2642,39 @@ class StudioApplication:
                             raise ToolError("草稿编辑不能修改用户硬约束")
                     # 客户端或修改模型的 pass 不是真实审核；编辑保存后必须重新审核。
                     draft = draft.model_copy(update={"critic_result": None, "critic_status": None})
+                    if current:
+                        state["context_diff"] = ComicContextBuilder.context_diff(
+                            current, draft, request.revision_instruction)
                     source = "manual"
                 step("checking", "director_draft_ready")
+                previous_lock = self.comic_projects.creative_context_lock(
+                    project_id, request.conversation_id) if request.conversation_id else None
                 spec = self.comic_projects.save_director(
-                    project_id, draft, expected_project_version=snapshot.project.current_version,
+                    project_id, draft,
+                        expected_project_version=snapshot.project.current_version,
                     source=source,
                     preserve_provenance=request.revision_instruction is not None,
                 )
+                if request.conversation_id and spec.schema_version == 2:
+                    changed = {item["field_path"] for item in
+                               state.get("context_diff", {}).get("changes", [])}
+                    affected = {
+                        "character_context": {"director_plan.character_presence"},
+                        "world_context": {"director_plan.subject_environment_relation"},
+                        "style_context": {"director_plan.style_boundary",
+                                          "director_plan.color_strategy",
+                                          "cinematography.color_relationship"},
+                    }
+                    sources = {key: value for key, value in
+                               (previous_lock or {}).get("bible_sources", {}).items()
+                               if not changed & affected[key]}
+                    state["creative_context_lock"] = self.comic_projects.save_context_lock(
+                        spec, request.conversation_id, sources)
                 state.update(
                     task_status="completed", last_completed_step="director_spec_saved",
                     director_spec_id=spec.spec_id, director_spec_version=spec.version,
-                    project_version_after=self.comic_projects.get(project_id).project.current_version,
+                    project_version_after=self.comic_projects.get(
+                        project_id).project.current_version,
                 )
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.COMPLETED, state=state,
@@ -2479,10 +2698,13 @@ class StudioApplication:
                     asset_ids=request.asset_ids, model=configured_model,
                 )
                 error._kantoku_public_failure = failure
-                state.update(task_status="failed", error_id=failure["error_id"])
+                state.update(task_status="failed", error_id=failure["error_id"],
+                             error_message=failure.get("safe_message"),
+                             error_kind=failure.get("error_kind"))
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.FAILED, state=state,
-                    current_node="director_spec", error=failure["error_id"],
+                    current_node="director_spec",
+                    error=f"{failure.get('safe_message')} · {failure['error_id']}",
                 )
                 self.runtime_store.append_event(
                     run.id, RuntimeEventType.RUN_FAILED, node_id="director_spec",
@@ -2497,12 +2719,287 @@ class StudioApplication:
             skill_id, dict(inputs), dict(context), model_call=self._comic_director_model,
         )
 
+    def _comic_action_context_recovery(self, snapshot, request: DirectorSpecRequest):
+        """只恢复旧入口误把代词动作另立 Brief 的已绑定会话，不迁移用户历史。"""
+        brief = snapshot.creative_brief
+        if (brief.fork_reason == "context_continuity_recovery"
+                and snapshot.project.director_id is not None):
+            return None  # 恢复成功后回到普通上下文锁，不重复重做导演。
+        if snapshot.project.director_id:
+            current = self.comic_projects.get_director(snapshot.project.project_id)
+            if current.source == "manual" or any(
+                    item.source_type == "manual_edit"
+                    for item in current.field_provenance.values()):
+                return None  # 人工修改过的方案不能按旧入口故障自动替换。
+        if (ComicContextBuilder.explicit_context_changes(request.task)
+                or brief.parent_brief_id != brief.brief_id
+                or brief.fork_reason not in {
+                    "explicit new creative direction", "context_continuity_recovery"}
+                or brief.fork_reason == "explicit new creative direction"
+                and (not re.match(r"^\s*[她他它](?:们)?(?!人)", brief.original_request)
+                     or ComicContextBuilder.explicit_context_changes(brief.original_request))):
+            return None
+        conversation = self.runtime_store.get_conversation(request.conversation_id)
+        if (conversation.domain != "comic"
+                or conversation.interaction_mode is not InteractionMode.GUIDED):
+            return None
+        briefs = {item.version: item for item in
+                  self.comic_projects.brief_versions(snapshot.project.project_id)}
+        for spec in self.comic_projects.director_versions(snapshot.project.project_id):
+            if spec.schema_version != 2:
+                continue
+            original = briefs.get(spec.creative_brief_version)
+            if original is None:
+                continue
+            if (brief.fork_reason == "explicit new creative direction"
+                    and original.version != brief.parent_brief_version
+                    or brief.fork_reason == "context_continuity_recovery"
+                    and original.original_request != brief.original_request
+                    or self._comic_director_owner(spec.project_id, request.conversation_id,
+                                                  spec.version) is None):
+                continue
+            if any(getattr(brief, field) and getattr(brief, field) != getattr(original, field)
+                   for field in ("hard_constraints", "soft_preferences", "creative_freedom")):
+                continue  # 不覆盖用户后续新增的事实或约束。
+            self.comic_assets.director_assets(spec)  # 不能复用失效资产版本。
+            with self.comic_projects._connect() as connection:
+                row = connection.execute(
+                    "SELECT payload_json FROM comic_entity_versions WHERE project_id=? "
+                    "AND entity_type='creative_context_lock' AND entity_id=? "
+                    "AND json_extract(payload_json,'$.director_version')=? "
+                    "ORDER BY version DESC LIMIT 1",
+                    (spec.project_id, request.conversation_id, spec.version),
+                ).fetchone()
+            lock = json.loads(row[0]) if row else {
+                "director_version": spec.version, "brief_version": original.version,
+                "bible_sources": {}}
+            return spec, original, lock
+        return None
+
     def _create_comic_director_mode(
-        self, project_id: str, request: DirectorSpecRequest,
+        self, project_id: str, request: DirectorSpecRequest, *, inherited: tuple | None = None,
     ) -> dict[str, Any]:
         snapshot = self.comic_projects.get(project_id)
         if snapshot.project.current_version != request.expected_project_version:
             raise ToolError("作品已由其他操作更新，请刷新后重试")
+        lock = None
+        changes: set[str] = set()
+        scopes: set[str] = set()
+        recovery = None
+        baseline = None
+        prepared_context = None
+        creative_context = {}
+        dynamic_turn = bool(request.independent_plan and request.conversation_id and request.task
+                            and
+                            not (request.resume_run_id or request.previous_run_id or
+                                 request.review_current or request.draft or
+                                 request.revision_instruction or request.stage_edits))
+        if dynamic_turn:
+            conversation = self.runtime_store.get_conversation(request.conversation_id)
+            if (conversation.domain != "comic"
+                    or conversation.interaction_mode is not InteractionMode.GUIDED):
+                raise ToolError("导演上下文仅用于当前漫剧创作会话")
+            user_turn = self.runtime_store.add_conversation_message(
+                request.conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+                content=request.task, event_id=f"director-request:{request.request_id}"
+                if request.request_id else None)
+            input_request = {"project_id": project_id, **request.model_dump(mode="json")}
+            prepared_context = self._prepare_conversation_context(
+                request.conversation_id, request.task, through_message_id=user_turn.id)
+            resolution = prepared_context.understanding
+            memory = conversation_memory(self.runtime_store, get_settings().runtime)
+            memory.remember(request.conversation_id, prepared_context, user_turn.id)
+            if resolution.action in {"chat", "clarify"}:
+                reply = resolution.question if resolution.action == "clarify" else (
+                    chat([{"role": "system", "content":
+                           "依据本轮有来源的上下文简洁回答，不声称创建了方案。"},
+                          *prepared_context.messages]).content or "")
+                assistant = self.runtime_store.add_conversation_message(
+                    request.conversation_id, role=MessageRole.ASSISTANT,
+                    type=MessageType.TEXT, content=reply,
+                    artifact_id=resolution.response_artifact_id,
+                    event_id=f"conversation-response:{user_turn.id}")
+                return {"conversation_response": {"action": resolution.action,
+                        "content": reply, "message": assistant.model_dump(mode="json")},
+                        "context": prepared_context.public()}
+            retained = {}
+            retained_director_fields = {}
+            bible_sources = {}
+            retained_assets = []
+            dropped_inherited_fields: list[dict[str, str]] = []
+            if request.asset_ids:
+                retained_assets.extend(asset for asset in self._select_comic_director_assets(
+                    snapshot, request.task, request.asset_ids)
+                    if asset.asset_id in request.asset_ids)
+            references = resolution.sources if request.creative_operation != "new" else []
+            for reference in references:
+                if reference.kind != "run":
+                    continue
+                source = self.runtime_store.get_run(reference.id)
+                if source.state.get("conversation_id") != request.conversation_id:
+                    raise ToolError("不能继承其他会话的导演方案")
+                source_project = source.state.get("project_id")
+                version = source.state.get("director_spec_version")
+                if not source_project or not version:
+                    continue
+                spec = self.comic_projects.get_director(source_project, version=version,
+                                                        spec_id=source.state.get("director_spec_id"))
+                if reference.version != spec.version:
+                    raise ToolError("继承来源必须绑定导演修订")
+                source_lock = self._comic_context_lock(
+                    source_project, request.conversation_id, require_confirmed=False)
+                if source_lock and source_lock["director_version"] != spec.version:
+                    source_lock = None
+                bibles = self.comic_projects.locked_bibles(source_project, source_lock) \
+                    if source_lock else {}
+                allowed = {"character_context", "world_context", "style_context",
+                           "camera_style", "color", "lighting"}
+                leaves = {f"{group}.{field}": getattr(body, field)
+                          for group, body in (("director_plan", spec.director_plan),
+                                              ("cinematography", spec.cinematography))
+                          if body is not None
+                          for field in type(body).model_fields}
+                allowed.update(leaves)
+                # The model may name fields outside the inheritable domain. Drop only
+                # those fields and keep the rest of the inheritance — a stale or unknown
+                # field name must never fail the whole creative turn.
+                inheritable_fields = [field for field in reference.fields if field in allowed]
+                dropped_fields = [field for field in reference.fields if field not in allowed]
+                if dropped_fields:
+                    dropped_inherited_fields.extend(
+                        {"source_run_id": reference.id, "field": field}
+                        for field in dropped_fields)
+                    logger.bind(component="comic.director", project_id=source_project).warning(
+                        "inherited fields outside director context dropped "
+                        "source_run_id={} dropped={} kept={}",
+                        reference.id, dropped_fields, inheritable_fields)
+                reference = reference.model_copy(update={"fields": inheritable_fields})
+                plan = spec.director_plan
+                camera = spec.cinematography
+                defaults = {"character_context": plan.character_presence if plan
+                                else spec.character_focus,
+                            "world_context": plan.subject_environment_relation if plan else None,
+                            "style_context": plan.style_boundary if plan else spec.visual_direction,
+                            "camera_style": json.dumps(spec.cinematography.model_dump(
+                                exclude={"color_relationship", "lighting", "light_source",
+                                         "light_direction"}) if camera else {
+                                    "camera_language": spec.camera_language}, ensure_ascii=False),
+                            "color": camera.color_relationship if camera else spec.color_language,
+                            "lighting": camera.lighting if camera else spec.lighting}
+                for field in reference.fields:
+                    if field in retained:
+                        raise ToolError("多个来源指定了同一设定，请明确选择")
+                    if field in leaves:
+                        if field in retained_director_fields:
+                            raise ToolError("多个来源指定了同一字段，请明确选择")
+                        value = leaves[field]
+                        retained_director_fields[field] = value
+                        retained[field] = value if isinstance(value, str) else json.dumps(
+                            value, ensure_ascii=False)
+                        continue
+                    value = bibles.get(field) or defaults.get(field)
+                    if value:
+                        retained[field] = value
+                    if source_lock and field in source_lock["bible_sources"]:
+                        bible_sources[field] = {**source_lock["bible_sources"][field],
+                                                "project_id": source_project}
+                    if field in {"character_context", "world_context", "style_context"}:
+                        leaf = {"character_context": "character_presence",
+                                "world_context": "subject_environment_relation",
+                                "style_context": "style_boundary"}[field]
+                        if defaults[field]:
+                            retained_director_fields[f"director_plan.{leaf}"] = defaults[field]
+                    camera_fields = {
+                        "camera_style": {"shot_size", "camera_angle", "camera_distance",
+                                         "spatial_feel", "camera_language", "depth_strategy",
+                                         "lens_or_spatial_feel", "material_language"},
+                        "color": {"color_relationship"},
+                        "lighting": {"lighting", "light_source", "light_direction"}}
+                    if camera is None:
+                        camera_fields.update(camera_style={"camera_language"},
+                                             lighting={"lighting"})
+                    for leaf in camera_fields.get(field, set()):
+                        if f"cinematography.{leaf}" in retained_director_fields:
+                            raise ToolError("来源中的摄影字段重叠，请明确选择")
+                        retained_director_fields[f"cinematography.{leaf}"] = getattr(
+                            camera, leaf) if camera else {
+                                "camera_language": spec.camera_language,
+                                "color_relationship": spec.color_language,
+                                "lighting": spec.lighting}[leaf]
+                if reference.fields:
+                    if baseline is None:
+                        baseline = spec
+                    for asset in self.comic_assets.director_assets(spec):
+                        section = {"character": "character_context", "scene": "world_context",
+                                   "style": "style_context"}[asset.details.kind]
+                        if section in reference.fields:
+                            retained_assets.append(asset)
+            scopes = {"character_context", "world_context", "style_context",
+                      "camera_style", "color", "lighting", "action"} - {
+                          field for source in references for field in source.fields}
+            changes = scopes & {"character_context", "world_context", "style_context"}
+            original = request.task
+            user_constraints = [fact.value for task in resolution.tasks
+                if task.task_id == resolution.current_task_id for fact in task.facts
+                if fact.origin == "user_request" and fact.status == "active"]
+            # A standalone plan owns its pointers even when it references several older plans.
+            if request.independent_plan and snapshot.project.director_id:
+                target = self.comic_projects.create(ComicProjectInput.model_validate({
+                    "title": request.task[:100], "brief": {"original_request": original,
+                                                           "hard_constraints": user_constraints}}))
+                copied = []
+                seen = set()
+                for asset in retained_assets:
+                    if asset.asset_id in seen:
+                        continue
+                    seen.add(asset.asset_id)
+                    copied.append(self.comic_assets.create(
+                        target.project.project_id, self.comic_assets._draft(asset),
+                        expected_project_version=self.comic_projects.get(
+                            target.project.project_id).project.current_version))
+                snapshot = self.comic_projects.get(target.project.project_id)
+                project_id = snapshot.project.project_id
+                request = request.model_copy(update={"expected_project_version":
+                    snapshot.project.current_version,
+                    "asset_ids": [asset.asset_id for asset in copied]})
+            elif original != snapshot.creative_brief.original_request:
+                snapshot = self.comic_projects.fork_brief(project_id, CreativeBriefFork(
+                    original_request=original, hard_constraints=user_constraints,
+                    expected_version=snapshot.project.current_version,
+                    parent_brief_id=snapshot.creative_brief.brief_id,
+                    parent_brief_version=snapshot.creative_brief.version,
+                    reason="dynamic conversation turn"))
+            elif user_constraints != snapshot.creative_brief.hard_constraints:
+                snapshot = self.comic_projects.replace_brief(project_id, CreativeBriefUpdate(
+                    original_request=original,
+                    hard_constraints=list(dict.fromkeys(user_constraints)),
+                    expected_version=snapshot.project.current_version))
+            if baseline:
+                baseline = baseline.model_copy(update={"project_id": project_id,
+                    "creative_brief_version": snapshot.creative_brief.version,
+                    "storyboard_version": None, "shot_version": None,
+                    "asset_versions": {}})
+                inherited = (baseline, {}, None)
+            lock = {"director_version": baseline.version if baseline else 0,
+                    "brief_version": snapshot.creative_brief.version,
+                    "bible_sources": bible_sources,
+                    **{label: retained[field] for field, label in {
+                        "character_context": "character", "world_context": "world",
+                        "style_context": "visual_style"}.items() if field in retained}
+                    } if retained or bible_sources else None
+            creative_context = {**prepared_context.public(), "locked_bibles": retained,
+                                "request": input_request,
+                                "bible_sources": bible_sources, "edit_scopes": sorted(scopes),
+                                "context_changes": sorted(changes),
+                                "independent_plan": request.independent_plan,
+                                "dynamic_context": True, "goal": resolution.goal,
+                                "input_message_id": user_turn.id,
+                                "retained_director_fields": retained_director_fields,
+                                "dropped_inherited_fields": dropped_inherited_fields,
+                                "reason": resolution.relation,
+                                "fork_created": resolution.relation == "new",
+                                "input_brief_id": snapshot.creative_brief.brief_id,
+                                "input_brief_version": snapshot.creative_brief.version}
         source_id = request.resume_run_id or request.previous_run_id
         previous = self.runtime_store.get_run(source_id) if source_id else None
         if previous and (
@@ -2514,9 +3011,40 @@ class StudioApplication:
         if previous and request.task is not None and request.task != previous.state.get("task"):
             raise ToolError("恢复任务与当前任务或输入版本不一致，新输入不能恢复旧 Run")
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
-        snapshot, creative_context = self._resolve_comic_creative_context(
-            snapshot, request, trace_id,
-        )
+        if not dynamic_turn:
+            snapshot, creative_context = self._resolve_comic_creative_context(
+                snapshot, request, trace_id,
+            )
+            if (request.task and request.conversation_id
+                    and request.task != snapshot.creative_brief.original_request
+                    and not creative_context.get("fork_created") and not source_id
+                    and not request.review_current):
+                lock = self._comic_context_lock(
+                    project_id, request.conversation_id, require_confirmed=False)
+                if lock:
+                    baseline = self.comic_projects.get_director(project_id)
+                    scopes = ComicContextBuilder.resolve_edit_scopes(
+                        request.task, baseline, model_call=self._comic_intent_model)
+                    changes = scopes & {"character_context", "world_context", "style_context"}
+                    if (not scopes - {"action"}
+                            and self.comic_projects.human_director_confirmed(baseline)):
+                        return self._continue_comic_shot(project_id, request, lock)
+                    retained = {key: value for key, value in {
+                                "character_context": baseline.director_plan.character_presence,
+                                "world_context":
+                                    baseline.director_plan.subject_environment_relation,
+                                "style_context": baseline.director_plan.style_boundary,
+                                **self.comic_projects.locked_bibles(project_id, lock)}.items()
+                                if key not in changes}
+                    creative_context.update({"locked_bibles": retained,
+                        "retained_director_fields": {
+                            f"director_plan.{leaf}": getattr(baseline.director_plan, leaf)
+                            for scope, leaf in {"character_context": "character_presence",
+                                "world_context": "subject_environment_relation",
+                                "style_context": "style_boundary"}.items() if scope not in changes},
+                        "bible_sources": {key: value for key, value in lock["bible_sources"].items()
+                                          if key not in changes},
+                        "context_changes": sorted(changes), "edit_scopes": sorted(scopes)})
         task = request.task if request.task is not None else (
             previous.state.get("task") if previous else None
         )
@@ -2524,7 +3052,11 @@ class StudioApplication:
             [key.removeprefix("asset:") for key in previous.state["input_versions"]
              if key.startswith("asset:")] if previous else []
         )
-        assets = self._select_comic_director_assets(snapshot, task, asset_ids)
+        assets = self.comic_assets.director_assets(baseline) \
+            if lock and not changes and not dynamic_turn else \
+            self._select_comic_director_assets(snapshot, task, asset_ids)
+        if dynamic_turn:
+            assets = [asset for asset in assets if asset.asset_id in asset_ids]
         if request.creative_operation == "new" and not source_id and not request.review_current:
             # 新任务只绑定本轮显式选择，不能从旧作品隐式带入 StyleBible。
             assets = [asset for asset in assets if asset.asset_id in asset_ids]
@@ -2563,17 +3095,21 @@ class StudioApplication:
             rerun_from = next((stage for stage in DIRECTOR_STAGES
                                if f"comic.{stage}" not in previous.state["completed_stages"]),
                               "director_critic")
-        prior_spec = self.comic_projects.get_director(project_id) \
-            if snapshot.project.director_id else None
+        prior_spec = baseline if inherited or recovery else (
+            self.comic_projects.get_director(project_id) if snapshot.project.director_id else None)
         if request.review_current:
             if prior_spec is None or prior_spec.version != request.expected_director_version:
                 raise ToolError("只能审核当前导演草稿")
             assets = self.comic_assets.director_assets(prior_spec)
+            creative_context["context_diff"] = self._comic_director_spec_payload(
+                prior_spec).get("context_diff")
             bindings = self._comic_director_bindings(project_id, prior_spec)
             if bindings.get("storyboard_id"):
                 storyboard = self.comic_storyboards.get(bindings["storyboard_id"])
             if bindings.get("shot_id"):
                 shot = self.comic_storyboards.get_shot(bindings["shot_id"])
+        review_mode = self._comic_director_spec_payload(prior_spec).get("generation_mode") \
+            if request.review_current else None
         result = self.comic_director.execute(DirectorCoordinatorRequest(
             snapshot=snapshot, assets=assets, task=task,
             execution_mode=request.creation_mode, storyboard=storyboard, shot=shot,
@@ -2582,53 +3118,296 @@ class StudioApplication:
             worker_instance_id=self._instance_id,
             trace_id=trace_id, creative_context=creative_context,
             review_draft=prior_spec if request.review_current else None,
+            generation_mode=(previous.state.get("generation_mode")
+                             if request.resume_run_id else review_mode or "FIRST_GENERATION"
+                             if request.review_current else "FIRST_GENERATION"
+                             if request.independent_plan else "USER_EDIT"
+                             if lock or request.stage_edits else
+                             "NEW_CONTEXT" if creative_context.get("fork_created") else
+                             "FIRST_GENERATION"),
+            creative_context_lock=lock or {},
         ))
+        current_director_version = self.comic_projects.get(project_id).project.director_version
+        if (lock and (changes or recovery) and current_director_version is not None
+                and current_director_version != lock["director_version"]):
+            self.comic_projects.save_context_lock(
+                self.comic_projects.get_director(project_id), request.conversation_id,
+                {key: value for key, value in lock["bible_sources"].items() if key not in changes},
+            )
         return self._comic_director_result(self.runtime_store.get_run(result.run_id))
+
+    def _comic_context_lock(self, project_id: str, conversation_id: str, *,
+                            require_confirmed: bool = True) -> dict | None:
+        conversation = self.runtime_store.get_conversation(conversation_id)
+        if (conversation.domain != "comic"
+                or conversation.interaction_mode is not InteractionMode.GUIDED):
+            return None
+        snapshot = self.comic_projects.get(project_id)
+        if snapshot.project.director_id is None:
+            return None
+        director = self.comic_projects.get_director(project_id)
+        if (director.creative_brief_version != snapshot.creative_brief.version
+                or director.schema_version != 2
+                or require_confirmed
+                and not self.comic_projects.human_director_confirmed(director)):
+            return None
+        if self._comic_director_owner(project_id, conversation_id, director.version) is None:
+            return None
+        return self.comic_projects.creative_context_lock(project_id, conversation_id) or \
+            self.comic_projects.save_context_lock(director, conversation_id)
+
+    def _comic_director_owner(self, project_id: str, conversation_id: str,
+                              director_version: int) -> RunRecord | None:
+        # 窄范围只读投影，避免长对话中导演 Run 被普通任务列表分页挤掉。
+        with self.runtime_store._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM runs WHERE domain='comic' "
+                "AND workflow IN ('comic.director','comic.director-spec') "
+                "AND json_extract(state_json,'$.project_id')=? "
+                "AND json_extract(state_json,'$.conversation_id')=? "
+                "AND json_extract(state_json,'$.director_spec_version')=? "
+                "ORDER BY started_at DESC LIMIT 1",
+                (project_id, conversation_id, director_version),
+            ).fetchone()
+        return self.runtime_store.get_run(row[0]) if row else None
+
+    def _comic_conversation_owns_director(
+        self, project_id: str, conversation_id: str | None,
+    ) -> bool:
+        """该会话是否参与过这个作品的导演方案。
+
+        确认动作会创建新的导演修订，但确认 Run 不携带会话归属，
+        因此只按“当前版本”查找会把同一会话自己的方案误判成外部会话。
+        这里只看该会话是否真的为这个作品执行过导演阶段。
+        """
+        if not conversation_id:
+            return False
+        # 与 _comic_director_owner 一致：走窄范围只读查询，不依赖任务列表分页，
+        # 长对话里导演 Run 不会被挤到窗口之外。
+        with self.runtime_store._connect() as connection:
+            row = connection.execute(
+                "SELECT id FROM runs WHERE domain='comic' "
+                "AND workflow IN ('comic.director','comic.director-spec') "
+                "AND json_extract(state_json,'$.project_id')=? "
+                "AND json_extract(state_json,'$.conversation_id')=? LIMIT 1",
+                (project_id, conversation_id),
+            ).fetchone()
+        return row is not None
+
+    def _comic_context_baseline(self, project_id: str, request: DirectorSpecRequest):
+        director = self.comic_projects.get_director(project_id)
+        self.comic_projects.require_confirmed_director(director, human_review=True)
+        assets = self.comic_assets.director_assets(director)
+        boards = [board for board in self.comic_storyboards.list(project_id)
+                  if board.director_spec_version == director.version]
+        if not boards:
+            baseline = self.create_comic_storyboard(project_id, {
+                "expected_project_version": self.comic_projects.get(
+                    project_id).project.current_version,
+                "generate": True, "asset_ids": [asset.asset_id for asset in assets],
+            })
+            boards = [self.comic_storyboards.get(baseline["storyboard"]["storyboard_id"])]
+        base_shots = [shot for board in boards for shot in
+                      self.comic_storyboards.list_shots(board.storyboard_id)
+                      if shot.status is not ShotStatus.DELETED]
+        if not base_shots:
+            raise ToolError("当前分镜没有可继承的镜头，请先完成首个镜头设定")
+        return base_shots[0]
+
+    def _continue_comic_shot(self, project_id: str, request: DirectorSpecRequest,
+                             lock: dict) -> dict[str, Any]:
+        """追加镜头并复用原 Compiler；不重做导演、不进入图片工作流。"""
+        base = self._comic_context_baseline(project_id, request)
+        director = self.comic_projects.get_director(project_id)
+        assets = self.comic_assets.director_assets(director)
+        if len(lock["bible_sources"]) != 3:
+            # 首次动作补充前先固定原导演设定，不能用这次动作生成新身份。
+            self.compile_comic_prompt(base.shot_id, {
+                "expected_project_version": self.comic_projects.get(
+                    project_id).project.current_version,
+                "expected_shot_version": base.version, "complete_prompt": True,
+                "image_mode": "external", "conversation_id": request.conversation_id,
+            })
+            lock = self.comic_projects.creative_context_lock(project_id, request.conversation_id)
+        snapshot = self.comic_projects.get(project_id)
+        bibles = self.comic_projects.locked_bibles(project_id, lock)
+        owner = self._comic_director_owner(project_id, request.conversation_id, director.version)
+        if owner is None:
+            raise ToolError("当前镜头的导演会话关联已变化，请刷新后重试")
+        # 纯动作续接属于系统继承设定，不是用户改写提示词：审核只作内部校验，
+        # 结论不外显为“需要修改”。只有用户改写方案时才对外发起正式审核。
+        review_required = True
+        edit_state = {"generation_mode": "USER_EDIT",
+                      "review_required": review_required,
+                      "creative_context_lock": lock, "context_diff": {},
+                      "director_review": {}, "critic_result": {},
+                      "director_spec_version": director.version,
+                      "execution_mode": request.creation_mode,
+                      "source_run_id": owner.id,
+                      "input_versions": owner.state["input_versions"],
+                      "project_version_after": snapshot.project.current_version,
+                      "stage_outputs": owner.state.get("stage_outputs", {}),
+                      "director_candidate": director.model_dump(
+                          mode="json", include=set(DirectorSpecDraft.model_fields))}
+
+        def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            self.runtime_store.add_conversation_message(
+                request.conversation_id, role=MessageRole.USER, type=MessageType.TEXT,
+                content=request.task, run_id=current_run_id(),
+            )
+            progress("generating", "context_locked")
+            plan = plan_storyboard(
+                snapshot, director, task=request.task, assets=assets,
+                model_call=self._comic_storyboard_model,
+                locked_context={"mode": "shot_continuation", "bibles": bibles,
+                                "sources": lock["bible_sources"], "released_fields": [],
+                                "confirmed_director_decision": director.model_dump(
+                                    mode="json", include={"spec_id", "version", "creative_decision",
+                                                          "director_plan", "cinematography"}),
+                                "base_shot": base.model_dump(mode="json")},
+            )
+            candidate = DirectorSpecDraft.model_validate(director.model_dump(
+                include=set(DirectorSpecDraft.model_fields)))
+            shot_plan = plan.shots[0]
+            candidate = candidate.model_copy(update={
+                "director_plan": candidate.director_plan.model_copy(update={
+                    "character_pose": shot_plan.action,
+                }), "critic_result": None,
+            })
+            candidate = record_changes(director, candidate, source="manual_edit",
+                                       evidence=DirectorEvidence(source_type="manual_edit",
+                                                                 reference=current_run_id()))
+            edit_state["director_candidate"].update(candidate.model_dump(mode="json"))
+            diff = ComicContextBuilder.context_diff(director, candidate, request.task)
+            edit_state["context_diff"].update(diff)
+            # 状态类指令会牵动同语义字段；显式告知审核器这些字段本轮应一起重审，
+            # 否则旧的情绪/表情残留会被判成与新姿态矛盾。
+            cluster = ComicContextBuilder.action_semantic_cluster(request.task)
+            if cluster:
+                diff = {**diff, "action_semantic_cluster": sorted(cluster)}
+                edit_state["context_diff"].update(diff)
+            progress("checking", "context_diff_created")
+            review = self.comic_director.critic_engine.review(
+                candidate, snapshot.creative_brief, assets=assets,
+                current_shot_instruction=request.task, context_diff=diff,
+            )
+            feedback = public_critic_feedback(review)
+            edit_state["director_review"].update(review.model_dump(mode="json"))
+            edit_state["critic_result"].update(review.model_dump(mode="json"))
+            edit_state["stage_outputs"]["comic.director_critic"] = {
+                "critic_result": review.model_dump(mode="json")}
+            diff.update(potential_conflicts=[item for item in feedback
+                                            if item["level"] == "blocking"],
+                        recommended_sync_changes=[item["suggestion"] for item in feedback])
+            edit_state["context_diff"].update(diff)
+            progress("checking", "director_review_completed")
+            if any(item["level"] == "blocking" for item in feedback):
+                return {"review_blocked": True, "context_diff": diff,
+                        "critic_result": review.model_dump(mode="json"),
+                        "run_id": current_run_id()}
+            board = self.comic_storyboards.create(
+                project_id, ComicStoryboardDraft(title=plan.title, description=plan.description),
+                expected_project_version=snapshot.project.current_version,
+                director_spec_version=director.version, shots=plan.shots, source="model",
+            )
+            return {"storyboard": board.model_dump(mode="json"),
+                    "shot": self.comic_storyboards.list_shots(board.storyboard_id)[0].model_dump(
+                        mode="json"), "run_id": current_run_id(),
+                    "context_diff": diff, "critic_result": review.model_dump(mode="json")}
+
+        continued = self._comic_tracked_action(
+            project_id, "shot.continue", execute,
+            expected_project_version=snapshot.project.current_version,
+            conversation_id=request.conversation_id,
+            execution_context=edit_state,
+        )
+        if continued.get("review_blocked"):
+            return self._comic_director_result(self.runtime_store.get_run(continued["run_id"]))
+        shot = continued["shot"]
+        prompt = self.compile_comic_prompt(shot["shot_id"], {
+            "expected_project_version": self.comic_projects.get(project_id).project.current_version,
+            "expected_shot_version": shot["version"], "complete_prompt": True,
+            "image_mode": "external", "conversation_id": request.conversation_id,
+        })
+        # 固定话术会把真实产出藏起来：用户看不到这次到底加了什么镜头。
+        # 这里如实报告新增镜头的内容与 Prompt 状态。
+        sequence = shot.get("sequence_number")
+        subject = str(shot.get("subject") or "").strip()
+        action = str(shot.get("action") or request.task or "").strip()
+        head = ("沿用当前角色、世界与风格" if not sequence
+                else f"沿用当前角色、世界与风格，新增镜头 {sequence}")
+        detail = "：".join(part for part in (subject, action) if part)
+        self.runtime_store.add_conversation_message(
+            request.conversation_id, role=MessageRole.ASSISTANT, type=MessageType.TEXT,
+            content=(f"{head}{' · ' + detail if detail else ''}。\n"
+                     "本次镜头的完整 Image Prompt 已生成，等待外部图片。"),
+            run_id=continued["run_id"],
+        )
+        payload = self._comic_director_result(self.runtime_store.get_run(continued["run_id"]))
+        return {**payload,
+                "shot_continuation": {**continued, "prompt": prompt}}
 
     def _comic_director_result(self, run: RunRecord) -> dict[str, Any]:
         spec = None
-        spec_status = "unavailable"
-        if run.status is ExecutionStatus.COMPLETED:
-            spec = self.comic_projects.get_director(
-                run.state["project_id"],
-                project_version=run.state["project_version_after"],
-            ).model_dump(mode="json")
-            spec_status = "reviewed"
-        elif run.status in {ExecutionStatus.WAITING, ExecutionStatus.FAILED}:
-            candidate = run.state.get("director_candidate")
-            if candidate is not None:
-                # 草案是 Run 中的真实分层输出，不伪造已保存的 spec_id/version 或审核成功。
-                spec = DirectorSpecDraft.model_validate(candidate).model_dump(mode="json")
-                spec.update(
-                    {
-                        "project_id": run.state["project_id"],
-                        "creative_brief_version": run.state["input_versions"]["creative_brief"],
-                        "draft": True,
-                        "source_run_id": run.id,
-                    }
-                )
-                spec_status = "draft"
-                if run.state.get("project_version_after"):
-                    spec = self.comic_projects.get_director(
-                        run.state["project_id"], project_version=run.state["project_version_after"],
-                    ).model_dump(mode="json")
-                    spec.update(draft=True, source_run_id=run.id)
+        saved = None
         confirmed = False
-        if spec is not None and "version" in spec:
-            saved = self.comic_projects.get_director(
-                run.state["project_id"], project_version=run.state["project_version_after"],
-            )
+        spec_status = "unavailable"
+        project_id = run.state.get("project_id")
+        version = run.state.get("director_spec_version")
+        # Only an explicitly bound revision belongs to this Run. A continuation
+        # references its baseline but owns a different candidate, not that revision.
+        if project_id and version is not None and run.workflow != "comic.shot.continue":
+            saved = next((item for item in self.comic_projects.director_versions(project_id)
+                          if item.version == version), None)
+        if saved is not None:
+            spec = saved.model_dump(mode="json")
+            spec_status = "reviewed" if run.status is ExecutionStatus.COMPLETED else "draft"
+            if spec_status == "draft":
+                spec["draft"] = True
             confirmed = self.comic_projects.director_confirmed(saved)
             spec["user_confirmed"] = self.comic_projects.human_director_confirmed(saved)
             spec["approval"] = {"status": "approved" if spec["user_confirmed"] else "pending"}
             spec["next_stage"] = "storyboard_generation" if spec["user_confirmed"] else None
+            spec["validation"] = self._comic_director_validation(saved)
+        elif (run.status is not ExecutionStatus.CANCELLED
+              and run.state.get("director_candidate")):
+            # Failed internal validation does not erase the real generated output.
+            spec = DirectorSpecDraft.model_validate(
+                run.state["director_candidate"]).model_dump(mode="json")
+            spec.update(project_id=project_id, draft=True, source_run_id=run.id,
+                        creative_brief_version=run.state.get("input_versions", {}).get(
+                            "creative_brief"),
+                        validation={"can_confirm": False, "can_produce": False})
+            spec_status = "draft"
+        review_required = run.state.get("review_required")
+        if review_required is None:
+            review_required = run.state.get("generation_mode") == "USER_EDIT"
+        if spec is not None:
+            # Stored reviews belong to the stored content; never overlay another
+            # attempt's review on it. Continuations carry their own candidate.
+            if saved is None and run.state.get("director_review"):
+                spec["critic_result"] = run.state["director_review"]
+            spec["critic_feedback"] = public_critic_feedback(
+                spec.get("critic_result")) if review_required else []
+            if not review_required:
+                spec["critic_result"] = None
+            spec.update(generation_mode=run.state.get("generation_mode"),
+                        review_required=review_required, context_diff=run.state.get("context_diff"),
+                        source_run_id=run.id)
         return {
             "run_id": run.id,
+            "context": run.state.get("creative_context"),
             "status": run.status.value,
+            "generation_mode": run.state.get("generation_mode"),
+            "review_required": review_required,
+            "creative_context_lock": run.state.get("creative_context_lock"),
+            "context_diff": run.state.get("context_diff"),
             "director_spec": spec,
             "director_spec_status": spec_status,
-            "ready_for_prompt": confirmed and (spec_status == "reviewed"
-                                               or self.comic_projects.advisory_authorized(saved)),
+            "ready_for_prompt": run.status is ExecutionStatus.COMPLETED and confirmed
+            and (spec_status == "reviewed"
+                                               or saved is not None
+                                               and self.comic_projects.advisory_authorized(saved)),
             "director_execution_summary": director_execution_summary(run),
             "recovery_required": run.status is ExecutionStatus.RUNNING
             and run.state.get("worker_instance_id") != self._instance_id,
@@ -2644,8 +3423,30 @@ class StudioApplication:
                     "comic.director", "comic.storyboard.", "comic.shot.", "comic.prompt.",
                 )) or run.state.get("project_id") != project_id):
                 continue
-            payload = self._comic_director_result(run) if run.workflow == "comic.director" \
-                else self._run_payload(run.id)
+            try:
+                payload = self._comic_director_result(run) if run.workflow in {
+                    "comic.director", "comic.shot.continue"} \
+                    else self._run_payload(run.id)
+            except (ToolError, KeyError, ValueError) as error:
+                # 投影失败的任务仍要出现在列表里：丢弃会让用户以为任务从未发生。
+                # 这里退回真实 Run 状态，方案内容留空，由前端显示可恢复的失败记录。
+                failure = public_error(
+                    error, component="comic.task_projection", project_id=project_id,
+                    run_id=run.id, trace_id=run.state.get("trace_id") or current_trace_id())
+                payload = {
+                    "run_id": run.id, "status": run.status.value,
+                    "director_spec": None,
+                    "recovery_required": run.status is ExecutionStatus.RUNNING
+                    and run.state.get("worker_instance_id") != self._instance_id,
+                    "director_execution_summary": {
+                        "mode": request_mode_fallback(run),
+                        "current_stage": str(run.current_node or "creative_understanding")
+                        .removeprefix("comic."),
+                        "status_label": str(run.error or "任务未完成，请查看执行记录"),
+                        "available_actions": ["view", "resume"],
+                        "stages": [], "error_id": failure["error_id"], "failure": failure,
+                    },
+                }
             if (run.workflow == "comic.director-spec"
                     and run.state.get("project_version_after")):
                 spec = self.comic_projects.get_director(
@@ -2680,6 +3481,7 @@ class StudioApplication:
         *, storyboard_id: str | None = None, shot_id: str | None = None,
         expected_project_version: int, expected_version: int | None = None,
         conversation_id: str | None = None,
+        execution_context: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """作品写操作复用 Core Run/Event；不创建 Comic 专属任务表。"""
         trace_id = current_trace_id() or f"trace-{uuid4().hex[:12]}"
@@ -2694,6 +3496,7 @@ class StudioApplication:
         }
         if conversation_id:
             state["conversation_id"] = conversation_id
+        state.update(execution_context or {})
         parent_id = current_run_id()
         parent = self.runtime_store.get_run(parent_id) if parent_id else None
         if parent and parent.state.get("quick_creation"):
@@ -2735,6 +3538,15 @@ class StudioApplication:
             try:
                 progress("planning", "request_validated")
                 result = action(progress)
+                if result.get("review_blocked"):
+                    state.update(task_status="needs_review", last_completed_step="director_review")
+                    self.runtime_store.update_run(
+                        run.id, status=ExecutionStatus.WAITING, state=state,
+                        current_node="director_critic")
+                    self.runtime_store.append_event(
+                        run.id, RuntimeEventType.NODE_PROGRESS, node_id="director_critic",
+                        payload={"director_event": "director_review_blocked"})
+                    return result
                 entity = result.get("storyboard", result)
                 saved_storyboard_id = entity.get("storyboard_id", storyboard_id)
                 saved_shot_id = entity.get("shot_id", shot_id)
@@ -2793,10 +3605,13 @@ class StudioApplication:
                     storyboard_id=storyboard_id or "-", shot_id=shot_id or "-",
                 )
                 error._kantoku_public_failure = failure
-                state.update(task_status="failed", error_id=failure["error_id"])
+                state.update(task_status="failed", error_id=failure["error_id"],
+                             error_message=failure.get("safe_message"),
+                             error_kind=failure.get("error_kind"))
                 self.runtime_store.update_run(
                     run.id, status=ExecutionStatus.FAILED, state=state,
-                    current_node=task_type, error=failure["error_id"],
+                    current_node=task_type,
+                    error=f"{failure.get('safe_message')} · {failure['error_id']}",
                 )
                 self.runtime_store.append_event(
                     run.id, RuntimeEventType.RUN_FAILED, node_id=task_type,
@@ -2966,10 +3781,8 @@ class StudioApplication:
             conversation = self.runtime_store.get_conversation(request.conversation_id or "")
             if (conversation.interaction_mode is not InteractionMode.GUIDED
                     or conversation.domain != "comic"
-                    or not any(run.workflow == "comic.director"
-                               and run.state.get("project_id") == shot.project_id
-                               for run in self.runtime_store.list_runs(
-                                   conversation_id=conversation.id))):
+                    or not self._comic_conversation_owns_director(
+                        shot.project_id, conversation.id)):
                 raise ToolError("外部图片准备必须绑定当前 Comic 创作会话")
             self.comic_projects.require_confirmed_director(
                 self.comic_projects.get_director(shot.project_id), human_review=True,
@@ -2986,17 +3799,80 @@ class StudioApplication:
             model_target = "external" if request.image_mode == "external" \
                 else get_settings().image.model
             compiler = compiler_for_model(model_target)
+            lock = self._comic_context_lock(shot.project_id, request.conversation_id) \
+                if request.image_mode == "external" and request.complete_prompt else None
+            locked_bibles = self.comic_projects.locked_bibles(shot.project_id, lock) if lock else {}
+            if lock:
+                owner = self._comic_director_owner(shot.project_id, request.conversation_id,
+                                                   director.version)
+                input_lock = owner.state.get("input_creative_context_lock") if owner else None
+                if input_lock:
+                    locked_bibles.update(ComicContextBuilder.retained_prompt_fields(
+                        self.comic_projects.locked_bibles(shot.project_id, input_lock),
+                        owner.state.get("task") or "",
+                        set(owner.state.get("creative_context", {}).get("edit_scopes", []))))
             progress("generating", "context_selected")
-            draft = compiler.compile(
+            compile_inputs = dict(
                 snapshot=snapshot, director=director, storyboard=storyboard,
                 shot=current_shot, assets=assets, model_target=model_target,
-                model_call=self._comic_storyboard_model,
                 allow_advisory=self.comic_projects.advisory_authorized(director),
                 allow_unavailable=self.comic_projects.human_director_confirmed(director),
                 complete_prompt=request.complete_prompt,
-                reused_context=self.comic_prompts.reused_context(current_shot, director)
+                reused_context=(locked_bibles if locked_bibles else
+                                self.comic_prompts.reused_context(current_shot, director))
                 if request.complete_prompt else None,
             )
+            try:
+                draft = compiler.compile(**compile_inputs, model_call=self._comic_storyboard_model)
+            except ToolError as error:
+                # 只修复已返回的文本结构一次；供应商错误/未知调用结果不重提。
+                if (not request.complete_prompt or request.image_mode != "external"
+                        or not (error.detail or "").startswith("module=prompt.compiler")):
+                    raise
+                logger.warning(
+                    "prompt_structure_repair_started trace_id={} project_id={} shot_id={} "
+                    "module=prompt.compiler reason={}", current_trace_id(), shot.project_id,
+                    shot.shot_id, error.detail)
+
+                def repair(messages, reason=error.detail):
+                    return self._comic_storyboard_model([
+                        {**messages[0], "content": messages[0]["content"] +
+                         "\n上一次返回已收到但结构校验失败：" + reason +
+                         "。请修复 JSON 结构，使用同一上下文，不重新设计角色。"
+                         "人物身份必须从已确认导演或 reused_bibles 提取，不能因未绑定"
+                         "独立人物资产而置空。身份字段只写固定姓名/身份，动作放入 Shot。"
+                         "不能伪造未知事实，保留所有固定约束。"}, *messages[1:],
+                    ])
+
+                try:
+                    draft = compiler.compile(**compile_inputs, model_call=repair)
+                except ToolError as repaired_error:
+                    if (repaired_error.detail or "").startswith("module=prompt.compiler"):
+                        field = re.search(r"\bfields?=([\w.,]+)", repaired_error.detail)
+                        label = {
+                            "character_context.identity": "人物身份",
+                            "character_context": "人物设定",
+                            "world_context": "世界设定",
+                            "style_context": "视觉风格",
+                            "shot_context": "当前镜头要求",
+                            "negative_prompt": "禁止内容",
+                            "director_summary": "导演摘要",
+                        }.get(field[1] if field else "", "分段内容")
+                        raise ToolError(
+                            f"完整 Prompt 的{label}结构仍不完整，无法用于外部图片模型。"
+                            "请重新生成当前镜头 Prompt；"
+                            "已确认的人物、世界与导演方案已保留。",
+                            detail=repaired_error.detail,
+                        ) from repaired_error
+                    raise
+            for field, label in (("character_context", "人物设定"),
+                                 ("world_context", "世界设定"), ("style_context", "视觉风格")):
+                if field in locked_bibles and getattr(draft, field) != locked_bibles[field]:
+                    raise ToolError(
+                        f"{label}与已锁定设定冲突，请沿用当前设定修订导演方案；"
+                        f"如需改变{label}，请在对话中明确要求更换。",
+                        detail=f"module=comic.context affected_field={field}",
+                    )
             progress("checking", "prompt_compiled")
             run_id = current_run_id()
             if run_id is None:
@@ -3007,6 +3883,13 @@ class StudioApplication:
                 model_target=model_target, compiler_version=compiler.version, run_id=run_id,
             )
             result = self.comic_prompts.payload(prompt)
+            if lock is not None:
+                sources = dict(lock["bible_sources"])
+                for field in ("character_context", "world_context", "style_context"):
+                    sources.setdefault(field, {"shot_id": prompt.shot_id, "version": prompt.version,
+                                               "prompt_id": prompt.prompt_id,
+                                               "artifact_id": prompt.artifact_id})
+                self.comic_projects.save_context_lock(director, request.conversation_id, sources)
             if request.image_mode == "external":
                 result["media_preparation"] = {
                     "image_mode": "external", "status": "awaiting_external_image",
@@ -3031,10 +3914,8 @@ class StudioApplication:
         conversation = self.runtime_store.get_conversation(request.conversation_id)
         if (conversation.interaction_mode is not InteractionMode.GUIDED
                 or conversation.domain != "comic"
-                or not any(run.workflow == "comic.director"
-                           and run.state.get("project_id") == prompt.project_id
-                           for run in self.runtime_store.list_runs(
-                               conversation_id=conversation.id))):
+                or not self._comic_conversation_owns_director(
+                    prompt.project_id, conversation.id)):
             raise ToolError("Prompt 确认必须绑定当前 Comic 创作会话")
 
         def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
@@ -3055,6 +3936,18 @@ class StudioApplication:
                 "artifact_id": current.artifact_id, "version": current.version,
                 "sha256": prompt_fingerprint(current),
             }
+            if current.model_target == "external" and current.source in {"edited", "restored"}:
+                lock = self._comic_context_lock(current.project_id, conversation.id)
+                if lock:
+                    bibles = self.comic_projects.locked_bibles(current.project_id, lock)
+                    sources = dict(lock["bible_sources"])
+                    for field in ("character_context", "world_context", "style_context"):
+                        if bibles.get(field) != getattr(current, field):
+                            sources[field] = {"shot_id": current.shot_id,
+                                              "prompt_id": current.prompt_id,
+                                              "version": current.version,
+                                              "artifact_id": current.artifact_id}
+                    self.comic_projects.save_context_lock(director, conversation.id, sources)
             return result
 
         self._comic_tracked_action(
@@ -3101,16 +3994,14 @@ class StudioApplication:
         conversation = self.runtime_store.get_conversation(request.conversation_id)
         if (conversation.interaction_mode is not InteractionMode.GUIDED
                 or conversation.domain != "comic"
-                or not any(run.workflow == "comic.director"
-                           and run.state.get("project_id") == shot.project_id
-                           for run in self.runtime_store.list_runs(
-                               conversation_id=conversation.id))):
+                or not self._comic_conversation_owns_director(
+                    shot.project_id, conversation.id)):
             raise ToolError("外部图片上传必须绑定当前 Comic 创作会话")
 
         def execute(_progress: Callable[[str, str | None], None]) -> dict[str, Any]:
             output_dir = get_settings().image.output_dir
             output_dir = (
-                output_dir if output_dir.is_absolute() else ROOT / output_dir
+                resolve_runtime_path(output_dir)
             ) / "external"
             return self.comic_prompts.import_image(
                 shot_id, data_url=request.data_url, filename=request.filename,
@@ -3163,12 +4054,61 @@ class StudioApplication:
             expected_version=request.expected_version,
         )
 
+    def delete_comic_prompt(self, shot_id: str, data: dict[str, Any]) -> dict[str, Any]:
+        """删除单个历史 Prompt 版本；当前版本由服务层拒绝，不在这里做隐式回退。"""
+        request = ComicVersionDeleteRequest.model_validate(data)
+        shot = self.comic_storyboards.get_shot(shot_id)
+
+        def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            progress("saving", "prompt_version_delete")
+            return self.comic_prompts.delete_version(
+                shot_id, version=request.version,
+                expected_project_version=request.expected_project_version,
+            )
+
+        return self._comic_tracked_action(
+            shot.project_id, "prompt.delete", execute,
+            storyboard_id=shot.storyboard_id, shot_id=shot_id,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.version,
+        )
+
     def get_comic_director(self, project_id: str) -> dict[str, Any]:
         return self._comic_director_spec_payload(self.comic_projects.get_director(project_id))
 
+    def _comic_director_validation(self, spec) -> dict[str, bool]:
+        """UI eligibility from the real validation gate, without disclosing review advice."""
+        from kantoku.domains.comic.critic import require_approved_director
+
+        try:
+            require_approved_director(spec, allow_advisory=True, allow_unavailable=True)
+        except ToolError:
+            return {"can_confirm": False, "can_produce": False}
+        return {"can_confirm": True,
+                "can_produce": self.comic_projects.director_confirmed(spec)}
+
     def _comic_director_spec_payload(self, spec) -> dict[str, Any]:
         confirmed = self.comic_projects.human_director_confirmed(spec)
+        with self.runtime_store._connect() as connection:
+            row = connection.execute(
+                "SELECT state_json FROM runs WHERE domain='comic' "
+                "AND workflow IN ('comic.director','comic.director-spec') "
+                "AND json_extract(state_json,'$.project_id')=? "
+                "AND json_extract(state_json,'$.director_spec_version')=? "
+                "ORDER BY started_at DESC LIMIT 1", (spec.project_id, spec.version),
+            ).fetchone()
+        state = json.loads(row[0]) if row else {}
+        # 缺键时按generation_mode 推导，避免把首次生成的内部校验当成用户审核。
+        review_required = state.get("review_required")
+        if review_required is None:
+            review_required = state.get("generation_mode") == "USER_EDIT"
+        review = spec.model_dump(mode="json")["critic_result"]
         return {**spec.model_dump(mode="json"),
+                "generation_mode": state.get("generation_mode"),
+                "validation": self._comic_director_validation(spec),
+                "review_required": review_required, "context_diff": state.get("context_diff"),
+                "critic_result": review if review_required else None,
+                "critic_feedback": public_critic_feedback(review) if review_required else [],
                 "user_confirmed": confirmed,
                 "approval": {"status": "approved" if confirmed else "pending"},
                 "next_stage": "storyboard_generation" if confirmed else None}
@@ -3228,6 +4168,20 @@ class StudioApplication:
                 allow_advisory=True,
             )
         if not automatic_run_id:
+            # 只定位本导演版本所属的创作会话，确认时立即建立版本锁。
+            with self.runtime_store._connect() as connection:
+                owners = connection.execute(
+                    "SELECT DISTINCT c.id FROM runs r JOIN conversations c ON "
+                    "c.id=json_extract(r.state_json,'$.conversation_id') "
+                    "WHERE r.domain='comic' AND r.workflow='comic.director' "
+                    "AND c.deleted_at IS NULL AND c.interaction_mode='guided' AND c.domain='comic' "
+                    "AND json_extract(state_json,'$.project_id')=? "
+                    "AND json_extract(state_json,'$.director_spec_version')=?",
+                    (project_id, saved.version),
+                ).fetchall()
+            for owner in owners:
+                if owner[0]:
+                    self._comic_context_lock(project_id, owner[0])
             logger.bind(trace_id=trace_id, project_id=project_id,
                         director_version=saved.version).info(
                 "workflow_transition from=director_review director_review_completed "
@@ -3237,7 +4191,7 @@ class StudioApplication:
 
     def list_comic_director_versions(self, project_id: str) -> dict[str, Any]:
         return {"versions": [
-            spec.model_dump(mode="json")
+            self._comic_director_spec_payload(spec)
             for spec in self.comic_projects.director_versions(project_id)
         ]}
 
@@ -3248,6 +4202,25 @@ class StudioApplication:
             expected_project_version=request.expected_project_version,
         )
         return self._comic_director_spec_payload(spec)
+
+    def delete_comic_director_version(
+        self, project_id: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """删除单个历史导演方案版本；当前版本由服务层拒绝。"""
+        request = ComicVersionDeleteRequest.model_validate(data)
+
+        def execute(progress: Callable[[str, str | None], None]) -> dict[str, Any]:
+            progress("saving", "director_version_delete")
+            return self.comic_projects.delete_director_version(
+                project_id, version=request.version,
+                expected_project_version=request.expected_project_version,
+            )
+
+        return self._comic_tracked_action(
+            project_id, "director.delete", execute,
+            expected_project_version=request.expected_project_version,
+            expected_version=request.version,
+        )
 
     def _run_payload(self, run_id: str) -> dict[str, Any]:
         run = self.runtime_store.get_run(run_id)
@@ -3526,21 +4499,35 @@ class StudioApplication:
         run_id: str | None = None,
         type_name: str | None = None,
         domain: str | None = None,
+        lifecycle_state: str | None = "active",
     ) -> list[dict[str, Any]]:
         """跨 Run 查询产物。"""
-        from kantoku.core.runtime.models import ArtifactType
+        from kantoku.core.runtime.models import ArtifactLifecycle, ArtifactType
 
         artifact_type = ArtifactType(type_name) if type_name else None
         return [
             item.model_dump(mode="json")
             for item in self.runtime_store.list_artifacts(
-                run_id, type=artifact_type, domain=domain
+                run_id, type=artifact_type, domain=domain,
+                lifecycle_state=ArtifactLifecycle(lifecycle_state) if lifecycle_state else None,
             ) if item.run_id is not None
         ]
 
     def get_core_artifact(self, artifact_id: str) -> dict[str, Any]:
         """读取单个 Artifact。"""
         return self.runtime_store.get_artifact(artifact_id).model_dump(mode="json")
+
+    def change_core_artifact(
+        self, artifact_id: str, action: str, data: dict[str, Any],
+    ) -> dict[str, Any]:
+        """复用统一产物服务，仅执行可恢复的回收/恢复。"""
+        from kantoku.core.artifacts import ArtifactService
+
+        if set(data) != {"expected_lifecycle_version"} or action not in {"trash", "restore"}:
+            raise ToolError("资产操作参数无效，请刷新后重试")
+        service = ArtifactService(self.runtime_store)
+        operation = service.trash if action == "trash" else service.restore
+        return operation(artifact_id, data["expected_lifecycle_version"]).model_dump(mode="json")
 
     def get_core_artifact_content(self, artifact_id: str) -> Path:
         """读取真实 Artifact 文件；Mock/Blocked 永远不会返回占位内容。"""
@@ -3714,8 +4701,14 @@ class StudioApplication:
 def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
     """只绑定回环地址；校验 Host 和会话令牌，收费操作只接受同源 JSON。"""
 
+    closing = threading.Event()
+
     class Handler(BaseHTTPRequestHandler):
         DEV_ORIGINS = {"http://127.0.0.1:5173", "http://localhost:5173"}
+
+        def setup(self) -> None:
+            self.request.settimeout(30)
+            super().setup()
 
         def log_message(self, format: str, *args: object) -> None:
             pass  # 提示词、会话令牌与个人路径不写访问日志。
@@ -3744,6 +4737,8 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 context["storyboard_id"] = parts[2]
             elif len(parts) >= 3 and parts[:2] == ["comic", "shots"]:
                 context["shot_id"] = parts[2]
+            elif len(parts) >= 2 and parts[0] == "artifacts":
+                context["artifact_id"] = parts[1]
             failure = getattr(error, "_kantoku_public_failure", None)
             if failure is None:
                 failure = public_error(error, **context)
@@ -3787,7 +4782,7 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
             self.end_headers()
             cursor = after
             deadline = time.time() + 600
-            while time.time() < deadline:
+            while time.time() < deadline and not closing.is_set():
                 try:
                     events = app.list_core_events(run_id, cursor)
                     for event in events:
@@ -4009,6 +5004,9 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                         run_id=query.get("run_id", [None])[0],
                         type_name=query.get("type", [None])[0],
                         domain=query.get("domain", [None])[0],
+                        lifecycle_state=query.get(
+                            "lifecycle", [None if query.get("run_id") else "active"],
+                        )[0],
                     )})
                 elif request_path.startswith("/api/artifacts/"):
                     parts = request_path.strip("/").split("/")
@@ -4038,6 +5036,16 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                     parts = request_path.strip("/").split("/")
                     if len(parts) == 3:
                         self.json_reply(200, app.conversation(parts[2]))
+                    elif len(parts) == 4 and parts[3] == "messages":
+                        query = parse_qs(parsed.query)
+                        items = app.runtime_store.list_conversation_messages(
+                            parts[2], limit=int(query.get("limit", ["50"])[0]),
+                            before_id=query.get("before", [None])[0],
+                            after_id=query.get("after", [None])[0],
+                            message_ids=query.get("id"))
+                        self.json_reply(200, {
+                            "messages": [item.model_dump(mode="json") for item in items],
+                            "next_before": items[0].id if items else None})
                     else:
                         self.json_reply(404, {"error": "Conversation API 路径不存在"})
                 elif request_path.startswith("/media/"):
@@ -4131,14 +5139,25 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
                 elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
                         and parts[4:] == ["prompt", "restore"]:
                     self.json_reply(201, app.restore_comic_prompt(parts[3], data))
+                elif len(parts) == 6 and parts[:3] == ["api", "comic", "shots"] \
+                        and parts[4:] == ["prompt", "delete"]:
+                    self.json_reply(200, app.delete_comic_prompt(parts[3], data))
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
                         and comic_parts[3:] == ["director-spec", "restore"]:
                     self.json_reply(201, app.restore_comic_director(comic_parts[2], data))
+                elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
+                        and comic_parts[3:] == ["director-spec", "delete"]:
+                    self.json_reply(
+                        200, app.delete_comic_director_version(comic_parts[2], data),
+                    )
                 elif comic_parts[:2] == ["comic", "projects"] and len(comic_parts) == 5 \
                         and comic_parts[3:] == ["director-spec", "confirm"]:
                     self.json_reply(200, app.confirm_comic_director(comic_parts[2], data))
                 elif request_path == "/api/runs":
                     self.json_reply(201, app.create_core_run(data))
+                elif len(parts) == 4 and parts[:2] == ["api", "artifacts"] \
+                        and parts[3] in {"trash", "restore"}:
+                    self.json_reply(200, app.change_core_artifact(parts[2], parts[3], data))
                 elif request_path == "/api/conversations":
                     self.json_reply(201, app.create_conversation(data))
                 elif len(parts) == 5 and parts[:2] == ["api", "conversations"] \
@@ -4264,7 +5283,16 @@ def make_server(app: StudioApplication, port: int = 0) -> ThreadingHTTPServer:
             except KantokuError as error:
                 self.error_reply(400, error)
 
-    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    class Server(ThreadingHTTPServer):
+        # ThreadingHTTPServer defaults to daemon handlers; SQLite writers must
+        # finish before the process's checkpoint/exit boundary.
+        daemon_threads = False
+
+        def server_close(self) -> None:
+            closing.set()
+            super().server_close()
+
+    return Server(("127.0.0.1", port), Handler)
 
 
 def _port_already_serving(port: int) -> bool:
@@ -4284,12 +5312,24 @@ def _port_owner_pid(port: int) -> int | None:
     if os.name != "nt":
         return None
     try:
+        # 中文 Windows 的 netstat 输出是本地代码页（GBK），按 UTF-8 解码会直接抛错。
         result = subprocess.run(
-            ["netstat", "-ano"], capture_output=True, text=True, timeout=5, check=False,
+            ["netstat", "-ano"], capture_output=True, timeout=5, check=False,
         )
     except (OSError, subprocess.SubprocessError):
         return None
-    for line in result.stdout.splitlines():
+    captured = result.stdout
+    raw = captured if isinstance(captured, bytes) else str(captured or "").encode("utf-8")
+    output = ""
+    for encoding in ("utf-8", "gbk"):
+        try:
+            output = raw.decode(encoding)
+            break
+        except UnicodeDecodeError:
+            continue
+    else:
+        output = raw.decode("utf-8", errors="replace")
+    for line in output.splitlines():
         parts = line.split()
         if len(parts) >= 5 and parts[1].endswith(f":{port}") and parts[3] == "LISTENING":
             with suppress(ValueError):
@@ -4321,7 +5361,15 @@ def serve(*, port: int = 8000, open_browser: bool = True) -> int:
         settings.image.model,
     )
     app = StudioApplication()
-    server = make_server(app, port)
+    try:
+        maintenance = get_runtime_paths().start_maintenance()
+        server = make_server(app, port)
+    except Exception:
+        app.runner.close()
+        if "maintenance" in locals():
+            maintenance.close()
+        database_manager.checkpoint_all()
+        raise
     url = f"http://127.0.0.1:{server.server_port}"
 
     def provider_status(*credentials: Callable[[], str]) -> str:
@@ -4342,7 +5390,7 @@ def serve(*, port: int = 8000, open_browser: bool = True) -> int:
         ("Config Path", "READY", str(config_path.resolve())),
         ("Database", "READY", str(app.runtime_store.path)),
         ("Runtime", "READY", "Graph + checkpoint"),
-        ("Logging", "READY", str(ROOT / "data" / "logs" / "kantoku.log")),
+        ("Logging", "READY", str(get_runtime_paths().logs / "kantoku.log")),
         ("DeepSeek", provider_status(settings.llm.chat_api_key), settings.llm.model_chat),
         (
             "Ark Vision", provider_status(settings.llm.vision_api_key),
@@ -4363,8 +5411,12 @@ def serve(*, port: int = 8000, open_browser: bool = True) -> int:
     except KeyboardInterrupt:
         pass
     finally:
-        app.runner.close()
         server.server_close()
+        app.runner.close()
+        try:
+            maintenance.close()
+        finally:
+            database_manager.checkpoint_all()
     return 0
 
 
