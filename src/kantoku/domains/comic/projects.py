@@ -594,7 +594,24 @@ class ComicProjectStore:
         )
 
     def creative_context_lock(self, project_id: str, conversation_id: str) -> dict | None:
-        """会话锁仅存不可变修订引用；Bible 内容仍由原 Prompt Artifact 保存。"""
+        """会话锁仅存不可变修订引用；Bible 内容仍由原 Prompt Artifact 保存。
+
+        Returns the lock only when it is still valid for the current project
+        revisions. Callers that need to know *why* a lock is unavailable should
+        use :meth:`context_lock_status` instead of treating ``None`` as "no lock".
+        """
+        lock, _status, _reason = self.context_lock_status(project_id, conversation_id)
+        return lock
+
+    def context_lock_status(self, project_id: str, conversation_id: str) -> tuple[
+            dict | None, str, str]:
+        """Return ``(lock, status, reason)`` where status is one of:
+
+        ``active``   – lock exists and matches the current revisions (lock returned)
+        ``drifted``  – lock exists but the director/brief revision moved on
+        ``released`` – the newest record is a released tombstone
+        ``absent``   – no lock has ever been saved for this conversation
+        """
         snapshot = self.get(project_id)
         with self._connect() as connection:
             row = connection.execute(
@@ -602,11 +619,46 @@ class ComicProjectStore:
                 "AND entity_type='creative_context_lock' AND entity_id=? "
                 "ORDER BY version DESC LIMIT 1", (project_id, conversation_id),
             ).fetchone()
-        lock = CreativeContextLock.model_validate_json(row[0]).model_dump() if row else None
-        if lock and (lock["director_version"] == snapshot.project.director_version
-                     and lock["brief_version"] == snapshot.creative_brief.version):
-            return lock
-        return None
+        if row is None:
+            return None, "absent", "该会话从未保存过创作设定锁"
+        payload = json.loads(row[0])
+        if payload.get("released"):
+            return None, "released", "该会话的创作设定锁已被显式释放"
+        lock = CreativeContextLock.model_validate(payload).model_dump()
+        if (lock["director_version"] == snapshot.project.director_version
+                and lock["brief_version"] == snapshot.creative_brief.version):
+            return lock, "active", ""
+        reason = (
+            f"创作设定锁已随版本漂移失效："
+            f"导演 {lock['director_version']}→{snapshot.project.director_version}，"
+            f"Brief {lock['brief_version']}→{snapshot.creative_brief.version}")
+        return None, "drifted", reason
+
+    def release_context_lock(self, project_id: str, conversation_id: str,
+                             *, reason: str = "") -> None:
+        """Explicitly release a conversation's creative lock.
+
+        Writes a tombstone version rather than deleting history so the audit
+        trail in ``comic_entity_versions`` stays intact and older code that reads
+        the newest record naturally observes "no lock".
+        """
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT version FROM comic_entity_versions WHERE project_id=? "
+                "AND entity_type='creative_context_lock' AND entity_id=? "
+                "ORDER BY version DESC LIMIT 1", (project_id, conversation_id),
+            ).fetchone()
+            if row is None:
+                return
+            self._insert_version(
+                connection, project_id=project_id,
+                entity_type="creative_context_lock", entity_id=conversation_id,
+                version=int(row["version"]) + 1,
+                payload_json=json.dumps({"released": True, "reason": reason},
+                                        ensure_ascii=False),
+                created_at=utc_now(),
+            )
 
     def save_context_lock(self, spec: DirectorSpec, conversation_id: str,
                           sources: dict | None = None) -> dict:

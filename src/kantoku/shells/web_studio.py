@@ -2971,6 +2971,12 @@ class StudioApplication:
                     parent_brief_id=snapshot.creative_brief.brief_id,
                     parent_brief_version=snapshot.creative_brief.version,
                     reason="dynamic conversation turn"))
+                # The brief changed, so the previous lock no longer describes this
+                # conversation. Release it explicitly instead of leaving a zombie
+                # lock that can only fail its version check forever.
+                self.comic_projects.release_context_lock(
+                    project_id, request.conversation_id,
+                    reason="dynamic turn forked a new creative brief")
             elif user_constraints != snapshot.creative_brief.hard_constraints:
                 snapshot = self.comic_projects.replace_brief(project_id, CreativeBriefUpdate(
                     original_request=original,
@@ -3140,23 +3146,46 @@ class StudioApplication:
 
     def _comic_context_lock(self, project_id: str, conversation_id: str, *,
                             require_confirmed: bool = True) -> dict | None:
+        """Resolve the conversation's creative lock, logging why it is unavailable.
+
+        Every early exit below used to be a silent ``None``, which made a drifted
+        or orphaned lock indistinguishable from "never had one". We keep the same
+        return contract but record a structured reason so failures are visible.
+        """
+        def _miss(reason: str) -> None:
+            logger.bind(component="comic.director", project_id=project_id,
+                        conversation_id=conversation_id).info(
+                "creative context lock unavailable: {}", reason)
+            return None
+
         conversation = self.runtime_store.get_conversation(conversation_id)
         if (conversation.domain != "comic"
                 or conversation.interaction_mode is not InteractionMode.GUIDED):
-            return None
+            return _miss("会话不是漫剧引导模式")
         snapshot = self.comic_projects.get(project_id)
         if snapshot.project.director_id is None:
-            return None
+            return _miss("作品尚无导演方案")
         director = self.comic_projects.get_director(project_id)
-        if (director.creative_brief_version != snapshot.creative_brief.version
-                or director.schema_version != 2
-                or require_confirmed
-                and not self.comic_projects.human_director_confirmed(director)):
-            return None
+        if director.creative_brief_version != snapshot.creative_brief.version:
+            return _miss(
+                f"导演方案 Brief 版本 {director.creative_brief_version} "
+                f"与当前 {snapshot.creative_brief.version} 不一致")
+        if director.schema_version != 2:
+            return _miss(f"导演方案 schema_version={director.schema_version} 不是 2")
+        if require_confirmed and not self.comic_projects.human_director_confirmed(director):
+            return _miss("导演方案尚未人工确认")
         if self._comic_director_owner(project_id, conversation_id, director.version) is None:
-            return None
-        return self.comic_projects.creative_context_lock(project_id, conversation_id) or \
-            self.comic_projects.save_context_lock(director, conversation_id)
+            return _miss("当前会话不是该导演版本的所属会话")
+        lock, status, reason = self.comic_projects.context_lock_status(
+            project_id, conversation_id)
+        if lock is not None:
+            return lock
+        if status == "drifted":
+            logger.bind(component="comic.director", project_id=project_id,
+                        conversation_id=conversation_id,
+                        lock_status=status).warning(
+                "creative context lock drifted: {}", reason)
+        return self.comic_projects.save_context_lock(director, conversation_id)
 
     def _comic_director_owner(self, project_id: str, conversation_id: str,
                               director_version: int) -> RunRecord | None:
