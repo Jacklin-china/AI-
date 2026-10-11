@@ -6,10 +6,11 @@ import base64
 import binascii
 import hashlib
 import json
+import re
 import sqlite3
 from collections.abc import Callable
 from pathlib import Path
-from typing import Protocol
+from typing import Any, Protocol
 from uuid import uuid4
 
 from loguru import logger
@@ -17,16 +18,24 @@ from pydantic import ValidationError
 
 from kantoku.config import ToolError
 from kantoku.config.observability import current_trace_id
+from kantoku.config.runtime_paths import (
+    atomic_write_bytes,
+    get_runtime_paths,
+    validate_runtime_path,
+)
 from kantoku.core.runtime.models import ArtifactRecord, ArtifactType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
 from .assets import ComicAssetStore
+from .context_declaration import BIBLE_SOURCE_KEYS
 from .critic import require_approved_director
 from .director_provenance import provenance_context, value_hash
 from .models import (
     ComicAsset,
     ComicProjectSnapshot,
     ComicPromptArtifact,
+    ComicPromptContext,
+    ComicPromptContexts,
     ComicPromptDraft,
     ComicShot,
     ComicStoryboard,
@@ -36,8 +45,9 @@ from .models import (
 from .projects import ComicContextBuilder, ComicProjectStore
 from .storyboards import ComicStoryboardStore
 
-COMPILER_VERSION = "comic-prompt-1"
+COMPILER_VERSION = "comic-prompt-3"
 CONTEXT_VERSION = "image-bibles-1"
+BIBLE_CONTRACT = "separated-contexts-1"
 PROMPT_SECTIONS = {
     "character_context": "Character Bible / 人物设定",
     "world_context": "World Bible / 世界观设定",
@@ -74,19 +84,39 @@ def prompt_sections(text: str) -> dict[str, str]:
     return result
 
 
-def _asset_context(assets: list[ComicAsset], kind: str) -> str:
-    lines = []
+def _asset_context(contexts: ComicPromptContexts, assets: list[ComicAsset]) -> None:
+    """固定事实按已有资产字段归属写入；场景/风格光线只进入 Shot。"""
+    routes = {
+        "character": {"appearance": ("character_context", "appearance"),
+                      "outfit": ("character_context", "clothing"),
+                      "features": ("character_context", "fixed_features")},
+        "scene": {"location": ("world_context", "location"),
+                  "time_of_day": ("world_context", "time"),
+                  "weather": ("world_context", "environment"),
+                  "atmosphere": ("world_context", "environment"),
+                  "environment_features": ("world_context", "environment"),
+                  "lighting": ("shot_context", "lighting_changes")},
+        "style": {"art_direction": ("style_context", "art_style"),
+                  "color_language": ("style_context", "color"),
+                  "materials": ("style_context", "materials"),
+                  "camera_language": ("style_context", "photographic_style"),
+                  "lighting": ("shot_context", "lighting_changes")},
+    }
     for asset in assets:
-        if asset.details.kind != kind:
-            continue
-        details = asset.details.model_dump(exclude={"kind"})
-        lines.append(f"固定资产：{asset.name}")
-        for name, value in details.items():
-            if value:
-                text = json.dumps(value, ensure_ascii=False) if isinstance(value, list) else value
-                lines.append(f"{name}: {text}")
-        lines.extend(f"一致性约束：{item}" for item in asset.fixed_constraints)
-    return "\n".join(lines)
+        if (asset.details.kind == "character"
+                and asset.name not in contexts.character_context.identity):
+            contexts.character_context.identity += "；" + asset.name
+        for name, value in asset.details.model_dump(exclude={"kind"}).items():
+            section, field = routes[asset.details.kind][name]
+            if asset.details.kind == "style" and name == "camera_language" and value:
+                shot_field = ComicPromptContext.shot_field(value)
+                if shot_field:
+                    section, field = "shot_context", shot_field
+            target = getattr(contexts, section)
+            for fact in value if isinstance(value, list) else [value]:
+                if fact and fact not in getattr(target, field):
+                    setattr(target, field, "；".join(filter(None, [getattr(target, field), fact])))
+        # 自由文本约束由模型按语义归属，末尾仍核验原文；不能随意塞入构图。
 
 
 class BasePromptCompiler(Protocol):
@@ -112,6 +142,37 @@ class StructuredImagePromptCompiler:
 
     def __init__(self, model_guidance: str) -> None:
         self.model_guidance = model_guidance
+
+    @staticmethod
+    def _separate_contexts(result: dict) -> tuple[ComicPromptContexts, list[dict]]:
+        """仅归位模型已有的完整分句，不创造、删减或猜测固定事实。"""
+        parts = {name: dict(result[name]) if isinstance(result[name], dict) else result[name]
+                 for name in PROMPT_SECTIONS}
+        moves = []
+        shot = parts["shot_context"]
+        for name in BIBLE_SOURCE_KEYS:
+            if not isinstance(parts[name], dict) or not isinstance(shot, dict):
+                continue  # 交给下面的严格 Schema 报告类型错误。
+            allowed = ComicPromptContexts.model_fields[name].annotation.model_fields
+            for field, value in parts[name].items():
+                if field not in allowed or not isinstance(value, str) or "\n" in value:
+                    continue
+                fixed = []
+                for clause in filter(None, re.split(r"[，；。]", value)):
+                    target = ComicPromptContext.shot_field(clause)
+                    if not target:
+                        fixed.append(clause)
+                        continue
+                    existing = shot.get(target, "")
+                    if not isinstance(existing, str):
+                        continue  # 错误类型不能被归位过程覆盖。
+                    if clause not in existing:
+                        shot[target] = "；".join(filter(None, [existing, clause]))
+                    moves.append({"from": f"{name}.{field}", "to": f"shot_context.{target}",
+                                  "value_sha256": value_hash(clause)})
+                if any(move["from"] == f"{name}.{field}" for move in moves):
+                    parts[name][field] = "，".join(fixed)
+        return ComicPromptContexts.model_validate(parts), moves
 
     def compile(
         self, *, snapshot: ComicProjectSnapshot, director: DirectorSpec,
@@ -145,25 +206,69 @@ class StructuredImagePromptCompiler:
             "storyboard": storyboard.version, "shot": shot.version,
         })
         context["model_target"] = model_target
+        director_fields = {
+            "visual_direction", "storytelling_goal", "camera_language", "composition",
+            "lighting", "color_language", "emotion", "character_focus", "constraints",
+            "creative_choices",
+        } if director.schema_version == 1 else {
+            "creative_decision", "director_plan", "cinematography", "constraints",
+        }
+        camera_labels = {
+            "shot_size": "景别", "camera_angle": "机位", "camera_movement": "摄影机运动",
+            "light_source": "主光源", "light_direction": "主光方向",
+            "color_relationship": "色彩关系",
+        }
+        execution_camera = {
+            name: getattr(shot, name, "") or getattr(director.cinematography, name, "")
+            for name in camera_labels
+        }
         if complete_prompt:
             # 读取已有可信字段，不能让 Compiler 修改 DirectorSpec 或重复整份审核 JSON。
-            context["stable_context"]["director_spec"] = director.model_dump(include={
-                "creative_decision", "director_plan", "cinematography", "knowledge_refs",
-            })
+            context["stable_context"].pop("director_spec", None)
+            context["shot_direction"] = {
+                "director_spec": director.model_dump(include=director_fields),
+                "storyboard": context["stable_context"].pop("storyboard"),
+            }
             context["director_sources"] = provenance_context(director)
-            context["reused_bibles"] = reused_context or {}
+            context["reused_bibles"] = {name: text for name, text in (reused_context or {}).items()
+                                        if name in PROMPT_SECTIONS}
+            context["locked_context_fields"] = {
+                name.removeprefix("lock:"): value for name, value in (reused_context or {}).items()
+                if name.startswith("lock:")}
+            context["execution_camera"] = {name: value for name, value in execution_camera.items()
+                                           if value}
         section_instruction = (
-            "完整图片模式：只返回 director_summary、character_context、world_context、"
-            "style_context、shot_context、negative_prompt 六个 JSON 字符串字段。"
-            "character_context 明确谁、固定外貌、服装、可辨认特征与角色一致性；"
-            "此段只写持续身份设定，不写当前动作、姿态、景别或画面位置。"
-            "world_context 明确世界设定、时代、环境和时间；style_context 明确艺术质感、"
-            "色彩规范和材质；shot_context 明确动作、景别、机位、构图、主光源与方向。"
+            "完整图片模式：只输出 JSON 对象，符合以下 JSON Schema。"
+            "只返回 director_summary、character_context、world_context、"
+            "style_context、shot_context、negative_prompt 六个字段。四个 Context 必须为以下 Schema"
+            "规定的对象，禁止使用自由文本段落，禁止新增字段；另两字段为字符串。"
+            "character_context 只包含身份、固定外貌、年龄、服装、固定特征；未知年龄留空。"
+            "当前动作、姿态、视线、朝向、景别、机位、镜头/光线方向全部属于 shot_context，"
+            "不能混进角色外貌或固定特征。不写本次定稿、无绑定资产等内部说明。"
+            "world_context 只包含地点、时间、世界观、环境，不包含主体动作与前中后景构图；"
+            "style_context 只包含艺术风格、摄影质感、色彩、材质，不包含本镜头机位或光源方向。"
+            "shot_context 只包含动作、姿态、构图、镜头、光影变化。所有字段是一行描述。"
             "未知细节可作一次具体创作选择，不得列候选、伪装为用户事实或覆盖固定资产。"
+            "execution_camera 是本镜头已选定的执行要求，正文必须一致，不能再选相反机位或光源。"
             "当前镜头的景别、机位、运动优先使用 current_shot；未指定时沿用导演摄影。"
             "导演的整体风格、色彩与主光逻辑不得改变。reused_bibles 是已保存的相同身份设定，"
-            "必须沿用；镜头动作写在 shot_context。所有正文总长不超过2500字，"
+            "必须沿用；镜头动作写在 shot_context。把构图落实为主体在画面的位置、朝向和前后景关系，"
+            "把光线落实为光源位置、受光面与阴影，把色彩落实为主体与环境的关系。"
+            "字段内容使用可直接交给图片模型的自然语言，不写来源 ID、审核术语或泛化质量标签。"
+            "所有正文总长不超过2500字，"
             "negative_prompt 写具体禁止内容，不写泛化质量口号。"
+            "静态设定与镜头执行必须先分清：stable_context 和固定资产提供事实，"
+            "shot_direction 提供导演执行要求，不能原封不动复制到静态三段。"
+            "从导演文字提取永久身份、外貌、服装即可，姿态/受光/空间布局必须拆到 shot_context。"
+            "逐项检查：从站立远望切换到战斗姿态，这个属性是否还完全成立？"
+            "只有不随镜头变化的属性才能放在 Character、World、Style。"
+            "前三段每个字段用简洁名词描述，建议60字内，不堆砌导演叙述。"
+            "例如外貌只描述发型、面容、体型；服装只描述款式和固有颜色，"
+            "不描述衣带飘动、背光边缘或受光肤色；身份不写夜立山巅。"
+            "World 的地点只写山巅岩台，环境只写松枝、云海、远山，"
+            "不写左下方、右侧中景或画外光源。摄影风格只写质感，"
+            "如真实摄影或写实插画，近远景纵深属于 Shot 镜头；未知年龄输出空字符串。"
+            + json.dumps(ComicPromptContexts.model_json_schema(), ensure_ascii=False)
         ) if complete_prompt else (
             "只返回 JSON：director_summary、positive_prompt、negative_prompt。")
         messages = [
@@ -198,9 +303,11 @@ class StructuredImagePromptCompiler:
                 allowed = {"director_summary", "negative_prompt", *PROMPT_SECTIONS}
                 if not isinstance(result, dict) or set(result) - allowed:
                     raise ValueError("unexpected prompt section fields")
-                missing = [name for name in (*PROMPT_SECTIONS, "director_summary")
-                           if not isinstance(result.get(name), str)
-                           or not result[name].strip()]
+                missing = [name for name in PROMPT_SECTIONS
+                           if name not in result and name not in (reused_context or {})]
+                if not isinstance(result.get("director_summary"), str) \
+                        or not result["director_summary"].strip():
+                    missing.append("director_summary")
                 if missing:
                     raise ToolError("完整 Prompt 编译缺少内容",
                                     detail=f"module=prompt.compiler fields={','.join(missing)}")
@@ -210,24 +317,44 @@ class StructuredImagePromptCompiler:
                                     detail="module=prompt.compiler field=negative_prompt")
                 for name, value in (reused_context or {}).items():
                     if name in PROMPT_SECTIONS:
-                        result[name] = value
-                for name, kind in (("character_context", "character"), ("world_context", "scene"),
-                                   ("style_context", "style")):
-                    if (fixed := _asset_context(assets, kind)) and fixed not in result[name]:
-                        result[name] = fixed + "\n" + result[name]
-                camera = director.cinematography
-                if camera:
-                    execution_camera = {
-                        name: getattr(shot, name, "") or getattr(camera, name)
-                        for name in ("shot_size", "camera_angle", "light_source", "light_direction",
-                                     "color_relationship")
-                    }
-                    result["shot_context"] += "\n已确认摄影：" + "；".join(
-                        f"{name}={value}" for name, value in execution_camera.items() if value)
+                        result[name] = ComicPromptContexts.model_fields[name].annotation.from_text(
+                            value).model_dump()
+                for path, value in context.get("locked_context_fields", {}).items():
+                    section, field = path.split(".", 1)
+                    if (section not in PROMPT_SECTIONS or field not in
+                            ComicPromptContexts.model_fields[section].annotation.model_fields):
+                        raise ValueError("invalid locked context field")
+                    if not isinstance(result.get(section), dict):
+                        raise ValueError("partial context reuse requires structured fields")
+                    result[section][field] = value
+                contexts, scope_relocations = self._separate_contexts(result)
+                _asset_context(contexts, assets)
+                if shot.action:
+                    contexts.shot_context.action = shot.action
+                for name, value in execution_camera.items():
+                    if not value:
+                        continue
+                    if name == "color_relationship":
+                        target, field = contexts.style_context, "color"
+                    elif name in {"light_source", "light_direction"}:
+                        target, field = contexts.shot_context, "lighting_changes"
+                    else:
+                        target, field = contexts.shot_context, "camera"
+                    fact = f"{camera_labels[name]}：{value}"
+                    if fact not in getattr(target, field):
+                        setattr(target, field, "；".join(
+                            filter(None, [getattr(target, field), fact])))
+                contexts = ComicPromptContexts.model_validate(contexts.model_dump())
+                result.update(contexts.sections())
+                # 复用已校验的稳定内容，模型不能换服装/世界/风格；禁止内容同样保持。
+                if (reused_context or {}).get("negative_prompt"):
+                    result["negative_prompt"] = reused_context["negative_prompt"]
                 result["positive_prompt"] = "\n\n".join(
                     heading + "\n" + result[name] for name, heading in PROMPT_SECTIONS.items())
                 result.update(context_version=CONTEXT_VERSION, context_sources={
-                    "bible_contract": "identity-only-1",
+                    "bible_contract": BIBLE_CONTRACT,
+                    "structured_contexts": contexts.model_dump(),
+                    "scope_relocations": scope_relocations,
                     "source_type": "model_choice", "trust_status": "creative_choice",
                     "model_request_id": request_id,
                     "source_versions": context["source_versions"],
@@ -243,6 +370,10 @@ class StructuredImagePromptCompiler:
                                                   f"source:{name}")}
                                        for name, text in (reused_context or {}).items()
                                        if name in PROMPT_SECTIONS},
+                    "retained_fields": {
+                        path: {"sha256": value_hash(value),
+                               "source_artifact_id": (reused_context or {}).get(f"source:{path}")}
+                        for path, value in context.get("locked_context_fields", {}).items()},
                 })
                 result["context_sources"]["field_provenance"] = {
                     name: {"source_type": "model_choice", "trust_status": "creative_choice",
@@ -252,13 +383,85 @@ class StructuredImagePromptCompiler:
                            "source_artifact_id": (reused_context or {}).get(f"source:{name}")}
                     for name in (*PROMPT_SECTIONS, "negative_prompt", "director_summary")
                 }
+                for name in (*PROMPT_SECTIONS, "negative_prompt"):
+                    if name in (reused_context or {}):
+                        previous = json.loads((reused_context or {}).get(
+                            f"provenance:{name}", "{}"))
+                        if (isinstance(previous, dict)
+                                and previous.get("value_sha256") == value_hash(result[name])
+                                and previous.get("trust_status") == "creative_choice"
+                                and previous.get("source_type") in {"model_choice", "manual_edit"}):
+                            result["context_sources"]["field_provenance"][name] = {
+                                **previous,
+                                "source_artifact_id": (reused_context or {}).get(f"source:{name}"),
+                            }
+                # 记录可核验的输入依据；知识输入不能证明某句话的因果来源。
+                skill_methods = {}
+                for provenance in director.field_provenance.values():
+                    for evidence in provenance.evidence:
+                        if evidence.source_type == "skill_method":
+                            method = evidence.model_dump(exclude_none=True)
+                            skill_methods[value_hash(method)] = method
+                lineage = {
+                    "brief": {"id": snapshot.creative_brief.brief_id,
+                              "version": snapshot.creative_brief.version,
+                              "sha256": value_hash(snapshot.creative_brief.model_dump(
+                                  mode="json"))},
+                    "assets": [{"id": asset.asset_id, "version": asset.version,
+                                "kind": asset.details.kind,
+                                "sha256": value_hash(asset.model_dump(mode="json", include={
+                                    "name", "details", "fixed_constraints",
+                                    "reference_artifact_ids",
+                                }))} for asset in assets],
+                    "director": {"id": director.spec_id, "version": director.version,
+                                 "sha256": value_hash(director.model_dump(
+                                     mode="json", include=director_fields))},
+                    "shot": {"id": shot.shot_id, "version": shot.version,
+                             "storyboard_id": storyboard.storyboard_id,
+                             "storyboard_version": storyboard.version,
+                             "sha256": value_hash(shot.model_dump(mode="json"))},
+                    "skill_methods": list(skill_methods.values()),
+                    "skill_evidence_status": "recorded" if skill_methods else "not_recorded",
+                    "evidence_semantics": "input_basis_not_causal_attribution",
+                    "execution_camera": {
+                        name: {"value": value,
+                               "field_path": (f"shot.{name}" if getattr(shot, name, "")
+                                              else f"director.cinematography.{name}")}
+                        for name, value in execution_camera.items() if value
+                    },
+                }
+                result["context_sources"]["input_lineage"] = lineage
+                asset_kinds = {"character_context": "character", "world_context": "scene",
+                               "style_context": "style"}
+                for name, provenance in result["context_sources"]["field_provenance"].items():
+                    if name in (reused_context or {}):
+                        provenance["input_basis"] = {
+                            "source_prompt_artifact_id": (reused_context or {}).get(
+                                f"source:{name}"),
+                            "sha256": value_hash(result[name]),
+                        }
+                        continue
+                    provenance["input_basis"] = {
+                        "brief": lineage["brief"], "director": lineage["director"],
+                        "assets": [item for item in lineage["assets"]
+                                   if name not in asset_kinds or item["kind"] == asset_kinds[name]],
+                        "skill_methods": lineage["skill_methods"],
+                        **({"shot": lineage["shot"]} if name in {
+                            "shot_context", "negative_prompt", "director_summary"} else {}),
+                    }
                 draft = ComicPromptDraft.model_validate(result)
             else:
                 draft = ComicPromptDraft.model_validate_json(raw)
         except (ValueError, ValidationError) as error:
+            field = "context"
+            reason = type(error).__name__
+            if isinstance(error, ValidationError):
+                issue = error.errors(include_input=False, include_context=False)[0]
+                field = ".".join(str(part) for part in issue["loc"]) or field
+                reason = issue["msg"]
             raise ToolError("Prompt 编译模型未返回有效结构",
                             detail=f"module=prompt.compiler request_id={request_id} "
-                            f"{type(error).__name__}") from error
+                            f"field={field} reason={reason}") from error
         required = [*snapshot.creative_brief.hard_constraints, *director.constraints]
         for asset in assets:
             required.extend(asset.fixed_constraints)
@@ -312,14 +515,14 @@ class ComicPromptStore:
     def reused_context(self, shot: ComicShot, director: DirectorSpec) -> dict[str, str]:
         """相同身份/场景复用现有 Prompt 修订；不从其他项目或角色继承设定。"""
         result = {}
-        for prompt in reversed(self.list(shot.project_id)):
+        for prompt in sorted(self.list(shot.project_id),
+                             key=lambda item: item.created_at, reverse=True):
             if (prompt.context_version != CONTEXT_VERSION
-                    or prompt.context_sources.get("bible_contract") != "identity-only-1"
+                    or prompt.context_sources.get("bible_contract") != BIBLE_CONTRACT
                     or prompt.director_spec_version != director.version
                     or prompt.creative_brief_version != director.creative_brief_version):
                 continue
-            previous_shot = next(item for item in self.storyboards.shot_versions(prompt.shot_id)
-                                 if item.version == prompt.shot_version)
+            previous_shot = self._prompt_shot(prompt)
             if ("character_context" not in result
                     and prompt.character_asset_versions == shot.character_asset_versions
                     and (bool(shot.character_asset_versions)
@@ -333,26 +536,67 @@ class ComicPromptStore:
             if "style_context" not in result and prompt.style_version == shot.style_version:
                 result["style_context"] = prompt.style_context
                 result["source:style_context"] = prompt.artifact_id
+            for name in PROMPT_SECTIONS:
+                if result.get(f"source:{name}") == prompt.artifact_id:
+                    result[f"provenance:{name}"] = json.dumps(
+                        prompt.context_sources.get("field_provenance", {}).get(name, {}),
+                        ensure_ascii=False)
+            if all(result.get(f"source:{name}") == prompt.artifact_id for name in
+                   BIBLE_SOURCE_KEYS):
+                result["negative_prompt"] = prompt.negative_prompt
+                result["source:negative_prompt"] = prompt.artifact_id
+                result["provenance:negative_prompt"] = json.dumps(
+                    prompt.context_sources.get("field_provenance", {}).get("negative_prompt", {}),
+                    ensure_ascii=False)
+            if all(name in result for name in
+                   BIBLE_SOURCE_KEYS):
+                break
         return result
 
     def confirmed(self, prompt: ComicPromptArtifact) -> bool:
-        return any(run.status.value == "completed"
-                   and run.state.get("prompt_confirmation") == {
-                       "artifact_id": prompt.artifact_id, "version": prompt.version,
-                       "sha256": prompt_fingerprint(prompt),
-                   } for run in self.runtime.list_runs(limit=100000, domain="comic")
-                   if run.workflow == "comic.prompt.confirm"
-                   and run.state.get("project_id") == prompt.project_id
-                   and run.state.get("shot_id") == prompt.shot_id)
+        # 现有 Core 没有按业务关联查询的公开接口。此兼容投影只读，不建第二套确认状态。
+        with self.runtime._connect() as connection:
+            rows = connection.execute(
+                "SELECT state_json FROM runs WHERE domain='comic' "
+                "AND workflow='comic.prompt.confirm' AND status='completed' "
+                "AND json_extract(state_json, '$.project_id')=? "
+                "AND json_extract(state_json, '$.shot_id')=? "
+                "AND json_extract(state_json, '$.prompt_confirmation.artifact_id')=?",
+                (prompt.project_id, prompt.shot_id, prompt.artifact_id),
+            )
+            expected = {"artifact_id": prompt.artifact_id, "version": prompt.version,
+                        "sha256": prompt_fingerprint(prompt)}
+            return any(json.loads(row["state_json"]).get("prompt_confirmation") == expected
+                       for row in rows)
+
+    def _prompt_shot(self, prompt: ComicPromptArtifact) -> ComicShot:
+        with self.projects._connect() as connection:
+            return ComicShot.model_validate_json(self.projects._version_payload(
+                connection, prompt.project_id, "shot", prompt.shot_id, prompt.shot_version))
+
+    def _external_image(
+        self, prompt: ComicPromptArtifact, *, content_sha256: str | None = None,
+    ) -> ArtifactRecord | None:
+        # 在原 Artifact 表按 Prompt 归属筛选；不读取其他项目的图片内容，不写 Core 表。
+        query = (
+            "SELECT id FROM artifacts WHERE type=? AND source='comic.external_image' "
+            "AND status='ready' AND json_extract(metadata_json, '$.project_id')=? "
+            "AND json_extract(metadata_json, '$.shot_id')=? "
+            "AND json_extract(metadata_json, '$.prompt_artifact_id')=?"
+        )
+        parameters = [ArtifactType.IMAGE.value, prompt.project_id,
+                      prompt.shot_id, prompt.artifact_id]
+        if content_sha256 is not None:
+            query += " AND json_extract(metadata_json, '$.sha256')=?"
+            parameters.append(content_sha256)
+        with self.runtime._connect() as connection:
+            row = connection.execute(query + " ORDER BY created_at DESC,id DESC LIMIT 1",
+                                     parameters).fetchone()
+        return self.runtime.get_artifact(row["id"]) if row else None
 
     def payload(self, prompt: ComicPromptArtifact) -> dict:
-        shot = next(item for item in self.storyboards.shot_versions(prompt.shot_id)
-                    if item.version == prompt.shot_version)
-        uploaded = next((item for item in self.runtime.list_artifacts(type=ArtifactType.IMAGE)
-                         if item.source == "comic.external_image" and item.status == "ready"
-                         and item.metadata.get("prompt_artifact_id") == prompt.artifact_id
-                         and item.metadata.get("project_id") == prompt.project_id
-                         and item.metadata.get("shot_id") == prompt.shot_id), None)
+        shot = self._prompt_shot(prompt)
+        uploaded = self._external_image(prompt)
         return {**prompt.model_dump(mode="json"), "final_prompt": image_prompt(prompt),
                 "shot_sequence_number": shot.sequence_number, "shot_subject": shot.subject,
                 "user_confirmed": self.confirmed(prompt),
@@ -401,16 +645,13 @@ class ComicPromptStore:
             raise ToolError("文件内容不是有效的 PNG、JPEG 或 WebP 图片",
                             detail="module=external_image.validate")
         digest = hashlib.sha256(content).hexdigest()
-        duplicate = next((item for item in self.runtime.list_artifacts(type=ArtifactType.IMAGE)
-                          if item.source == "comic.external_image"
-                          and item.metadata.get("prompt_artifact_id") == prompt.artifact_id
-                          and item.metadata.get("sha256") == digest), None)
+        duplicate = self._external_image(prompt, content_sha256=digest)
         if duplicate is None:
-            output_dir.mkdir(parents=True, exist_ok=True)
+            output_dir = validate_runtime_path(output_dir)
             suffix = {"data:image/png;base64": ".png", "data:image/jpeg;base64": ".jpg",
                       "data:image/webp;base64": ".webp"}[header]
             path = output_dir / (uuid4().hex + suffix)
-            path.write_bytes(content)
+            atomic_write_bytes(path, content)
             duplicate = ArtifactRecord(
                 id=f"artifact-{uuid4().hex}", type=ArtifactType.IMAGE,
                 run_id=run_id, conversation_id=conversation_id,
@@ -438,7 +679,7 @@ class ComicPromptStore:
                     self.runtime.insert_artifact(connection, duplicate)
             except Exception:
                 # 仅清理本次创建的随机文件；不触碰用户原图或任何历史 Artifact。
-                path.unlink(missing_ok=True)
+                get_runtime_paths().remove_file(path, file_type="artifact")
                 raise
         logger.info("COMIC_EXTERNAL_IMAGE_IMPORTED trace_id={} project_id={} shot_id={} "
                     "prompt_artifact_id={} artifact_id={} status=image_uploaded",
@@ -516,6 +757,62 @@ class ComicPromptStore:
             ).fetchall()
         return [ComicPromptArtifact.model_validate_json(row["payload_json"]) for row in rows]
 
+    def delete_version(
+        self, shot_id: str, *, version: int, expected_project_version: int,
+    ) -> dict[str, Any]:
+        """删除单个历史 Prompt 版本。
+
+        与 restore 同源：都只操作 comic_entity_versions 中 prompt 实体的行。
+        两条硬约束：
+          ① 当前正在使用的版本不可删（删了会让 comic_prompts.current_version 悬空）；
+          ② 删除也追加一次作品修订，历史链上不会出现"无记录的空档"。
+        """
+        shot = self.storyboards.get_shot(shot_id)
+        with self.projects._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT current_version FROM comic_projects WHERE project_id=?",
+                (shot.project_id,),
+            ).fetchone()
+            if row is None or int(row["current_version"]) != expected_project_version:
+                raise ToolError("作品已由其他操作更新，请刷新后重试")
+            current = connection.execute(
+                "SELECT prompt_id,current_version FROM comic_prompts WHERE shot_id=?",
+                (shot_id,),
+            ).fetchone()
+            if current is None:
+                raise ToolError("当前镜头尚无 Prompt 资产")
+            prompt_id = str(current["prompt_id"])
+            if int(current["current_version"]) == version:
+                raise ToolError(
+                    "当前正在使用的 Prompt 版本不能删除",
+                    detail="请先把其他版本恢复为新版本，再删除这一版",
+                )
+            existing = connection.execute(
+                "SELECT 1 FROM comic_entity_versions WHERE project_id=? "
+                "AND entity_type='prompt' AND entity_id=? AND version=?",
+                (shot.project_id, prompt_id, version),
+            ).fetchone()
+            if existing is None:
+                raise ToolError("找不到指定 Prompt 版本")
+            connection.execute(
+                "DELETE FROM comic_entity_versions WHERE project_id=? "
+                "AND entity_type='prompt' AND entity_id=? AND version=?",
+                (shot.project_id, prompt_id, version),
+            )
+            project_version = self.projects._advance_project(
+                connection, shot.project_id, expected_project_version,
+            )
+        logger.info(
+            "comic prompt version deleted project_id={} shot_id={} prompt_id={} "
+            "deleted_version={} project_version={}",
+            shot.project_id, shot_id, prompt_id, version, project_version,
+        )
+        return {
+            "shot_id": shot_id, "prompt_id": prompt_id,
+            "deleted_version": version, "project_version": project_version,
+        }
+
     def save(
         self, shot_id: str, draft: ComicPromptDraft, *, expected_project_version: int,
         expected_shot_version: int, model_target: str, compiler_version: str,
@@ -524,10 +821,36 @@ class ComicPromptStore:
     ) -> ComicPromptArtifact:
         # 外部模型调用在事务外；事务内再次验证所有来源版本，避免保存过时结果。
         snapshot, director, storyboard, shot, assets = self.source(shot_id)
+        previous = self.get(shot_id) if source in {"edited", "restored"} else None
+        if (previous and previous.context_sources.get("bible_contract") == BIBLE_CONTRACT
+                and draft.context_version != CONTEXT_VERSION):
+            raise ToolError("不能将结构化 Prompt 降级为未分段正文",
+                            detail="module=prompt.sections schema=separated-contexts-1")
         if draft.context_version == CONTEXT_VERSION:
             draft = draft.model_copy(update=prompt_sections(draft.positive_prompt))
             if not draft.negative_prompt.strip():
                 raise ToolError("完整 Prompt 缺少禁止内容", detail="module=prompt.sections")
+            inherited_sources = (previous.context_sources if source == "edited" and previous
+                                 else draft.context_sources)
+            contexts = None
+            if (inherited_sources.get("bible_contract") == BIBLE_CONTRACT
+                    or (previous and previous.context_sources.get("bible_contract")
+                        == BIBLE_CONTRACT)):
+                try:
+                    contexts = ComicPromptContexts.from_sections({
+                        name: getattr(draft, name) for name in PROMPT_SECTIONS})
+                    fixed = contexts.model_copy(deep=True)
+                    _asset_context(fixed, assets)
+                    if fixed != contexts:
+                        raise ValueError("固定资产字段必须保留在对应 Context 字段")
+                except (ValueError, ValidationError) as error:
+                    raise ToolError(
+                        "Prompt Context 字段不合法，请将动作和摄影信息放入 Shot Context",
+                        detail="module=prompt.sections schema=separated-contexts-1",
+                    ) from error
+                sections = contexts.sections()
+                draft = draft.model_copy(update={**sections, "positive_prompt": "\n\n".join(
+                    heading + "\n" + sections[name] for name, heading in PROMPT_SECTIONS.items())})
             # 固定资产不会因编辑自由文本而变成另一个角色/世界/风格。
             facts = [value for asset in assets
                      for value in asset.details.model_dump(exclude={"kind"}).values() if value]
@@ -535,7 +858,6 @@ class ComicPromptStore:
                    for item in (value if isinstance(value, list) else [value])):
                 raise ToolError("完整 Prompt 遗漏固定资产信息", detail="module=prompt.sections")
             if source in {"edited", "restored"}:
-                previous = self.get(shot_id)
                 draft.context_sources = {
                     **(previous.context_sources if source == "edited" else draft.context_sources),
                     "source_type": "manual_edit", "run_id": run_id,
@@ -547,11 +869,17 @@ class ComicPromptStore:
                 for name in (*PROMPT_SECTIONS, "negative_prompt", "director_summary"):
                     if source == "restored" or getattr(previous, name) != getattr(draft, name):
                         fields[name] = {
+                            **fields.get(name, {}),
                             "source_type": "manual_edit", "trust_status": "creative_choice",
                             "value_sha256": value_hash(getattr(draft, name)), "run_id": run_id,
+                            "model_request_id": None,
                             "source_artifact_id": previous.artifact_id,
                         }
                 draft.context_sources["field_provenance"] = fields
+            if contexts is not None:
+                draft.context_sources = {**draft.context_sources,
+                                         "bible_contract": BIBLE_CONTRACT,
+                                         "structured_contexts": contexts.model_dump()}
         required = [*snapshot.creative_brief.hard_constraints, *director.constraints]
         for asset in assets:
             required.extend(asset.fixed_constraints)

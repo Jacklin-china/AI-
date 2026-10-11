@@ -91,6 +91,13 @@ from kantoku.core.runtime.store import RuntimeStore
 from kantoku.core.skills import SkillLoader, SkillRegistry
 from kantoku.domains.comic import ComicState, build_comic_workflow
 from kantoku.domains.comic.assets import ComicAssetStore
+from kantoku.domains.comic.context_declaration import (
+    BIBLE_GROUP_TO_SLOT,
+    CINEMATOGRAPHY_LEAVES,
+    INHERIT_KEYS,
+    EDIT_SCOPE_KEYS,
+    BIBLE_SOURCE_KEYS,
+)
 from kantoku.domains.comic.coordinator import (
     DIRECTOR_STAGES,
     ComicDirectorCoordinator,
@@ -2852,8 +2859,7 @@ class StudioApplication:
                     source_lock = None
                 bibles = self.comic_projects.locked_bibles(source_project, source_lock) \
                     if source_lock else {}
-                allowed = {"character_context", "world_context", "style_context",
-                           "camera_style", "color", "lighting"}
+                allowed = set(INHERIT_KEYS)
                 leaves = {f"{group}.{field}": getattr(body, field)
                           for group, body in (("director_plan", spec.director_plan),
                                               ("cinematography", spec.cinematography))
@@ -2903,18 +2909,15 @@ class StudioApplication:
                     if source_lock and field in source_lock["bible_sources"]:
                         bible_sources[field] = {**source_lock["bible_sources"][field],
                                                 "project_id": source_project}
-                    if field in {"character_context", "world_context", "style_context"}:
+                    if field in BIBLE_SOURCE_KEYS:
                         leaf = {"character_context": "character_presence",
                                 "world_context": "subject_environment_relation",
                                 "style_context": "style_boundary"}[field]
                         if defaults[field]:
                             retained_director_fields[f"director_plan.{leaf}"] = defaults[field]
                     camera_fields = {
-                        "camera_style": {"shot_size", "camera_angle", "camera_distance",
-                                         "spatial_feel", "camera_language", "depth_strategy",
-                                         "lens_or_spatial_feel", "material_language"},
-                        "color": {"color_relationship"},
-                        "lighting": {"lighting", "light_source", "light_direction"}}
+                        field: set(CINEMATOGRAPHY_LEAVES.get(field, frozenset()))
+                        for field in CINEMATOGRAPHY_LEAVES}
                     if camera is None:
                         camera_fields.update(camera_style={"camera_language"},
                                              lighting={"lighting"})
@@ -2934,10 +2937,9 @@ class StudioApplication:
                                    "style": "style_context"}[asset.details.kind]
                         if section in reference.fields:
                             retained_assets.append(asset)
-            scopes = {"character_context", "world_context", "style_context",
-                      "camera_style", "color", "lighting", "action"} - {
-                          field for source in references for field in source.fields}
-            changes = scopes & {"character_context", "world_context", "style_context"}
+            scopes = set(EDIT_SCOPE_KEYS) - {
+                field for source in references for field in source.fields}
+            changes = scopes & set(BIBLE_SOURCE_KEYS)
             original = request.task
             user_constraints = [fact.value for task in resolution.tasks
                 if task.task_id == resolution.current_task_id for fact in task.facts
@@ -3025,7 +3027,7 @@ class StudioApplication:
                     baseline = self.comic_projects.get_director(project_id)
                     scopes = ComicContextBuilder.resolve_edit_scopes(
                         request.task, baseline, model_call=self._comic_intent_model)
-                    changes = scopes & {"character_context", "world_context", "style_context"}
+                    changes = scopes & set(BIBLE_SOURCE_KEYS)
                     if (not scopes - {"action"}
                             and self.comic_projects.human_director_confirmed(baseline)):
                         return self._continue_comic_shot(project_id, request, lock)
@@ -3885,7 +3887,7 @@ class StudioApplication:
             result = self.comic_prompts.payload(prompt)
             if lock is not None:
                 sources = dict(lock["bible_sources"])
-                for field in ("character_context", "world_context", "style_context"):
+                for field in BIBLE_SOURCE_KEYS:
                     sources.setdefault(field, {"shot_id": prompt.shot_id, "version": prompt.version,
                                                "prompt_id": prompt.prompt_id,
                                                "artifact_id": prompt.artifact_id})
@@ -3941,7 +3943,7 @@ class StudioApplication:
                 if lock:
                     bibles = self.comic_projects.locked_bibles(current.project_id, lock)
                     sources = dict(lock["bible_sources"])
-                    for field in ("character_context", "world_context", "style_context"):
+                    for field in BIBLE_SOURCE_KEYS:
                         if bibles.get(field) != getattr(current, field):
                             sources[field] = {"shot_id": current.shot_id,
                                               "prompt_id": current.prompt_id,
