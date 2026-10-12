@@ -51,24 +51,17 @@ const exportText = computed(() => {
   return ['漫剧制作材料', '以下为文字说明；图片需另行随附提交给视频工具。', '', ...lines].join('\n')
 })
 
-/** 04 改图指令：右侧结构化卡片的四块内容。
-    真实性约束：后端不提供「图片分析报告」与「用户修改需求」实体，
-    因此这三项一律由已有的真实信息（成图、镜头号、Prompt 版本）推导，
-    并在无图时明确留空，不伪造分析结论。 */
+/** 04 改图指令：结构化卡片内容全部来自用户真实输入 + 已登记的真实成图信息。
+    真实性约束：后端不提供「图片分析报告」「用户修改需求」「修改建议」实体，
+    因此不预置任何编造文案；用户没写就显示空态提示，不伪造需求或建议。 */
 const previewUrl = computed(() => (props.featured?.preview_url ? String(props.featured.preview_url) : ''))
-const requirementSummary = computed(() => {
-  if (!hasImages.value) return '尚未导入成图，暂无修改需求。'
-  return `调整镜头 ${props.featured?.shot_sequence_number ?? '?'} 的画面表现：降低抢眼元素、柔和光线，保留原有氛围。`
-})
-const suggestionSummary = computed(() => {
-  if (!hasImages.value) return '导入成图后，可在此记录针对性的修改建议。'
-  return '降低高光与抢眼客体，保持主体清晰；不做结构性重绘，避免破坏已确认的构图。'
-})
+/** 用户在 03 图片优化页或本页写下的修改诉求（本地会话状态，不承诺持久化）。 */
+const requirement = ref('')
 const revisionInstruction = computed(() => {
-  if (!hasImages.value) return ''
+  const text = requirement.value.trim()
+  if (!text || !hasImages.value) return ''
   return [
-    `用户修改需求：${requirementSummary.value}`,
-    `修改建议：${suggestionSummary.value}`,
+    `用户修改需求：${text}`,
     `请基于附上的原图（${imageName.value}）编辑。`,
     '需要保持不变：人物身份 · 服装与物件 · 画面构图 · 已确认的风格基调。',
   ].join('\n')
@@ -144,19 +137,25 @@ function conflictOf(shot: StoryShot): string {
             </div>
           </section>
 
+          <!-- 用户修改需求：由用户本人填写，不预置任何编造内容。 -->
           <section class="rev-card">
             <span class="section-kicker">用户修改需求</span>
-            <p class="rev-text">{{ requirementSummary }}</p>
+            <textarea v-model="requirement" class="rev-input" rows="3"
+              :disabled="!hasImages"
+              :placeholder="hasImages ? '写下你想要的修改，如：光线柔和一点，保留人物和构图。' : '请先到「图片优化」导入成图。'"></textarea>
+            <small v-if="!requirement.trim()" class="rev-hint">尚未填写修改需求。填好后下方会同步生成完整改图指令。</small>
           </section>
 
+          <!-- 修改建议：后端无分析能力，只说明现状，不摆放编造建议。 -->
           <section class="rev-card">
             <span class="section-kicker">修改建议</span>
-            <p class="rev-text">{{ suggestionSummary }}</p>
+            <p class="rev-text rev-muted">暂无系统建议。图片分析能力接入后，这里会给出针对性的修改建议。</p>
           </section>
 
           <section class="rev-card rev-final">
             <span class="section-kicker">完整的改图指令</span>
-            <pre class="rev-pre">{{ revisionInstruction }}</pre>
+            <pre v-if="revisionInstruction" class="rev-pre">{{ revisionInstruction }}</pre>
+            <p v-else class="rev-text rev-muted">填写「用户修改需求」后，这里会生成可直接复制的完整改图指令。</p>
           </section>
 
           <section class="rev-card">
@@ -166,10 +165,11 @@ function conflictOf(shot: StoryShot): string {
         </div>
 
         <aside class="rev-side">
-          <button class="ui-button primary" :disabled="!hasImages || busy" @click="copyText(revisionInstruction, '改图指令', 'revision')">
+          <button class="ui-button primary" :disabled="!hasImages || !revisionInstruction || busy" @click="copyText(revisionInstruction, '改图指令', 'revision')">
             <Copy :size="15" /> 复制改图指令
           </button>
           <small v-if="!hasImages">需要先有真实成图才能整理改图指令。</small>
+          <small v-else-if="!revisionInstruction">先填写「用户修改需求」。</small>
           <template v-else>
             <small>复制后请在外部工具同时附上原图。</small>
             <div class="rev-wait">
@@ -342,6 +342,10 @@ function conflictOf(shot: StoryShot): string {
 .rev-attach-meta strong { font-size: var(--font-control); font-weight: var(--weight-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rev-attach-meta small { color: var(--text-muted); font-size: var(--font-meta); line-height: 1.6; }
 .rev-text { margin:0; color: var(--text-secondary); font-size: var(--font-body); line-height: 1.7; }
+.rev-text.rev-muted { color: var(--text-muted); font-size: var(--font-meta); }
+.rev-input { width:100%; padding: var(--space-3); border:1px solid var(--border-strong); border-radius: var(--radius-control); background:#fff; color: var(--text-primary); font: inherit; font-size: var(--font-control); line-height: 1.65; resize: vertical; }
+.rev-input:disabled { background: var(--surface-subtle); color: var(--text-muted); cursor: not-allowed; }
+.rev-hint { color: var(--text-muted); font-size: var(--font-kicker); }
 .rev-final { border-color: var(--border-strong); background: var(--surface-subtle); }
 .rev-pre { margin:0; color: var(--text-primary); font-size: var(--font-control); line-height: 1.75; white-space: pre-wrap; }
 .rev-side { display: grid; gap: var(--space-3); padding: var(--space-5); border: 1px solid var(--border-muted); border-radius: var(--radius-panel); background: var(--surface-subtle); }

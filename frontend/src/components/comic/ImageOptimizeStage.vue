@@ -7,8 +7,9 @@ import { Check, ChevronDown, ImagePlus, Lock, Paperclip, Sparkles, Wand2 } from 
    数据全部由 DirectorWorkspace 通过 props 注入（它已持有 uploadedPrompts / featuredPrompt 等真实数据）。
 
    真实性约束（design-spec §4.1 / §10，与 ComicFlowStage 一致）：
-   后端当前不提供「图片分析报告」，因此右侧「可改善点」一律标注为「示例」，
-   绝不显示「分析完成」；能真实做的（复制文字、登记已导入图片）才提供按钮。 */
+   后端当前不提供「图片分析报告」，因此右侧「可改善点」不预置任何编造内容，
+   而是渲染为空态（"待接入图片分析"），绝不显示「分析完成」或假的分析结论。
+   能真实做的（用户自己写修改诉求、复制文字、登记已导入图片）才提供按钮。 */
 
 const props = defineProps<{
   uploaded: Record<string, unknown>[]
@@ -35,30 +36,18 @@ const keepSummary = '人物、表情、手势、服装、饮品与构图'
 /** 用户补充的修改诉求（本地会话状态，不承诺持久化）。 */
 const requirement = ref('')
 
-/** 可改善点：当前后端无分析能力，用「示例」占位说明版式与交互，
-   不假装是真实分析结果。 */
-interface Improvement { id: number; title: string; evidence: string; suggestion: string; tag: string }
-const samples: Improvement[] = [
-  { id: 1, title: '上方背景高光偏亮', evidence: '人物上方逆光区域较亮。', suggestion: '降低高光，保留逆光氛围。', tag: '定位可调整 · 忽略' },
-  { id: 2, title: '右侧车辆较抢眼', evidence: '右侧的车辆较为醒目。', suggestion: '可适当降低车辆的存在感。', tag: '定位可调整 · 忽略' },
-]
-const selected = ref<number[]>([1])
-function toggleSample(id: number): void {
-  selected.value = selected.value.includes(id) ? selected.value.filter(item => item !== id) : [...selected.value, id]
-}
-
-/** 整理修改指令：只产出文字，明确不含图片本体；真正的改图在外部工具完成。 */
+/** 整理修改指令：只产出用户真实输入的文字，明确不含图片本体；
+    真正的改图在外部工具完成。无可写内容时按钮禁用，不编造指令。 */
 async function organize(): Promise<void> {
-  const parts: string[] = []
-  if (requirement.value.trim()) parts.push(`用户修改需求：${requirement.value.trim()}`)
-  const picked = samples.filter(item => selected.value.includes(item.id))
-  if (picked.length) parts.push(`修改建议：${picked.map(item => item.suggestion).join(' ')}`)
+  const text = requirement.value.trim()
+  if (!text) return
+  const parts = [`用户修改需求：${text}`]
   if (imageName.value) parts.push(`请基于附上的原图（${imageName.value}）编辑。`)
   parts.push(`需要保持不变：${keepSummary}。`)
-  const text = parts.join('\n')
-  const ok = await copyToClipboard(text)
+  const payload = parts.join('\n')
+  const ok = await copyToClipboard(payload)
   copied.value = ok
-  emit('copy', text, '修改指令')
+  emit('copy', payload, '修改指令')
 }
 async function copyToClipboard(text: string): Promise<boolean> {
   try {
@@ -79,7 +68,7 @@ async function copyToClipboard(text: string): Promise<boolean> {
     </header>
 
     <div class="opt-grid">
-      <!-- 中间：大图预览 + 编号热点 -->
+      <!-- 中间：大图预览 -->
       <figure class="opt-canvas">
         <div class="opt-canvas-frame">
           <div v-if="hasImages" class="opt-canvas-media" :aria-label="imageName">
@@ -90,7 +79,6 @@ async function copyToClipboard(text: string): Promise<boolean> {
             <p>尚未导入成图</p>
             <button class="ui-button sm" @click="emit('go', 'prompt')">到生图指令准备图片</button>
           </div>
-          <span v-for="point in samples" :key="point.id" class="opt-hotspot" :data-index="point.id">{{ point.id }}</span>
         </div>
         <figcaption>
           <span>{{ imageName || '参考图片预览 · 设计素材' }}</span>
@@ -105,44 +93,29 @@ async function copyToClipboard(text: string): Promise<boolean> {
         </figcaption>
       </figure>
 
-      <!-- 右侧：可改善点 + 保留约束 + 整理指令 -->
+      <!-- 右侧：可改善点（空态） + 保留约束 + 整理指令 -->
       <aside class="opt-panel">
         <div class="opt-panel-head">
-          <h4>可改善点（示例）</h4>
-          <small>示例分析</small>
+          <h4>可改善点</h4>
+          <small>待接入图片分析</small>
         </div>
-        <ol class="opt-list">
-          <li v-for="point in samples" :key="point.id" :class="{ 'is-picked': selected.includes(point.id) }">
-            <span class="opt-index">{{ point.id }}</span>
-            <div class="opt-body">
-              <strong>{{ point.title }}</strong>
-              <div class="opt-evidence">
-                <span class="opt-evidence-thumb" aria-hidden="true"></span>
-                <p>{{ point.evidence }}</p>
-              </div>
-              <div class="opt-suggest">
-                <span>修改建议</span>
-                <p>{{ point.suggestion }}</p>
-              </div>
-              <label class="opt-pick">
-                <input type="checkbox" :checked="selected.includes(point.id)" @change="toggleSample(point.id)" />
-                <span>加入本次修改</span>
-              </label>
-              <small class="opt-tag">{{ point.tag }}</small>
-            </div>
-          </li>
-        </ol>
+        <!-- 后端暂无图片分析能力：不给任何编造条目，只说明现状与可做的动作。 -->
+        <div class="opt-empty">
+          <Sparkles :size="18" />
+          <p>尚无分析结果。图片分析能力接入后，这里会列出可改善之处并支持定位。</p>
+          <p class="opt-empty-hint">现在可在下方直接写下你的修改诉求。</p>
+        </div>
 
         <details class="opt-keep" :open="keepOpen" @toggle="keepOpen = ($event.target as HTMLDetailsElement).open">
           <summary><Lock :size="14" /> 保留{{ keepSummary }}<ChevronDown :size="14" class="opt-keep-arrow" /></summary>
-          <p>光线柔和一点，保留人物和构图。</p>
+          <p>默认保护人物与构图；如需放宽某项，请在修改诉求里明确写出。</p>
         </details>
 
         <div class="opt-compose">
-          <textarea v-model="requirement" class="opt-input" rows="2" placeholder="补充你的修改诉求，如：光线柔和一点，保留人物和构图。"></textarea>
+          <textarea v-model="requirement" class="opt-input" rows="2" placeholder="写下你的修改诉求，如：光线柔和一点，保留人物和构图。"></textarea>
           <div class="opt-compose-actions">
             <Paperclip :size="15" class="opt-clip" />
-            <button class="ui-button primary" :disabled="!hasImages || busy" @click="organize">
+            <button class="ui-button primary" :disabled="!hasImages || !requirement.trim() || busy" @click="organize">
               <Wand2 :size="15" /> 整理修改指令
             </button>
           </div>
@@ -174,9 +147,6 @@ async function copyToClipboard(text: string): Promise<boolean> {
 .opt-canvas-media :deep(img) { width: 100%; height: 100%; max-height: 60vh; object-fit: contain; display: block; }
 .opt-canvas-empty { display: grid; place-items: center; gap: var(--space-2); padding: var(--space-8); color: var(--text-muted); text-align: center; }
 .opt-canvas-empty p { margin: 0; font-size: var(--font-control); }
-.opt-hotspot { position: absolute; display: grid; place-items: center; width: 22px; height: 22px; border-radius: var(--radius-pill); background: rgba(20,24,31,.62); color: #fff; font-size: var(--font-kicker); font-weight: 600; }
-.opt-hotspot[data-index="1"] { top: 12%; right: 14%; }
-.opt-hotspot[data-index="2"] { bottom: 32%; right: 8%; }
 .opt-canvas figcaption { display: grid; gap: var(--space-3); color: var(--text-muted); font-size: var(--font-kicker); }
 .opt-caption-thumb { display: flex; align-items: center; gap: var(--space-3); padding: var(--space-3); border: 1px solid var(--border-muted); border-radius: var(--radius-control); background: var(--surface); }
 .opt-thumb, .opt-thumb-empty { display: grid; place-items: center; width: 44px; height: 44px; flex: 0 0 auto; overflow: hidden; border: 1px solid var(--border-muted); border-radius: var(--radius-control); background: var(--canvas-inset); color: var(--text-muted); }
@@ -189,20 +159,10 @@ async function copyToClipboard(text: string): Promise<boolean> {
 .opt-panel-head h4 { margin: 0; font-size: var(--font-body); font-weight: var(--weight-medium); color: var(--text-primary); }
 .opt-panel-head small { display: block; margin-top: var(--space-1); color: var(--text-muted); font-size: var(--font-kicker); }
 
-.opt-list { display: grid; gap: var(--space-3); margin: 0; padding: 0; list-style: none; }
-.opt-list > li { display: grid; grid-template-columns: auto 1fr; gap: var(--space-3); padding: var(--space-4); border: 1px solid var(--border-muted); border-radius: var(--radius-control); background: var(--surface); transition: border-color var(--duration-fast) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard); }
-.opt-list > li.is-picked { border-color: var(--accent-ring); box-shadow: 0 0 0 2px var(--accent-ring); }
-.opt-index { display: grid; place-items: center; width: 20px; height: 20px; border-radius: var(--radius-pill); background: var(--canvas-inset); color: var(--text-secondary); font-size: var(--font-kicker); font-weight: 600; }
-.opt-body { display: grid; gap: var(--space-2); min-width: 0; }
-.opt-body strong { font-size: var(--font-control); font-weight: var(--weight-medium); color: var(--text-primary); }
-.opt-evidence { display: grid; grid-template-columns: 62px 1fr; gap: var(--space-3); align-items: center; }
-.opt-evidence-thumb { height: 40px; border-radius: var(--radius-tile); background: linear-gradient(135deg, var(--canvas-inset), var(--border-muted)); }
-.opt-evidence p { margin: 0; color: var(--text-secondary); font-size: var(--font-meta); line-height: var(--line-body); }
-.opt-suggest { display: grid; gap: var(--space-1); }
-.opt-suggest > span { color: var(--text-muted); font-size: var(--font-kicker); }
-.opt-suggest p { margin: 0; color: var(--text-secondary); font-size: var(--font-meta); line-height: var(--line-body); }
-.opt-pick { display: inline-flex; align-items: center; gap: var(--space-2); color: var(--text-secondary); font-size: var(--font-meta); cursor: pointer; }
-.opt-tag { color: var(--text-muted); font-size: var(--font-kicker); }
+/* 空态：后端无图片分析能力，明确说明现状，不摆放任何编造的分析条目。 */
+.opt-empty { display: grid; gap: var(--space-2); justify-items: start; padding: var(--space-5); border: 1px dashed var(--border-strong); border-radius: var(--radius-control); background: var(--surface); color: var(--text-muted); }
+.opt-empty p { margin: 0; font-size: var(--font-meta); line-height: var(--line-body); }
+.opt-empty-hint { color: var(--text-secondary); }
 
 .opt-keep { border: 1px solid var(--border-muted); border-radius: var(--radius-control); background: var(--surface); }
 .opt-keep summary { display: flex; align-items: center; gap: var(--space-2); padding: var(--space-3) var(--space-4); cursor: pointer; color: var(--text-secondary); font-size: var(--font-meta); }

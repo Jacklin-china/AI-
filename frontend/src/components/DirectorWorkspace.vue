@@ -53,9 +53,11 @@ const selectedRun = ref('')
 const selectedStage = ref(route.value.directorStage ?? 'director_assemble')
 /* 内部 section 沿用旧的 'director'（画面方案/导演节点）与 'storyboard'（生图指令）语义，
    避免大规模重写 1600 行组件的取数逻辑；七步导航 id 只在边界处做一次映射。
-   规划：01画面方案/02生图指令/03图片优化/04改图指令 先复用现有 director·storyboard·assets 分支；
-   05版本比较/06故事编排/07导出材料 由下方新增分支承载。 */
-const sectionAliasesToInternal: Record<string, string> = { plan: 'director', prompt: 'storyboard', optimize: 'assets', revision: 'assets' }
+   01画面方案/02生图指令 复用现有 director·storyboard 分支；
+   03图片优化/04改图指令/05版本比较/06故事编排/07导出材料 均由各自独立分支承载。
+   注意：optimize / revision 曾经被临时映射到 'assets'（占位），导致点击这两步会落到
+   「作品素材」页；现在它们已有真实分支，必须保持 1:1，不再并入 assets。 */
+const sectionAliasesToInternal: Record<string, string> = { plan: 'director', prompt: 'storyboard' }
 const internalToSectionAlias: Record<string, string> = { director: 'plan', storyboard: 'prompt' }
 function toInternalSection(page: string): string { return sectionAliasesToInternal[page] ?? page }
 function toNavId(internal: string): string { return internalToSectionAlias[internal] ?? internal }
