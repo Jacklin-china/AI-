@@ -129,4 +129,11 @@
   /* ---- Motion（仅响应用户动作） ---- */
   --motion-fast: 120ms ease;
   --motion-med: 180ms ease;
+  /* 别名：全站组件按"时长 / 缓动分离"的写法引用（transition: background var(--duration-fast) var(--ease-standard)）。
+     此前只有 --motion-* 组合值，导致 var(--duration-*) / var(--ease-*) 全部未定义、过渡被浏览器静默吞掉。
+     这里补齐语义化拆分为别名，不改任何调用点即可恢复原意。 */
+  --duration-fast: 120ms;
+  --duration-med: 180ms;
+  --ease-standard: ease;
+  --ease-out: cubic-bezier(.2, .8, .3, 1);
 }
