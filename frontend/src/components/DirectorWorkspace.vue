@@ -1532,6 +1532,9 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
               </div>
               </Transition>
             <section v-show="chatExpanded" ref="timeline" class="workspace-messages" aria-label="连续创作对话" @scroll="scrollState">
+              <!-- 载入对话期间只显示占位，避免先渲染"只有用户消息"的中间态再补上 AI 回复（视觉闪烁）。 -->
+              <p v-if="loading" class="conversation-loading" role="status">正在载入对话…</p>
+              <template v-else>
               <p v-if="!chatTurns.length && !pendingText" class="conversation-welcome">描述你的故事与画面，生成导演方案后可修改并确认，再进入分镜准备镜头 Prompt。</p>
               <article v-for="turn in chatTurns" :key="turn.id" class="creative-turn">
                 <UserMessageBubble v-if="turn.role === 'user'" :content="turn.content" />
@@ -1545,6 +1548,7 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                 <UserMessageBubble :content="input.text" />
                 <div class="queued-note"><span>补充已排队 · 当前方案结束后处理 · {{ input.mode === 'professional' ? '专业模式' : '普通模式' }}</span><button class="ui-button quiet sm" @click="queuedInputs = queuedInputs.filter(item => item.id !== input.id)">撤回</button></div>
               </article>
+              </template>
               <button v-if="queuedInputs.length && error && !busy && !hasRunning" class="ui-button sm" @click="dispatchQueued(true)">继续处理已发送的补充</button>
               <p v-if="error" class="workspace-error" role="alert">{{ error }}</p>
               <p v-if="dirty" class="pane-note">有未保存的节点修改。切换节点会保留草稿；保存并重新审核后才能确认。</p>
@@ -1593,8 +1597,10 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
           <p v-if="legacyOnly" class="pane-note">此历史任务没有作品级 Project；点击"新作品"进入作品级创作。</p>
           <div v-if="busy || hasRunning" class="execution-controls" role="status"><span>{{ executionLabel }} · 可继续输入</span><button v-if="hasRunning" class="ui-button quiet sm" :disabled="cancelling" @click="cancelExecution">{{ cancelling ? '正在取消' : '取消当前任务' }}</button></div>
           <p v-if="!chatExpanded && error" class="workspace-error" role="alert">{{ error }}</p>
-          <MessageComposer :key="activeConversationId" ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
-          <small>{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '确认导演方案，生成完整 Prompt，复制到外部模型后上传图片。' }}</small>
+          <!-- 输入框只在「对话」页出现；其他工作区页面去掉输入框，避免每个页面底部都挂一个大聊天框。 -->
+          <MessageComposer v-if="chatExpanded" :key="activeConversationId" ref="composer" :disabled="loading || legacyOnly" @send="sendInput" />
+          <small v-if="chatExpanded">{{ revisionVersion !== null ? '发送将保存当前方案的新修订；不会创建新创意。' : queuedInputs.length ? '补充已排队，刷新会丢失未执行补充；可在对话中撤回。' : '确认导演方案，生成完整 Prompt，复制到外部模型后上传图片。' }}</small>
+          <small v-else>需要输入时，点击上方「打开创作对话」回到对话页。</small>
         </div>
 </template>
   </WorkspaceShell>
@@ -1674,6 +1680,7 @@ select { color:var(--text-primary); background:transparent; border:1px solid var
 .workspace-messages { flex:1; min-height:0; overflow:auto; padding:var(--space-5) max(var(--space-6), calc((100% - 780px) / 2)); }
 .creative-turn { margin-bottom:var(--space-7); }
 .conversation-welcome { color:var(--text-secondary); font-size: var(--font-body); line-height:1.8; max-width:600px; padding:var(--space-8) 0; }
+.conversation-loading { color:var(--text-muted); font-size: var(--font-control); padding:var(--space-8) 0; }
 .workspace-composer { background:transparent; }
 .composer-context { display:flex; align-items:center; justify-content:space-between; gap:var(--space-2); min-height:var(--control-sm); margin-bottom:var(--space-2); }
 .composer-context small, .workspace-composer > small { color:var(--text-muted); font-size: var(--font-kicker); }
