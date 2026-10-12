@@ -63,7 +63,9 @@ export function parse(path: string): Route {
   if (parts[0] === 'history') return { name: 'tasks', tab: 'history' }
 
   if (parts[0] === 'workspace') {
-    const domain = parts[1] ?? 'studio'
+    /* 默认领域对齐侧栏「工作区」：漫剧制作是唯一对外提供的创作领域，
+       因此 /workspace 与 /workspace/comic 等价，不会落回通用创作工作台。 */
+    const domain = parts[1] ?? 'comic'
     const offset = parts[2] === 'run' && parts[3] ? 4 : 2
     const page = parts[offset]
     const node = parts[offset + 1]

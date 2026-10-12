@@ -3,7 +3,6 @@ import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
 import CommandPalette from './components/layout/CommandPalette.vue'
 import SidebarNav from './components/layout/SidebarNav.vue'
 import TopBar from './components/layout/TopBar.vue'
-import type { DomainDefinition } from './domains'
 import HomeView from './views/HomeView.vue'
 import ProductionWorkspace from './views/ProductionWorkspace.vue'
 import TasksCenter from './views/TasksCenter.vue'
@@ -45,10 +44,6 @@ function go(path: string): void {
   navigate(parse(path))
 }
 
-function openDomain(domain: DomainDefinition): void {
-  navigate({ name: 'workspace', domain: domain.id })
-}
-
 function shortcut(event: KeyboardEvent): void {
   const target = event.target
   if (target instanceof HTMLElement && (target.isContentEditable || ['INPUT', 'TEXTAREA', 'SELECT'].includes(target.tagName))) return
@@ -79,7 +74,6 @@ onBeforeUnmount(() => {
       :collapsed="sidebarCollapsed || conversationWorkspace"
       :rail="conversationWorkspace"
       @navigate="go"
-      @domain="openDomain"
       @toggle="sidebarCollapsed = !sidebarCollapsed"
     />
     <section class="app-stage">
