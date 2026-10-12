@@ -12,6 +12,7 @@ import DirectorNodeView from './DirectorNodeView.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
 import ComicShotGeneration from './ComicShotGeneration.vue'
 import ComicFlowStage from './comic/ComicFlowStage.vue'
+import ImageOptimizeStage from './comic/ImageOptimizeStage.vue'
 import { externalShotPrompt, finalImagePrompt, promptVersionDiff } from '../domains/comic/shotGeneration'
 import { createComicStoryboard } from '../services/core'
 import { comicProductionProgress } from '../domains/comic/productionProgress'
@@ -304,6 +305,8 @@ const selectedShotHint = computed(() => {
   const shot = shots.value.find(item => item.shot_id === selectedShot.value)
   return shot ? `为镜头 ${shot.sequence_number} · ${shot.subject} 生成完整 Image Prompt` : ''
 })
+// 图片优化页需要「当前镜头成图」的可直接渲染 URL（无图时为空，交由组件显示空态）。
+const featuredPreviewUrl = computed(() => featuredPrompt.value ? referenceUrls.value[uploadedArtifact(featuredPrompt.value)] ?? '' : '')
 // 历史方案必须能看出“什么时候保存的”，用户才知道它与当前作品差了多少。
 const stalePlanSavedAt = computed(() => {
   const wanted = Number((spec.value as { version?: number } | null)?.version)
@@ -1263,23 +1266,30 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
 
               <Transition name="ws-cross" mode="out-in">
               <div v-if="!chatExpanded" :key="`${section}:${selectedStage}:${selectedRun}`" ref="stageScroll" class="stage-scroll" aria-label="当前节点工作区">
-                <!-- 七步制作进度条：始终显示「我在流程的哪一步、下一步是什么」，
-                     点击可直达对应阶段。与左侧局部栏互补（这里是流程视角，侧栏是导航视角）。 -->
+                <!-- 七步制作流程条：单行椭圆胶囊（与「导演流程」同一套视觉语言），
+                     只占一行高度，避免此前两行卡片式导航挤压工作区。
+                     三态语汇：已完成=实心勾；当前=白底滑块 + 强调色；待办=空心环。 -->
                 <nav class="flow-steps" aria-label="漫剧制作流程">
-                  <button
-                    v-for="(step, index) in productionSteps"
-                    :key="step.id"
-                    :data-status="step.status"
-                    :aria-current="activeNavigation === step.id ? 'step' : undefined"
-                    :title="step.hint"
-                    @click="openSection(step.id)"
-                  >
-                    <span class="flow-steps-index">
-                      <Check v-if="step.status === 'done'" :size="12" />
-                      <template v-else>{{ String(index + 1).padStart(2, '0') }}</template>
-                    </span>
-                    <span class="flow-steps-body"><strong>{{ step.label }}</strong><small>{{ step.hint }}</small></span>
-                  </button>
+                  <div class="flow-steps-rail">
+                    <button
+                      v-for="(step, index) in productionSteps"
+                      :key="step.id"
+                      type="button"
+                      :data-status="step.status"
+                      :aria-current="activeNavigation === step.id ? 'step' : undefined"
+                      :title="`${String(index + 1).padStart(2, '0')} ${step.label} · ${step.hint}`"
+                      @click="openSection(step.id)"
+                    >
+                      <span class="flow-steps-index">
+                        <Check v-if="step.status === 'done'" :size="12" />
+                        <template v-else>{{ String(index + 1).padStart(2, '0') }}</template>
+                      </span>
+                      <span class="flow-steps-body">
+                        <strong>{{ step.label }}</strong>
+                        <small>{{ step.hint }}</small>
+                      </span>
+                    </button>
+                  </div>
                 </nav>
                 <template v-if="section === 'director'">
 <nav class="director-flow" aria-label="导演流程">
@@ -1489,10 +1499,22 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
                   <div v-if="deletionFailures.length" class="delete-failures" role="alert"><p>{{ deletionFailures.length }} 项未完成，请刷新核实后重试：</p><ul><li v-for="failure in deletionFailures" :key="failure.label">{{ failure.label }}：{{ failure.reason }}</li></ul></div>
                   <h3>真实执行记录</h3><button v-for="item in executions" :key="item.run_id" class="history-task" @click="openDraft(item.run_id)">{{ item.director_execution_summary.mode === 'fast' ? '普通模式' : '专业模式' }} · {{ directorStateLabels[item.status] ?? item.status }}<small>{{ item.run_id }}</small></button>
                 </template>
-                <!-- 04 改图指令 / 05 版本比较 / 06 故事编排 / 07 导出材料：
+                <!-- 03 图片优化 / 04 改图指令 / 05 版本比较 / 06 故事编排 / 07 导出材料：
                      这些页面按 design-spec 的交互规格搭建；后端尚不具备的能力
                      （图片分析、图片版本链、选用关系、故事实体、服务端导出）
                      一律显式标识为「待接入」，不显示任何假成功。 -->
+                <template v-else-if="section === 'optimize'">
+                  <!-- 03 图片优化：只做「看图 — 挑问题 — 整理修改指令」，
+                       不复用生图控件（生图仍归属 02/分镜面板，此处保持单一入口）。 -->
+                  <ImageOptimizeStage :uploaded="uploadedPrompts" :featured="featuredPrompt" :selected-shot="selectedShot" :busy="busy || hasRunning" @copy="(text: string) => void copyText(text)" @go="openSection">
+                    <template #preview>
+                      <img v-if="featuredPreviewUrl" :src="featuredPreviewUrl" :alt="`镜头 ${featuredPrompt?.shot_sequence_number ?? ''} 成图预览`" />
+                    </template>
+                    <template #thumb>
+                      <img v-if="featuredPreviewUrl" :src="featuredPreviewUrl" alt="" />
+                    </template>
+                  </ImageOptimizeStage>
+                </template>
                 <template v-else-if="section === 'revision'">
                   <ComicFlowStage stage="revision" :project-prompts="projectPrompts" :uploaded="uploadedPrompts" :pending="pendingPrompts" :featured="featuredPrompt" :selected-shot="selectedShot" :busy="busy || hasRunning" @copy="(text: string) => void copyText(text)" @go="openSection" />
                 </template>
@@ -1584,21 +1606,32 @@ onBeforeUnmount(() => { disposed = true; pageRequest++; if (timer) clearInterval
    · 当前   —— 左侧 2px 强调竖条（复用 .critic-finding 语汇）+ 浅底，表示“就是这里”；
    · 待办   —— 空心灰环，表示“还没到”。
    竖条比背景色更耐看：不抢视线，也不依赖颜色区分状态。 */
-.flow-steps { display:flex; flex-wrap:wrap; gap:var(--space-2); margin:0 0 var(--space-6); padding:0 0 var(--space-5); border-bottom:1px solid var(--border-muted); }
-.flow-steps button { position:relative; display:flex; align-items:center; gap:var(--space-2); padding:var(--space-2) var(--space-3); border:1px solid transparent; border-radius:var(--radius-dialog); background:transparent; color:var(--text-secondary); font:inherit; text-align:left; cursor:pointer; transition:background var(--duration-fast) var(--ease-standard), border-color var(--duration-fast) var(--ease-standard), color var(--duration-fast) var(--ease-standard), box-shadow var(--duration-fast) var(--ease-standard); }
-.flow-steps button::before { content:""; position:absolute; left:0; top:50%; width:2px; height:0; border-radius:1px; background:var(--accent); transform:translateY(-50%); transition:height var(--duration-med) var(--ease-out); }
-.flow-steps button:hover { background:var(--surface-subtle); color:var(--text-primary); }
+/* 七步制作流程条（单行椭圆胶囊）：
+   与下方 .director-flow 同一套语汇，但承担"全流程 7 步"的导航。
+   三态用三种"语汇"而非三种色深：
+   · 已完成 —— 实心勾 + 弱化文字，表示"已翻篇"；
+   · 当前   —— 白底滑块 + 强调色文字，表示"就是这里"；
+   · 待办   —— 空心序号环，表示"还没到"。
+   交互：hover 轻微抬起 + 底色渐入；当前项白底滑块带投影；点击整颗胶囊下沉 1px。 */
+.flow-steps { margin:0 0 var(--space-6); }
+.flow-steps-rail { display:flex; flex-wrap:nowrap; align-items:center; gap:var(--space-1); max-width:100%; padding:var(--space-1); overflow-x:auto; scrollbar-width:none; border:1px solid var(--border-muted); border-radius:var(--radius-pill); background:var(--canvas-inset); -webkit-overflow-scrolling:touch; }
+.flow-steps-rail::-webkit-scrollbar { display:none; }
+.flow-steps button { position:relative; display:inline-flex; align-items:center; gap:var(--space-2); flex:0 0 auto; padding:var(--space-2) var(--space-3); border:0; border-radius:var(--radius-pill); background:transparent; color:var(--text-secondary); font:inherit; text-align:left; white-space:nowrap; cursor:pointer; transition:background var(--duration-med) var(--ease-out), color var(--duration-med) var(--ease-out), box-shadow var(--duration-med) var(--ease-out), transform var(--duration-fast) var(--ease-out); }
+.flow-steps button:hover { background:var(--surface-subtle); color:var(--text-primary); transform:translateY(-1px); }
+.flow-steps button:active { transform:translateY(1px); }
 .flow-steps button:focus-visible { outline:2px solid var(--focus-ring-color); outline-offset:2px; }
-.flow-steps button[aria-current] { background:var(--selected); color:var(--selected-ink); box-shadow:var(--shadow-control); }
-.flow-steps button[aria-current]::before { height:60%; }
-.flow-steps-index { display:grid; place-items:center; flex-shrink:0; width:18px; font-size: var(--font-kicker); color:var(--text-muted); font-variant-numeric:tabular-nums; transition:color var(--duration-fast) var(--ease-standard); }
-.flow-steps button[aria-current] .flow-steps-index { color:var(--text-primary); }
-.flow-steps button[data-status="done"] .flow-steps-index { color:var(--success); }
-.flow-steps-body { display:grid; gap:var(--space-1); }
+.flow-steps button[aria-current] { background:#fff; color:var(--text-primary); box-shadow:var(--shadow-control); }
+.flow-steps button[aria-current]:hover { transform:none; }
+.flow-steps-index { display:grid; place-items:center; flex-shrink:0; width:16px; height:16px; border:1px solid var(--border-strong); border-radius:var(--radius-pill); font-size:10px; font-weight:600; color:var(--text-muted); font-variant-numeric:tabular-nums; transition:border-color var(--duration-med) var(--ease-out), color var(--duration-med) var(--ease-out), background var(--duration-med) var(--ease-out); }
+.flow-steps button[data-status="done"] .flow-steps-index { border-color:transparent; background:var(--success-soft); color:var(--success); }
+.flow-steps button[aria-current] .flow-steps-index { border-color:var(--accent); color:var(--accent); }
+.flow-steps-body { display:inline-flex; align-items:baseline; gap:var(--space-2); }
 .flow-steps-body strong { font-size: var(--font-control); font-weight:500; }
-.flow-steps-body small { font-size: var(--font-kicker); color:var(--text-muted); }
+.flow-steps-body small { display:none; font-size: var(--font-kicker); color:var(--text-muted); }
+/* 只有"当前"这一步展开显示副标题，其余收成单行标题 —— 单行高度的同时保留"下一步是什么"。 */
+.flow-steps button[aria-current] .flow-steps-body small { display:inline; }
 .flow-steps button[data-status="done"] { color:var(--text-secondary); }
-.flow-steps button[data-status="todo"] .flow-steps-index { color:var(--text-muted); }
+.flow-steps button[data-status="todo"] { color:var(--text-muted); }
 .toolbar-mode { flex-shrink:0; }
 .toolbar-status { color:var(--text-secondary); font-size: var(--font-kicker); max-width:140px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .toolbar-new { flex-shrink:0; }

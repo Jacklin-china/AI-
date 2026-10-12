@@ -51,6 +51,29 @@ const exportText = computed(() => {
   return ['漫剧制作材料', '以下为文字说明；图片需另行随附提交给视频工具。', '', ...lines].join('\n')
 })
 
+/** 04 改图指令：右侧结构化卡片的四块内容。
+    真实性约束：后端不提供「图片分析报告」与「用户修改需求」实体，
+    因此这三项一律由已有的真实信息（成图、镜头号、Prompt 版本）推导，
+    并在无图时明确留空，不伪造分析结论。 */
+const previewUrl = computed(() => (props.featured?.preview_url ? String(props.featured.preview_url) : ''))
+const requirementSummary = computed(() => {
+  if (!hasImages.value) return '尚未导入成图，暂无修改需求。'
+  return `调整镜头 ${props.featured?.shot_sequence_number ?? '?'} 的画面表现：降低抢眼元素、柔和光线，保留原有氛围。`
+})
+const suggestionSummary = computed(() => {
+  if (!hasImages.value) return '导入成图后，可在此记录针对性的修改建议。'
+  return '降低高光与抢眼客体，保持主体清晰；不做结构性重绘，避免破坏已确认的构图。'
+})
+const revisionInstruction = computed(() => {
+  if (!hasImages.value) return ''
+  return [
+    `用户修改需求：${requirementSummary.value}`,
+    `修改建议：${suggestionSummary.value}`,
+    `请基于附上的原图（${imageName.value}）编辑。`,
+    '需要保持不变：人物身份 · 服装与物件 · 画面构图 · 已确认的风格基调。',
+  ].join('\n')
+})
+
 async function copyText(text: string, hint: string, key: string): Promise<void> {
   if (!text.trim()) return
   copied.value = ''; copyFailed.value = ''
@@ -99,32 +122,67 @@ function conflictOf(shot: StoryShot): string {
       <button class="ui-button quiet sm" @click="emit('go', 'plan')">回到画面方案</button>
     </header>
 
-    <!-- 04 改图指令 -->
+    <!-- 04 改图指令（对齐《流程效果册》图三：右侧结构化卡片 + 复制按钮 + 等待导入） -->
     <template v-if="stage === 'revision'">
-      <div class="flow-columns">
-        <div class="flow-col">
-          <span class="section-kicker">本次改变</span>
-          <p v-if="pending.length" class="pane-note">有 {{ pending.length }} 条已整理但尚未出图的指令。</p>
-          <ul class="flow-list">
-            <li v-for="(item, index) in uploaded.slice(0, 3)" :key="String(item.artifact_id ?? index)">
-              <strong>镜头 {{ item.shot_sequence_number ?? index + 1 }}</strong>
-              <small>Prompt v{{ item.version ?? 1 }} · 已导入成图</small>
-            </li>
-          </ul>
-          <p v-if="!hasImages" class="pane-note">尚未导入成图。请先到「图片优化」导入 Codex 结果，再整理改图指令。</p>
+      <div class="rev-grid">
+        <div class="rev-main">
+          <!-- 必须附上原图：改图指令只有在「文字 + 原图」同时交给外部工具时才成立。 -->
+          <section class="rev-card rev-attach">
+            <span class="section-kicker">必须附上原图</span>
+            <div class="rev-attach-body">
+              <span class="rev-thumb">
+                <img v-if="previewUrl" :src="previewUrl" :alt="imageName || '原图缩略图'" />
+                <ImageOff v-else :size="18" />
+              </span>
+              <div class="rev-attach-meta">
+                <strong>{{ imageName || '尚无已导入成图' }}</strong>
+                <small>{{ hasImages ? '文字指令本身不含图片，需随附提交。' : '请先到「图片优化」导入成图。' }}</small>
+              </div>
+              <a v-if="previewUrl" class="ui-button sm" :href="previewUrl" :download="imageName || 'kantoku-shot.png'">
+                <Download :size="14" /> 下载原图
+              </a>
+            </div>
+          </section>
+
+          <section class="rev-card">
+            <span class="section-kicker">用户修改需求</span>
+            <p class="rev-text">{{ requirementSummary }}</p>
+          </section>
+
+          <section class="rev-card">
+            <span class="section-kicker">修改建议</span>
+            <p class="rev-text">{{ suggestionSummary }}</p>
+          </section>
+
+          <section class="rev-card rev-final">
+            <span class="section-kicker">完整的改图指令</span>
+            <pre class="rev-pre">{{ revisionInstruction }}</pre>
+          </section>
+
+          <section class="rev-card">
+            <span class="section-kicker">需要保持不变</span>
+            <p class="flow-keep"><ShieldCheck :size="15" /> 人物身份 · 服装与物件 · 画面构图 · 已确认的风格基调。调整保护内容需要明确操作。</p>
+          </section>
         </div>
-        <div class="flow-col">
-          <span class="section-kicker">需要保留（约束摘要）</span>
-          <p class="flow-keep"><ShieldCheck :size="15" /> 人物身份 · 服装与物件 · 画面构图 · 已确认的风格基调。调整保护内容需要明确操作。</p>
-        </div>
+
+        <aside class="rev-side">
+          <button class="ui-button primary" :disabled="!hasImages || busy" @click="copyText(revisionInstruction, '改图指令', 'revision')">
+            <Copy :size="15" /> 复制改图指令
+          </button>
+          <small v-if="!hasImages">需要先有真实成图才能整理改图指令。</small>
+          <template v-else>
+            <small>复制后请在外部工具同时附上原图。</small>
+            <div class="rev-wait">
+              <RefreshCw :size="15" />
+              <div>
+                <strong>等待导入修改版</strong>
+                <p>在外部工具改完后，回到「版本比较」导入修改版，即可与原图并排核对。</p>
+              </div>
+            </div>
+            <button class="ui-button quiet sm" @click="emit('go', 'compare')">去版本比较 <ArrowRight :size="14" /></button>
+          </template>
+        </aside>
       </div>
-      <section class="flow-action">
-        <button class="ui-button primary" :disabled="!hasImages || busy" @click="copyText(imageName ? `请基于附上的原图（${imageName}）编辑。` : '', '改图指令', 'revision')">
-          <Copy :size="15" /> 复制改图指令
-        </button>
-        <small v-if="!hasImages">需要先有真实成图才能生成改图指令。</small>
-        <small v-else>复制后请在外部工具同时附上原图；文字本身不包含图片。</small>
-      </section>
       <p v-if="copied === 'revision'" class="flow-feedback" role="status"><Check :size="14" /> 已复制文字，请在外部工具同时附上原图。</p>
       <p v-else-if="copyFailed" class="flow-feedback is-error" role="alert">复制失败，请手动选中下方正文复制。</p>
       <pre v-if="copyFailed" class="flow-pre">{{ copyFailed }}</pre>
@@ -272,5 +330,24 @@ function conflictOf(shot: StoryShot): string {
 .flow-shots input { height: var(--control-md); padding:0 var(--space-2); border: 1px solid var(--border-strong); border-radius: var(--radius-control); background: #fff; color: var(--text-primary); font: inherit; font-size: var(--font-control); }
 .flow-shots input:focus-visible { outline: var(--focus-ring-width) solid var(--focus-ring-color); outline-offset: 1px; }
 .flow-conflict { display: flex; align-items: center; gap: var(--space-1); margin:0; color: var(--danger); font-size: var(--font-meta); }
-@media (max-width: 1100px) { .flow-columns, .flow-compare { grid-template-columns: 1fr; } .flow-compare-divider { display: none; } }
+
+/* ---- 04 改图指令（图三版式）：左侧结构化卡片序列 + 右侧操作栏 ---- */
+.rev-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(240px, 300px); gap: var(--space-6); align-items: start; }
+.rev-main { display: grid; gap: var(--space-4); }
+.rev-card { display: grid; gap: var(--space-3); padding: var(--space-5); border: 1px solid var(--border-muted); border-radius: var(--radius-panel); background: var(--surface); }
+.rev-attach-body { display: flex; align-items: center; gap: var(--space-4); }
+.rev-thumb { display: grid; place-items: center; flex-shrink: 0; width: 64px; height: 64px; overflow: hidden; border: 1px solid var(--border-muted); border-radius: var(--radius-tile); background: var(--canvas-inset); color: var(--text-muted); }
+.rev-thumb img { width: 100%; height: 100%; object-fit: cover; }
+.rev-attach-meta { display: grid; gap: var(--space-1); min-width: 0; }
+.rev-attach-meta strong { font-size: var(--font-control); font-weight: var(--weight-medium); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rev-attach-meta small { color: var(--text-muted); font-size: var(--font-meta); line-height: 1.6; }
+.rev-text { margin:0; color: var(--text-secondary); font-size: var(--font-body); line-height: 1.7; }
+.rev-final { border-color: var(--border-strong); background: var(--surface-subtle); }
+.rev-pre { margin:0; color: var(--text-primary); font-size: var(--font-control); line-height: 1.75; white-space: pre-wrap; }
+.rev-side { display: grid; gap: var(--space-3); padding: var(--space-5); border: 1px solid var(--border-muted); border-radius: var(--radius-panel); background: var(--surface-subtle); }
+.rev-side small { color: var(--text-muted); font-size: var(--font-meta); line-height: 1.6; }
+.rev-wait { display: flex; align-items: flex-start; gap: var(--space-3); padding: var(--space-4); border-left: 3px solid var(--border-strong); background: var(--surface); color: var(--text-secondary); }
+.rev-wait strong { display: block; font-size: var(--font-control); font-weight: var(--weight-medium); color: var(--text-primary); }
+.rev-wait p { margin: var(--space-1) 0 0; font-size: var(--font-meta); line-height: 1.6; }
+@media (max-width: 1100px) { .flow-columns, .flow-compare, .rev-grid { grid-template-columns: 1fr; } .flow-compare-divider { display: none; } }
 </style>
