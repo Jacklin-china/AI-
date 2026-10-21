@@ -31,7 +31,6 @@ def test_doctor_blocks_qwen_when_workspace_endpoint_is_missing(
         raise ConfigError("workspace required")
 
     monkeypatch.setattr(doctor, "get_settings", lambda: settings)
-    monkeypatch.setattr(doctor, "RuntimeStore", lambda _path: object())
     monkeypatch.setattr(doctor, "configured_database_path", lambda: tmp_path / "db.sqlite")
     monkeypatch.setattr(
         doctor, "_provider", lambda: SimpleNamespace(validate_request=reject_placeholder),

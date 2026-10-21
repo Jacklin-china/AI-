@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import json
 import sqlite3
-from collections.abc import Iterator
-from contextlib import contextmanager
+from collections.abc import Callable, Iterable, Iterator
+from contextlib import closing, contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,7 +15,7 @@ from loguru import logger
 
 from kantoku.config import ToolError, get_settings
 from kantoku.config.observability import current_trace_id
-from kantoku.config.settings import ROOT
+from kantoku.config.runtime_paths import get_runtime_paths, resolve_runtime_path
 from kantoku.core.conversations import (
     ConversationMessageRecord,
     ConversationRecord,
@@ -25,12 +25,14 @@ from kantoku.core.conversations import (
     MessageRole,
     MessageType,
 )
+from kantoku.core.database import database_manager
 
 from .models import (
     BATCH_TERMINAL_STATUSES,
     TERMINAL_STATUSES,
     ApprovalDecision,
     ApprovalRecord,
+    ArtifactLifecycle,
     ArtifactRecord,
     ArtifactType,
     BatchRecord,
@@ -267,13 +269,24 @@ MIGRATIONS: tuple[tuple[int, str], ...] = (
           );
         """,
     ),
+    (
+        12,
+        """
+        ALTER TABLE artifacts ADD COLUMN lifecycle_state TEXT NOT NULL DEFAULT 'active'
+            CHECK (lifecycle_state IN ('active','trashed','purging','purged'));
+        ALTER TABLE artifacts ADD COLUMN lifecycle_version INTEGER NOT NULL DEFAULT 1
+            CHECK (lifecycle_version > 0);
+        ALTER TABLE artifacts ADD COLUMN lifecycle_updated_at TEXT;
+        CREATE INDEX idx_artifacts_lifecycle ON artifacts(lifecycle_state,created_at);
+        """,
+    ),
 )
 
 
 def configured_database_path() -> Path:
     """按项目配置解析数据库绝对路径。"""
     path = get_settings().storage.sqlite_path
-    return path if path.is_absolute() else ROOT / path
+    return resolve_runtime_path(path)
 
 
 def _dump(value: dict[str, Any]) -> str:
@@ -295,8 +308,7 @@ class RuntimeStore:
     """Core 数据仓库；所有写入均为短事务。"""
 
     def __init__(self, path: Path | None = None) -> None:
-        self.path = path or configured_database_path()
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path = resolve_runtime_path(path) if path else configured_database_path()
         self.migrate()
 
     def create_conversation(
@@ -305,22 +317,37 @@ class RuntimeStore:
         *,
         interaction_mode: InteractionMode = InteractionMode.AUTONOMOUS,
         domain: str | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> ConversationRecord:
         """Create a durable conversation independently from runtime runs."""
+        if connection is None:
+            with self._connect() as opened:
+                return self.create_conversation(
+                    title, interaction_mode=interaction_mode, domain=domain, connection=opened
+                )
         now = utc_now()
         record = ConversationRecord(
-            id=f"conversation-{uuid4().hex}", title=title.strip() or "新对话",
-            interaction_mode=interaction_mode, domain=domain,
-            created_at=now, updated_at=now,
+            id=f"conversation-{uuid4().hex}",
+            title=title.strip() or "新对话",
+            interaction_mode=interaction_mode,
+            domain=domain,
+            created_at=now,
+            updated_at=now,
         )
-        with self._connect() as connection:
-            connection.execute(
-                "INSERT INTO conversations "
-                "(id,title,interaction_mode,domain,active_run_id,created_at,updated_at) "
-                "VALUES (?,?,?,?,?,?,?)",
-                (record.id, record.title, record.interaction_mode.value, record.domain,
-                 None, now.isoformat(), now.isoformat()),
-            )
+        connection.execute(
+            "INSERT INTO conversations "
+            "(id,title,interaction_mode,domain,active_run_id,created_at,updated_at) "
+            "VALUES (?,?,?,?,?,?,?)",
+            (
+                record.id,
+                record.title,
+                record.interaction_mode.value,
+                record.domain,
+                None,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
         return record
 
     def list_conversations(
@@ -431,6 +458,7 @@ class RuntimeStore:
         run_id: str | None = None,
         event_id: str | None = None,
         artifact_id: str | None = None,
+        require_new: bool = False,
     ) -> ConversationMessageRecord:
         self.get_conversation(conversation_id)
         record = ConversationMessageRecord(
@@ -452,6 +480,8 @@ class RuntimeStore:
                 (record.created_at.isoformat(), conversation_id),
             )
             if cursor.rowcount == 0 and event_id is not None:
+                if require_new:
+                    raise ToolError("此会话请求已被认领，请读取原请求状态")
                 row = connection.execute(
                     "SELECT * FROM conversation_messages "
                     "WHERE conversation_id=? AND event_id=?",
@@ -644,14 +674,42 @@ class RuntimeStore:
 
     def list_conversation_messages(
         self, conversation_id: str, *, include_deleted: bool = False,
+        limit: int | None = None, before_id: str | None = None,
+        after_id: str | None = None, message_ids: list[str] | None = None,
     ) -> list[ConversationMessageRecord]:
         if not include_deleted:
             self.get_conversation(conversation_id)
         with self._connect() as connection:
+            clauses, params = ["conversation_id=?"], [conversation_id]
+            for anchor, operator in ((before_id, "<"), (after_id, ">")):
+                if anchor is None:
+                    continue
+                row = connection.execute(
+                    "SELECT created_at,id FROM conversation_messages WHERE id=? "
+                    "AND conversation_id=?", (anchor, conversation_id),
+                ).fetchone()
+                if row is None:
+                    raise ToolError("消息范围不属于当前会话")
+                clauses.append(f"(created_at,id){operator}(?,?)")
+                params.extend(row)
+            if message_ids is not None:
+                if not message_ids:
+                    return []
+                if len(message_ids) > 200:
+                    raise ToolError("单次历史读取最多 200 条消息")
+                clauses.append("id IN (" + ",".join("?" for _ in message_ids) + ")")
+                params.extend(message_ids)
+            if limit is not None:
+                if not 1 <= limit <= 200:
+                    raise ToolError("历史分页大小必须在 1 到 200 之间")
+                params.append(limit)
             rows = connection.execute(
-                "SELECT * FROM conversation_messages WHERE conversation_id=? "
-                "ORDER BY created_at,id", (conversation_id,),
+                "SELECT * FROM conversation_messages WHERE " + " AND ".join(clauses) +
+                (" ORDER BY created_at DESC,id DESC LIMIT ?" if limit is not None
+                 else " ORDER BY created_at,id"), params,
             ).fetchall()
+        if limit is not None:
+            rows.reverse()
         return [self._message(row) for row in rows]
 
     @staticmethod
@@ -662,6 +720,19 @@ class RuntimeStore:
             event_id=row["event_id"], artifact_id=row["artifact_id"],
             created_at=_time(row["created_at"]),
         )
+
+    def bind_conversation_message(self, conversation_id: str, message_id: str,
+                                  run_id: str) -> None:
+        run = self.get_run(run_id)
+        if run.state.get("conversation_id") != conversation_id:
+            raise ToolError("消息与任务不属于同一会话")
+        with self._connect() as connection:
+            changed = connection.execute(
+                "UPDATE conversation_messages SET run_id=? WHERE id=? AND conversation_id=? "
+                "AND (run_id IS NULL OR run_id=?)", (run_id, message_id, conversation_id, run_id),
+            ).rowcount
+            if changed != 1:
+                raise ToolError("消息已绑定其他任务或不属于当前会话")
 
     @staticmethod
     def _conversation(row: sqlite3.Row) -> ConversationRecord:
@@ -675,7 +746,7 @@ class RuntimeStore:
     @contextmanager
     def _connect(self) -> Iterator[sqlite3.Connection]:
         try:
-            connection = sqlite3.connect(self.path, timeout=30)
+            connection = database_manager.connect(self.path, timeout=30)
             connection.row_factory = sqlite3.Row
             connection.execute("PRAGMA foreign_keys = ON")
             yield connection
@@ -699,6 +770,17 @@ class RuntimeStore:
                 row[0]
                 for row in connection.execute("SELECT version FROM core_schema_migrations")
             }
+            if applied and 12 not in applied:
+                # SQLite backup includes committed WAL pages; never copy a live db file.
+                directory = self.path.parent / "backups"
+                get_runtime_paths().ensure_directory(directory)
+                backup = directory / f"{self.path.stem}.pre-artifact-lifecycle-{uuid4().hex}.sqlite"
+                connection.commit()
+                with closing(database_manager.connect(backup)) as destination:
+                    connection.backup(destination)
+                database_manager.checkpoint_all(within=backup)
+                get_runtime_paths().register(backup, file_type="backup", owner="migration")
+                logger.info("Artifact lifecycle migration backup created: {}", backup)
             for version, script in MIGRATIONS:
                 if version in applied:
                     continue
@@ -805,13 +887,33 @@ class RuntimeStore:
         status: ExecutionStatus | None = None,
         interaction_mode: InteractionMode | None = None,
         conversation_id: str | None = None,
+        project_id: str | None = None,
+        project_ids: Iterable[str] | None = None,
     ) -> list[RunRecord]:
-        """按更新时间倒序列出 Run，可按领域与状态过滤。"""
+        """按更新时间倒序列出 Run，可按领域、状态与关联作品过滤。
+
+        `project_id` / `project_ids` 在 SQL 侧完成过滤，避免调用方先取出全部 Run
+        再在 Python 中解析 state_json；这是对话页加载与作品任务列表的热路径。
+        """
         clauses: list[str] = []
         params: list[object] = []
         if conversation_id is not None:
             clauses.append("json_extract(state_json, '$.conversation_id')=?")
             params.append(conversation_id)
+        project_filter: list[str] = []
+        if project_id is not None:
+            project_filter.append(project_id)
+        if project_ids is not None:
+            project_filter.extend(project_ids)
+        project_filter = list(dict.fromkeys(project_filter))
+        if project_filter:
+            clauses.append(
+                "json_extract(state_json, '$.project_id') IN ("
+                + ",".join("?" for _ in project_filter) + ")")
+            params.extend(project_filter)
+        elif project_ids is not None:
+            # 明确按作品集合过滤但集合为空：与旧的 Python 集合判断一致，不返回任何 Run。
+            clauses.append("0=1")
         if domain:
             clauses.append("domain=?")
             params.append(domain)
@@ -1021,10 +1123,13 @@ class RuntimeStore:
         connection.execute(
             "INSERT INTO artifacts "
             "(id,type,run_id,conversation_id,node_id,source,status,created_at,"
-            "metadata_json,location,version) VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            "metadata_json,location,version,lifecycle_state,lifecycle_version,"
+            "lifecycle_updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (record.id, record.type, record.run_id, record.conversation_id,
              record.node_id, record.source, record.status, record.created_at.isoformat(),
-             _dump(record.metadata), record.location, record.version),
+             _dump(record.metadata), record.location, record.version,
+             record.lifecycle_state, record.lifecycle_version,
+             record.lifecycle_updated_at.isoformat() if record.lifecycle_updated_at else None),
         )
 
     def create_artifact(
@@ -1058,10 +1163,14 @@ class RuntimeStore:
         type: ArtifactType | None = None,
         domain: str | None = None,
         conversation_id: str | None = None,
+        lifecycle_state: ArtifactLifecycle | None = None,
+        include_internal: bool = False,
     ) -> list[ArtifactRecord]:
         """查询 Artifact，可按 run、type 与 domain 过滤。"""
         clauses: list[str] = []
         params: list[object] = []
+        if not include_internal:
+            clauses.append("COALESCE(json_extract(artifacts.metadata_json,'$.internal'),0) != 1")
         if run_id:
             clauses.append("artifacts.run_id=?")
             params.append(run_id)
@@ -1074,6 +1183,9 @@ class RuntimeStore:
         if conversation_id:
             clauses.append("artifacts.conversation_id=?")
             params.append(conversation_id)
+        if lifecycle_state is not None:
+            clauses.append("artifacts.lifecycle_state=?")
+            params.append(lifecycle_state)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         with self._connect() as connection:
             rows = connection.execute(
@@ -1081,6 +1193,19 @@ class RuntimeStore:
                 f"{where} ORDER BY artifacts.created_at DESC", params,
             ).fetchall()
         return [self._artifact(row) for row in rows]
+
+    def retained_artifact_locations(self, *, exclude_id: str,
+                                    connection: sqlite3.Connection | None = None) -> list[str]:
+        """读取仍需保留文件的其他产物路径，包含内部产物及回收站。"""
+        if connection is None:
+            with self._connect() as opened:
+                return self.retained_artifact_locations(exclude_id=exclude_id, connection=opened)
+        rows = connection.execute(
+            "SELECT DISTINCT location FROM artifacts WHERE id!=? "
+            "AND lifecycle_state!=? AND location IS NOT NULL",
+            (exclude_id, ArtifactLifecycle.PURGED),
+        ).fetchall()
+        return [row[0] for row in rows]
 
     @staticmethod
     def _artifact(row: sqlite3.Row) -> ArtifactRecord:
@@ -1090,7 +1215,79 @@ class RuntimeStore:
             node_id=row["node_id"], source=row["source"], status=row["status"],
             created_at=_time(row["created_at"]), metadata=_load(row["metadata_json"]),
             location=row["location"], version=row["version"],
+            lifecycle_state=row["lifecycle_state"], lifecycle_version=row["lifecycle_version"],
+            lifecycle_updated_at=_time(row["lifecycle_updated_at"]),
         )
+
+    def change_artifact_lifecycle(
+        self, artifact_id: str, target: ArtifactLifecycle, expected_version: int,
+    ) -> ArtifactRecord:
+        """CAS 回收/恢复；不修改正文、执行状态、引用、账本或媒体文件。"""
+        if type(expected_version) is not int or expected_version < 1:
+            raise ToolError("请提供有效的资产操作版本，并刷新后重试")
+        if target not in {ArtifactLifecycle.ACTIVE, ArtifactLifecycle.TRASHED}:
+            raise ToolError("本接口只支持回收和恢复资产")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("找不到指定资产，请刷新列表")
+            current = self._artifact(row)
+            if current.lifecycle_state == target and expected_version in {
+                current.lifecycle_version, current.lifecycle_version - 1,
+            }:
+                return current  # Same request repeated after its successful transition.
+            if current.lifecycle_version != expected_version:
+                raise ToolError("资产状态已变化，请刷新列表后重试")
+            if current.lifecycle_state not in {ArtifactLifecycle.ACTIVE, ArtifactLifecycle.TRASHED}:
+                raise ToolError("资产正在清理或已清理，不能执行此操作")
+            connection.execute(
+                "UPDATE artifacts SET lifecycle_state=?,lifecycle_version=lifecycle_version+1,"
+                "lifecycle_updated_at=? WHERE id=? AND lifecycle_version=?",
+                (target, utc_now().isoformat(), artifact_id, expected_version),
+            )
+            updated = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,),
+            ).fetchone()
+        return self._artifact(updated)
+
+    def purge_artifact(self, artifact_id: str, expected_version: int, *,
+                       before_purge: Callable[[ArtifactRecord, sqlite3.Connection], None]
+                       | None = None) -> ArtifactRecord:
+        """彻底删除回收站资产：仅允许 TRASHED→PURGED，不修改正文、引用或账本。
+
+        这是不可恢复的状态转换，只能从回收站发起。可选文件处理回调在 CAS 检查后、
+        同一写事务中执行，阻止恢复并发抢先；回调失败不提交状态变化。
+        """
+        if type(expected_version) is not int or expected_version < 1:
+            raise ToolError("请提供有效的资产操作版本，并刷新后重试")
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            row = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,),
+            ).fetchone()
+            if row is None:
+                raise ToolError("找不到指定资产，请刷新列表")
+            current = self._artifact(row)
+            if current.lifecycle_state == ArtifactLifecycle.PURGED:
+                return current  # Same request repeated after its successful transition.
+            if current.lifecycle_version != expected_version:
+                raise ToolError("资产状态已变化，请刷新列表后重试")
+            if current.lifecycle_state != ArtifactLifecycle.TRASHED:
+                raise ToolError("只有回收站中的资产可以彻底删除，请先移入回收站")
+            if before_purge is not None:
+                before_purge(current, connection)
+            connection.execute(
+                "UPDATE artifacts SET lifecycle_state=?,lifecycle_version=lifecycle_version+1,"
+                "lifecycle_updated_at=? WHERE id=? AND lifecycle_version=?",
+                (ArtifactLifecycle.PURGED, utc_now().isoformat(), artifact_id, expected_version),
+            )
+            updated = connection.execute(
+                "SELECT * FROM artifacts WHERE id=?", (artifact_id,),
+            ).fetchone()
+        return self._artifact(updated)
 
     def save_skill_execution(self, record: SkillExecutionRecord) -> None:
         """记录 Skill 调用结果。"""

@@ -14,9 +14,15 @@ from dotenv import dotenv_values
 from loguru import logger
 
 from kantoku.config import ConfigError, get_settings
-from kantoku.config.settings import ENV_PATH, ROOT
+from kantoku.config.runtime_paths import get_runtime_paths, validate_runtime_path
+from kantoku.config.settings import ENV_PATH
 
-LOG_DIR = ROOT / "data" / "logs"
+# Optional override used by isolated tests; production resolves at initialization.
+LOG_DIR: Path | None = None
+
+
+def _log_dir() -> Path:
+    return validate_runtime_path(LOG_DIR) if LOG_DIR is not None else get_runtime_paths().logs
 
 _SECRET_PATTERNS = (
     re.compile(r"(?i)(authorization\s*[:=]\s*bearer\s+)[^\s,;]+"),
@@ -86,9 +92,12 @@ def _console_filter(record: dict[str, object]) -> bool:
 
 def setup_logging(level: str | None = None) -> None:
     console_level = level if level is not None else get_settings().app.log_level
+    directory = _log_dir()
     try:
         logger.level(console_level)
-        LOG_DIR.mkdir(parents=True, exist_ok=True)
+        get_runtime_paths().prepare()
+        validate_runtime_path(directory / "kantoku.log")
+        get_runtime_paths().ensure_directory(directory)
     except (ValueError, OSError) as error:
         raise ConfigError("日志初始化失败", detail=type(error).__name__) from None
     # 控制台级别配色：INFO 蓝 / WARNING 黄 / ERROR 红 / CRITICAL 红加粗
@@ -110,13 +119,26 @@ def setup_logging(level: str | None = None) -> None:
         diagnose=False,
         filter=_console_filter,
     )
+    legacy = {path.resolve() for path in directory.glob("kantoku*.log")}
+    get_runtime_paths().register(directory / "kantoku.log", file_type="active_log",
+                                 owner="application")
+
+    def retain_rotated(files: list[str]) -> None:
+        manager = get_runtime_paths()
+        for raw in files:
+            path = Path(raw).resolve()
+            if path not in legacy and path.parent == directory:
+                kind = "log" if directory == manager.logs else "qa"
+                if directory == manager.logs or directory.is_relative_to(manager.tmp):
+                    manager.register(path, file_type=kind, owner="application")
+
     logger.add(
-        LOG_DIR / "kantoku.log",
+        directory / "kantoku.log",
         level="DEBUG",
         format="{message}",
         serialize=True,
         rotation="10 MB",
-        retention="14 days",
+        retention=retain_rotated,
         encoding="utf-8",
         diagnose=False,
         filter=_patch_record,
@@ -131,13 +153,19 @@ def setup_logging(level: str | None = None) -> None:
 
 def archive_development_log() -> Path | None:
     """Archive only the active application log; never touch audit/ledger data."""
-    active = LOG_DIR / "kantoku.log"
+    directory = _log_dir()
+    active = directory / "kantoku.log"
     if not active.is_file():
         return None
-    if active.resolve().parent != LOG_DIR.resolve():
+    if active.resolve().parent != directory.resolve():
         raise ConfigError("开发日志路径无效")
-    archive = LOG_DIR / f"kantoku.{datetime.now(UTC):%Y-%m-%d_%H-%M-%S_%f}.log"
+    archive = directory / f"kantoku.{datetime.now(UTC):%Y-%m-%d_%H-%M-%S_%f}.log"
     logger.remove()
     active.rename(archive)
+    manager = get_runtime_paths()
+    kind = "log" if directory == manager.logs else (
+        "qa" if directory.is_relative_to(manager.tmp) else "audit"
+    )
+    manager.register(archive, file_type=kind, owner="application")
     setup_logging()
     return archive

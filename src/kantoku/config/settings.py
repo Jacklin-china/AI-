@@ -163,9 +163,12 @@ class ImageSettings(BaseModel):
 
 
 class StorageSettings(BaseModel):
-    """项目数据的存储位置。"""
+    """项目数据的存储位置；业务代码只通过 ``get_settings`` 读取。"""
 
     sqlite_path: Path
+    # 运行根目录（承载 data/logs/cache/artifacts/tmp）。留空表示项目根目录。
+    # 环境变量 KANTOKU_RUNTIME_ROOT 优先于此字段，用于离线测试与隔离验收。
+    runtime_root: Path | None = None
 
 
 class RuntimeSettings(BaseModel):
@@ -173,6 +176,9 @@ class RuntimeSettings(BaseModel):
 
     max_reworks: int = Field(default=1, ge=0, le=5, strict=True)
     batch_max_concurrency: int = Field(default=2, gt=0, le=16, strict=True)
+    context_token_budget: int = Field(default=18000, ge=2000, le=64000, strict=True)
+    context_summary_tokens: int = Field(default=2000, ge=256, le=8000, strict=True)
+    context_recall_tokens: int = Field(default=6000, ge=256, le=16000, strict=True)
 
 
 class VideoSettings(BaseModel):
@@ -185,7 +191,7 @@ class VideoSettings(BaseModel):
     retry: int = Field(default=1, ge=0, le=3, strict=True)
     estimated_fen: int = Field(default=1, gt=0, strict=True)
     max_fen: int = Field(default=1, ge=0, strict=True)
-    output_dir: Path = Path("data/videos")
+    output_dir: Path = Path("artifacts/videos")
 
 
 class CommerceSettings(BaseModel):

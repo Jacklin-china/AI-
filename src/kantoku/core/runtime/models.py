@@ -71,6 +71,15 @@ class ArtifactType(StrEnum):
     REPORT = "report"
 
 
+class ArtifactLifecycle(StrEnum):
+    """产物库生命周期，独立于执行状态和内容版本。"""
+
+    ACTIVE = "active"
+    TRASHED = "trashed"
+    PURGING = "purging"
+    PURGED = "purged"
+
+
 class CoreModel(BaseModel):
     """数据库边界使用的严格模型基类。"""
 
@@ -120,6 +129,9 @@ class ArtifactRecord(CoreModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
     location: str | None = None
     version: int = Field(default=1, gt=0)
+    lifecycle_state: ArtifactLifecycle = ArtifactLifecycle.ACTIVE
+    lifecycle_version: int = Field(default=1, gt=0)
+    lifecycle_updated_at: datetime | None = None
 
 
 class ApprovalRecord(CoreModel):
