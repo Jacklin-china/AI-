@@ -18,10 +18,12 @@ dist/
 node_modules/
 
 # 运行时数据（SQLite/日志/下载）
-data/
-logs/
-cache/
-artifacts/
+# 必须带前导斜杠锚定根目录：不加斜杠的 `artifacts/` 会匹配任意层级，
+# 曾把 frontend/src/components/artifacts/ 的源码一并忽略。
+/data/
+/logs/
+/cache/
+/artifacts/
 *.db-wal
 *.db-shm
 *.sqlite-wal
