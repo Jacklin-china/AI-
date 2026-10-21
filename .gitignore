@@ -6,6 +6,7 @@ config/settings.yaml
 __pycache__/
 *.py[cod]
 .venv/
+.uv-cache/
 *.egg-info/
 .pytest_cache/
 .ruff_cache/
@@ -18,9 +19,19 @@ node_modules/
 
 # 运行时数据（SQLite/日志/下载）
 data/
+logs/
+cache/
+artifacts/
+*.db-wal
+*.db-shm
+*.sqlite-wal
+*.sqlite-shm
 
 # 大体积演示视频（>10MB 不进 git，README 放链接）
 assets/demo/*.mp4
+
+# 生成用参考素材（人像/风格/场景样例，代码不引用）
+assets/reference/
 
 # os
 .DS_Store
@@ -28,3 +39,9 @@ Thumbs.db
 
 # IDE（PyCharm 本地配置，不进 git）
 .idea/
+
+# Unified managed transient storage
+/tmp/
+
+# 本地 agent 工作区（记忆、临时验证脚本与截图，不进 git）
+.workbuddy/
