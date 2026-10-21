@@ -113,8 +113,8 @@ def test_batch_checks_output_writability_before_first_paid_request(
 
     monkeypatch.setattr(
         qc_batch,
-        "NamedTemporaryFile",
-        lambda **_: (_ for _ in ()).throw(PermissionError("private path")),
+        "probe_writable_directory",
+        lambda _: (_ for _ in ()).throw(PermissionError("private path")),
     )
     with pytest.raises(ToolError, match="结果目录不可写"):
         qc_batch.run_qc_batch(

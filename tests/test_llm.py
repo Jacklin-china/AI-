@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import socket
+import ssl
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call
@@ -457,3 +459,159 @@ def test_attempt_latency_excludes_retry_sleep(
     monkeypatch.setattr(llm_module, "sleep", MagicMock())
     llm_module.chat([{"role": "user", "content": "测试"}])
     assert [item.args[0].latency_ms for item in llm_environment.call_args_list] == [100, 200]
+
+
+@pytest.mark.parametrize("entrypoint", ["chat", "vision_chat", "stream_chat"])
+def test_local_socket_failure_has_safe_actionable_public_reason_without_resubmitting(
+    monkeypatch: pytest.MonkeyPatch,
+    llm_environment: MagicMock,
+    entrypoint: str,
+) -> None:
+    from kantoku.config.observability import public_error
+
+    settings = _settings()
+    settings.llm.retry = 0
+    monkeypatch.setattr(llm_module, "get_settings", lambda: settings)
+    # Match the SDK -> transport -> suppressed socket context chain seen on Windows.
+    socket_error = OSError(10048, "PRIVATE-SOCKET-DETAIL https://user:password@proxy.invalid")
+    transport_error = ConnectionError("PRIVATE-TRANSPORT-DETAIL")
+    transport_error.__context__ = socket_error
+    transport_error.__suppress_context__ = True
+    connection_error = APIConnectionError(request=MagicMock())
+    connection_error.__cause__ = transport_error
+    client = MagicMock()
+    client.chat.completions.create.side_effect = connection_error
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr(llm_module, "OpenAI", factory)
+    sleep = MagicMock()
+    monkeypatch.setattr(llm_module, "sleep", sleep)
+
+    messages = [{"role": "user", "content": "PRIVATE-USER-PROMPT"}]
+    with pytest.raises(LLMError, match="本机网络地址或端口冲突") as caught:
+        if entrypoint == "stream_chat":
+            list(llm_module.stream_chat(messages))
+        else:
+            getattr(llm_module, entrypoint)(messages, single_attempt=True)
+
+    assert caught.value.__cause__ is connection_error
+    failure = public_error(caught.value)
+    assert failure["retryable"] is True
+    assert "检查代理及其他网络程序" in failure["safe_message"]
+    safe_diagnostics = f"{failure} {caught.value.detail}"
+    for private in ("PRIVATE-", "password", "proxy.invalid"):
+        assert private not in safe_diagnostics
+    assert caught.value.detail == "APIConnectionError(reason=local_address_conflict)"
+    assert factory.call_count == client.chat.completions.create.call_count == 1
+    client.close.assert_called_once_with()
+    sleep.assert_not_called()
+    if entrypoint != "stream_chat":
+        assert llm_environment.call_args.args[0].error == caught.value.detail
+
+
+@pytest.mark.parametrize(
+    "underlying,reason,hint",
+    [
+        (socket.gaierror(-2, "PRIVATE-DNS"), "dns_failed", "地址解析失败"),
+        (ssl.SSLCertVerificationError("PRIVATE-TLS"), "certificate_failed", "证书校验失败"),
+        (ssl.SSLError("PRIVATE-TLS"), "tls_failed", "安全连接失败"),
+        (OSError(10061, "PRIVATE-REFUSED"), "connection_refused", "连接被拒绝"),
+        (OSError(10051, "PRIVATE-NETWORK"), "network_unreachable", "无法到达"),
+        (OSError(10054, "PRIVATE-RESET"), "connection_interrupted", "连接中断"),
+        (TimeoutError("PRIVATE-TIMEOUT"), "timeout", "超时"),
+    ],
+)
+def test_transport_reason_uses_types_and_codes_without_provider_message(
+    monkeypatch: pytest.MonkeyPatch,
+    underlying: BaseException,
+    reason: str,
+    hint: str,
+) -> None:
+    error = APIConnectionError(request=MagicMock())
+    error.__cause__ = underlying
+    client = MagicMock()
+    client.chat.completions.create.side_effect = error
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+
+    with pytest.raises(LLMError, match=hint) as caught:
+        llm_module.chat([{"role": "user", "content": "测试"}], single_attempt=True)
+
+    assert "PRIVATE-" not in str(caught.value)
+    assert reason in caught.value.detail or reason == "timeout"
+    assert client.chat.completions.create.call_count == 1
+    client.close.assert_called_once_with()
+
+
+def test_connection_reason_handles_cyclic_exception_chain_without_guessing_socket_cause(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = APIConnectionError(request=MagicMock())
+    context = RuntimeError("PRIVATE-CONTEXT")
+    error.__cause__ = context
+    context.__context__ = error
+    client = MagicMock()
+    client.chat.completions.create.side_effect = error
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+
+    with pytest.raises(LLMError, match="无法连接模型服务") as caught:
+        llm_module.chat([{"role": "user", "content": "测试"}], single_attempt=True)
+
+    assert caught.value.detail == "APIConnectionError"
+    assert "端口" not in caught.value.message
+    assert "PRIVATE-" not in str(caught.value)
+    client.close.assert_called_once_with()
+
+
+def test_authentication_failure_is_not_misclassified_from_an_earlier_network_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    response = MagicMock(status_code=401, request=MagicMock(), headers={})
+    error = AuthenticationError("PRIVATE-PROVIDER-DETAIL", response=response, body=None)
+    error.__context__ = OSError(10048, "PRIVATE-EARLIER-NETWORK-DETAIL")
+    client = MagicMock()
+    client.chat.completions.create.side_effect = error
+    monkeypatch.setattr(llm_module, "OpenAI", MagicMock(return_value=client))
+
+    with pytest.raises(LLMError) as caught:
+        llm_module.chat([{"role": "user", "content": "测试"}], single_attempt=True)
+
+    assert caught.value.message == "主模型调用失败"
+    assert caught.value.detail == "AuthenticationError(status=401)"
+    assert "端口" not in str(caught.value)
+    client.close.assert_called_once_with()
+
+
+def test_actual_sdk_transport_failure_keeps_socket_reason_and_closes_without_network(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx2
+    from httpcore2 import ConnectError
+    from openai import OpenAI
+
+    calls = []
+
+    def handle(request: httpx2.Request) -> httpx2.Response:
+        calls.append(request)
+        try:
+            try:
+                raise OSError(10048, "PRIVATE-SOCKET-DETAIL")
+            except OSError as error:
+                raise ConnectError(error) from error
+        except ConnectError as error:
+            # HTTP Core suppresses the socket cause while keeping its context.
+            error.__cause__ = None
+            raise httpx2.ConnectError("PRIVATE-TRANSPORT-DETAIL", request=request) from error
+
+    transport = httpx2.MockTransport(handle)
+    client = OpenAI(
+        base_url="https://offline.invalid/v1", api_key="offline-key", max_retries=0,
+        http_client=httpx2.Client(transport=transport, trust_env=False),
+    )
+    monkeypatch.setattr(llm_module, "_build_client", lambda **_kwargs: client)
+
+    with pytest.raises(LLMError, match="本机网络地址或端口冲突") as caught:
+        llm_module.chat([{"role": "user", "content": "测试"}], single_attempt=True)
+
+    assert len(calls) == 1
+    assert isinstance(caught.value.__cause__, APIConnectionError)
+    assert caught.value.detail == "APIConnectionError(reason=local_address_conflict)"
+    assert client.is_closed()

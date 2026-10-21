@@ -10,7 +10,7 @@ from uuid import uuid4
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from kantoku.config import BudgetError, ToolError, get_settings
-from kantoku.config.settings import ROOT
+from kantoku.config.runtime_paths import exclusive_write_text, resolve_runtime_path
 from kantoku.core import budget
 from kantoku.core.llm import chat
 from kantoku.schemas.media import ImageGenerationResult
@@ -33,7 +33,7 @@ class StudioTask(BaseModel):
 def task_directory() -> Path:
     """任务记录跟随配置数据库，避免依赖启动目录。"""
     path = get_settings().storage.sqlite_path
-    return (path if path.is_absolute() else ROOT / path).parent / "studio"
+    return resolve_runtime_path(path).parent / "studio"
 
 
 def compose_prompt(subject: str, purpose: str, audience: str, style: str) -> str:
@@ -115,9 +115,7 @@ def create_task(
                 raise BudgetError("同一画面还有未确认结果的任务，请先从历史任务查询，避免重复收费")
     try:
         directory = task_directory()
-        directory.mkdir(parents=True, exist_ok=True)
-        with (directory / f"{task.request_id}.json").open("x", encoding="utf-8") as handle:
-            handle.write(task.model_dump_json(indent=2))
+        exclusive_write_text(directory / f"{task.request_id}.json", task.model_dump_json(indent=2))
     except OSError as error:
         raise ToolError("创作记录无法保存，尚未提交生图") from error
     return task

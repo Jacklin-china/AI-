@@ -10,7 +10,7 @@ test('a selected fast domain is visible only before its one task is sent', () =>
 })
 
 test('other domains and modes cannot appear as a home fast skill', () => {
-  assert.equal(visibleFastDomain('commerce', null, false), 'commerce')
-  assert.equal(visibleFastDomain('studio', null, false), 'studio')
+  assert.equal(visibleFastDomain('commerce', null, false), null)
+  assert.equal(visibleFastDomain('studio', null, false), null)
   assert.equal(visibleFastDomain('ads', null, false), null)
 })

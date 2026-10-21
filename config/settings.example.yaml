@@ -22,12 +22,13 @@ llm:
   pricing_cny_per_million_by_model:
     deepseek-flash: {input_cny: 2, output_cny: 8}
 
-  # 视觉理解：火山方舟豆包多模态；即梦 AK/SK 只用于下方 Visual API 生图。
-  vision_base_url: https://ark.cn-beijing.volces.com/api/v3
-  model_vision: doubao-seed-2-0-lite-260428
-  vision_api_key_env: ARK_API_KEY
-  vision_extra_body: {}
-  vision_max_tokens: 512       # 质检只返回短 JSON，限制输出成本
+  # 视觉理解：DeepSeek Flash，复用文本密钥；下方 image 配置单独控制生图。
+  # https://api-docs.deepseek.com/guides/vision/
+  vision_base_url: https://api.deepseek.com/v1
+  model_vision: deepseek-flash
+  vision_api_key_env: DEEPSEEK_API_KEY
+  vision_extra_body: {thinking: {type: disabled}}
+  vision_max_tokens: 4096      # 图片观察和两图检查返回结构化报告；限制单次输出
   vision_max_image_bytes: 10485760
 
   # ── 降级位：跨供应商才是真降级（08 风险登记册 R4）──────────────────
@@ -87,7 +88,7 @@ image:
   timeout_s: 600                # Qwen OpenAI 兼容接口同步返回图片 URL
   query_retry: 2                # 只重试查询；付费提交永不自动重提
   query_backoff_s: 2
-  output_dir: data/images
+  output_dir: artifacts/images # 旧本地配置 data/images 继续兼容
   pricing:                     # 精准计价：每张图的公示单价（元），按模型区分；审批卡片按此 × 张数展示
     default_cny_per_image: 0.18        # 北京地域 Qwen 标准版文生图公示价；以控制台账单为准
     cny_per_image_by_model:
@@ -109,7 +110,13 @@ budget:                        # 成本红线：任何付费调用前必须检�
   token_daily_limit: 200000    # token 单日上限，防跑飞
 
 storage:
-  sqlite_path: data/kantoku.db # 项目库/台账/素材索引同一个库
+  sqlite_path: data/kantoku.db # 相对 runtime_root 解析；项目库/台账/素材索引同一个库
+  # 运行根目录，承载 data / logs / cache / artifacts / tmp。留空 = 项目根目录（默认）。
+  # 想让运行数据与测试数据不落在仓库里，就把它指向仓库外的绝对路径（禁止系统 Temp）。
+  # 环境变量 KANTOKU_RUNTIME_ROOT 优先于本字段（离线测试与隔离验收使用）。
+  # 切换前必须先迁移 data/kantoku.db 与 data/images：产物 location 是绝对路径，
+  # 直接改这里等于换新空库，历史与图片引用都会失效。
+  runtime_root: null
 
 commerce:
   data_mode: production       # production 无真实 Source 时阻断；demo 才启用 Mock Data
@@ -121,6 +128,9 @@ commerce:
 runtime:
   max_reworks: 1               # Domain 返工硬上限，防止 Workflow 无限循环
   batch_max_concurrency: 2     # Core Batch 本机并发上限
+  context_token_budget: 18000  # 单轮会话记忆的估计 token 容量
+  context_summary_tokens: 2000 # 较早内容增量摘要；原始消息完整保留
+  context_recall_tokens: 6000  # 有界历史读取与版本来源
 
 video:
   enabled: false               # 默认关闭；本轮仅提供显式 Mock Provider
@@ -130,7 +140,7 @@ video:
   retry: 1                     # Provider 网络层重试，不与 Workflow retry 叠乘
   estimated_fen: 1
   max_fen: 1
-  output_dir: data/videos
+  output_dir: artifacts/videos
 
 vtuber:
   base_url: ws://localhost:12393  # Open-LLM-VTuber 后端地址，W10 可选

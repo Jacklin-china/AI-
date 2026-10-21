@@ -1,6 +1,8 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref } from 'vue'
+import { ListChecks } from 'lucide-vue-next'
 import ApprovalCard from '../components/approval/ApprovalCard.vue'
+import WorkspacePage from '../components/workspace/WorkspacePage.vue'
 import StatusBadge from '../components/StatusBadge.vue'
 import EmptyState from '../components/EmptyState.vue'
 import { presenterFor } from '../domains/presenters'
@@ -21,7 +23,9 @@ const tabs = [
   { id: 'failed', label: '失败' },
   { id: 'history', label: '历史' },
 ]
+
 const active = ref(props.tab && tabs.some((item) => item.id === props.tab) ? props.tab : 'running')
+const shellNavigation = tabs.map((item) => ({ ...item, icon: ListChecks }))
 const runs = ref<CoreRun[]>([])
 const approvals = ref<CoreApproval[]>([])
 const batches = ref<CoreBatch[]>([])
@@ -121,11 +125,12 @@ onBeforeUnmount(() => { if (timer !== undefined) window.clearInterval(timer) })
 </script>
 
 <template>
+  <WorkspacePage identity="任务中心" subtitle="Run · Batch · Approval" active-page="active" :navigation="shellNavigation" @select-page="active = $event">
+    <template #toolbar><span class="page-toolbar-note">高级管理视图 · 普通流程请在 Domain Workspace 内完成</span></template>
   <main class="page tasks-page">
     <header class="page-header">
       <div>
-        <span class="section-kicker">高级管理视图</span>
-        <h1>任务中心</h1>
+        <h1>{{ tabs.find((item) => item.id === active)?.label ?? '任务中心' }}</h1>
         <p>Run、Batch 与 Approval 的统一管理入口；普通流程请在 Domain Workspace 内完成。</p>
       </div>
       <div class="page-actions">
@@ -134,12 +139,6 @@ onBeforeUnmount(() => { if (timer !== undefined) window.clearInterval(timer) })
         </button>
       </div>
     </header>
-
-    <nav class="detail-tabs" aria-label="任务视图">
-      <button v-for="item in tabs" :key="item.id" :class="{ active: active === item.id }" @click="active = item.id">
-        {{ item.label }}
-      </button>
-    </nav>
 
     <p v-if="error" class="error-box" role="alert">{{ error }}</p>
 
@@ -240,4 +239,5 @@ onBeforeUnmount(() => { if (timer !== undefined) window.clearInterval(timer) })
       <EmptyState v-if="!(active === 'failed' ? failedRuns : historyRuns).length" title="暂无记录" description="任务完成或失败后会进入历史。" />
     </section>
   </main>
+  </WorkspacePage>
 </template>

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from kantoku.config import SchemaError, ToolError
+from kantoku.core.database import database_manager
 from kantoku.memory import Persona, list_personas, load_persona, parse_persona, save_persona
 from kantoku.memory import persona as persona_module
 
@@ -60,7 +61,7 @@ def test_save_load_and_upsert_persona(isolated_database: Path) -> None:
     loaded = load_persona("  小雨 ")
 
     assert loaded == _persona(outfit="新围裙")
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM persona").fetchone()[0] == 1
 
 
@@ -85,7 +86,7 @@ def test_unknown_and_empty_persona_queries() -> None:
 
 def test_corrupt_style_tokens_are_rejected(isolated_database: Path) -> None:
     save_persona(_persona())
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             "UPDATE persona SET style_tokens_json = ? WHERE name = ?",
             ("not-json", "小雨"),

@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
-import { History, MessageSquareText } from 'lucide-vue-next'
-import WorkspaceShell from '../components/layout/WorkspaceShell.vue'
+import { History, MessageSquareText, Plus, Workflow } from 'lucide-vue-next'
+import WorkspaceShell from '../components/workspace/WorkspaceShell.vue'
 import { conversationTaskTitle } from '../components/chat/conversationPresentation'
 import ApprovalCard from '../components/approval/ApprovalCard.vue'
 import ChatMessageList from '../components/chat/ChatMessageList.vue'
@@ -9,19 +9,57 @@ import ConversationHistory from '../components/chat/ConversationHistory.vue'
 import MessageComposer from '../components/chat/MessageComposer.vue'
 import { visibleFastDomain, type FastDomain } from '../components/chat/fastDomainSelection'
 import SystemStatusInline from '../components/chat/SystemStatusInline.vue'
+import { domains } from '../domains'
 import { presenterFor } from '../domains/presenters'
 import { navigate, route } from '../router'
 import { createConversation, decideApproval, decideMediaCost, deleteConversation, getApprovals, getArtifact, getArtifactContentUrl, getArtifacts, getConversation, getConversations, getEvents, getRun, getTaskImageUrl, renameConversation, setConversationFastDomain, streamConversationMessage, subscribeRunEvents, type RuntimeEvent } from '../services/core'
 import type { Conversation, ConversationMessage, CoreApproval, CoreArtifact, CoreRun, MediaJob } from '../types'
 
 const props = withDefaults(defineProps<{ runs?: CoreRun[]; approvals?: CoreApproval[]; busy?: boolean; domain?: string; embedded?: boolean; initialRunId?: string; studioFocus?: boolean }>(), { runs: () => [], approvals: () => [], busy: false, embedded: false, studioFocus: false })
-const emit = defineEmits<{ refresh: []; runCreated: [run: CoreRun]; chatting: [active: boolean] }>()
+const emit = defineEmits<{ refresh: []; runCreated: [run: CoreRun]; chatting: [active: boolean]; selectStage: [nodeId: string] }>()
 const conversations = ref<Conversation[]>([])
 const historyOpen = ref(false)
 const navOpen = ref(!window.matchMedia('(max-width: 600px)').matches)
+/* 桌面端图标条折叠态：与 navOpen（抽屉显隐）独立，跨页共用同一 key 保持状态一致。
+   localStorage 在 SSR / 单元测试环境下不存在，必须容错，否则 setup 阶段直接抛错。 */
+const navCollapsedKey = 'kantoku-ws-nav-collapsed'
+function readNavCollapsed(): boolean {
+  try { return localStorage.getItem(navCollapsedKey) === '1' } catch { return false }
+}
+const navCollapsed = ref(readNavCollapsed())
+function toggleNavCollapsed(value: boolean): void {
+  navCollapsed.value = value
+  try { localStorage.setItem(navCollapsedKey, value ? '1' : '0') } catch { /* 忽略写入失败 */ }
+}
 const creatingConversation = ref(false)
-const navigation = [{ id: 'conversation', label: '对话', icon: MessageSquareText }]
+/* 首页形态：二级侧栏已整块移除（那里只有一个"对话"入口，等于一块空白竖条），
+   「最近对话」改为顶栏按钮 + 浮层。与 studioFocus 的历史聊天按钮（historyOpen）
+   是两套入口，各自独立，互不影响。 */
+const recentOpen = ref(false)
+const recentHost = ref<HTMLElement | null>(null)
+function pickConversation(id: string): void {
+  recentOpen.value = false
+  void selectConversation(id)
+}
+function closeRecentOnOutside(event: MouseEvent): void {
+  if (!recentOpen.value) return
+  const target = event.target
+  if (target instanceof Node && recentHost.value?.contains(target)) return
+  recentOpen.value = false
+}
+/* 第二层侧栏 = 当前领域的工作节点；文案来自 Domain Presenter，首页不显示。 */
+const navigation = computed(() => [
+  { id: 'conversation', label: '对话', icon: MessageSquareText },
+  ...(props.domain ? presenterFor(props.domain).workflow.map((node) => ({ id: node.id, label: node.label, icon: Workflow })) : []),
+])
+const activeWorkspacePage = computed(() => selectedWorkspaceNode.value || 'conversation')
 const conversationTitle = computed(() => conversations.value.find(item => item.id === conversationId.value)?.title ?? '新对话')
+const shellIdentity = computed(() => props.domain ? domainLabel(props.domain).name : 'Kantoku')
+const shellSubtitle = computed(() => props.domain ? domainLabel(props.domain).label : '对话工作区')
+function domainLabel(domain: string): { name: string; label: string } {
+  const found = domains.find((item) => item.id === domain)
+  return { name: found?.name ?? domain, label: found?.label ?? '' }
+}
 const conversationId = ref('')
 const messages = ref<ConversationMessage[]>([])
 const mediaJobs = ref<MediaJob[]>([])
@@ -230,6 +268,13 @@ async function loadMessageMedia(message: ConversationMessage, ownerId: string): 
   } finally {
     loadingMedia.delete(loadingKey)
   }
+}
+
+const selectedWorkspaceNode = ref('')
+/** 点击第二层节点：交给领域 Workspace 打开对应阶段页面。 */
+function selectWorkspaceNode(id: string): void {
+  selectedWorkspaceNode.value = id === 'conversation' ? '' : id
+  emit('selectStage', id)
 }
 
 async function newConversation(): Promise<void> {
@@ -634,8 +679,13 @@ async function decideMedia(requestId: string, decision: 'approve' | 'reject'): P
 }
 
 function openRun(run: CoreRun): void { navigate({ name: 'workspace_run', domain: run.domain, runId: run.id }) }
-onMounted(initialize)
+onMounted(() => {
+  // 点击浮层外部关闭；SSR/单测环境可能没有 document，这只是增强，缺了不影响功能。
+  try { document.addEventListener('click', closeRecentOnOutside) } catch { /* 忽略 */ }
+  void initialize()
+})
 onBeforeUnmount(() => {
+  try { document.removeEventListener('click', closeRecentOnOutside) } catch { /* 忽略 */ }
   if (mediaPollTimer) clearInterval(mediaPollTimer)
   stopEvents?.()
   for (const stop of homeStops.values()) stop()
@@ -666,11 +716,48 @@ watch(
 </script>
 
 <template>
-  <component :is="domain ? 'main' : WorkspaceShell" :class="domain ? ['chat-shell', { embedded, 'studio-focus': studioFocus, 'history-visible': historyOpen }] : 'home-workspace'" v-bind="domain ? {} : { navigation, activePage: 'conversation', navigationOpen: navOpen, creatingConversation, identity: 'Kantoku', subtitle: '对话工作区', workspaceLabel: '首页对话工作台', hideHeading: true }" @update:navigation-open="navOpen = $event" new-conversation-label="新建对话" @new-conversation="newConversation">
-    <template #toolbar><strong class="home-conversation-title">{{ conversationTitle }}</strong></template>
+  <WorkspaceShell
+    class="home-workspace"
+    :navigation="navigation"
+    :active-page="activeWorkspacePage"
+    v-model:navigation-open="navOpen"
+    :navigation-collapsed="navCollapsed"
+    :hide-navigation="!domain"
+    :flow-composer="!domain"
+    :creating-conversation="creatingConversation"
+    :identity="shellIdentity"
+    :subtitle="shellSubtitle"
+    :workspace-label="domain ? `${shellIdentity} 工作台` : '首页对话工作台'"
+    new-conversation-label="新建对话"
+    hide-heading
+    @update:navigation-collapsed="toggleNavCollapsed"
+    @new-conversation="newConversation"
+    @select-page="selectWorkspaceNode"
+  >
+    <template #toolbar>
+      <strong class="home-conversation-title">{{ conversationTitle }}</strong>
+      <slot name="workspace-toolbar" />
+      <!-- 首页：二级侧栏已移除，新建对话与最近对话改由顶栏承载。 -->
+      <div v-if="!domain" ref="recentHost" class="home-toolbar-actions">
+        <button class="ui-button quiet sm" type="button" :disabled="creatingConversation" @click="newConversation"><Plus :size="15" />新建对话</button>
+        <div class="home-recent">
+          <button class="ui-button quiet sm" type="button" :aria-expanded="recentOpen" aria-label="最近对话" @click="recentOpen = !recentOpen"><History :size="15" />最近对话</button>
+          <Transition name="home-pop">
+            <div v-if="recentOpen" class="home-recent-pop" role="dialog" aria-label="最近对话列表">
+              <ConversationHistory list-only :conversations="conversations" :active-id="conversationId" :busy="creatingConversation" @select="pickConversation" @rename="renameChat" @remove="removeChat" />
+            </div>
+          </Transition>
+        </div>
+      </div>
+    </template>
+    <template #stage><slot name="workspace-stage" /></template>
     <template #recent><ConversationHistory list-only :conversations="conversations" :active-id="conversationId" :busy="creatingConversation" @select="selectConversation" @rename="renameChat" @remove="removeChat" /></template>
-    <template #composer><MessageComposer :key="conversationId" ref="composer" fast-domains :fast-domain="fastDomain" :fast-domain-busy="switchingFastDomain || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" /><p class="home-composer-hint">{{ fastDomain === 'comic' ? '自动完成分析与生图，图片会保留在当前对话。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接提问或描述创意，结果会保留在当前对话。' }}</p></template>
-    <ConversationHistory v-if="domain && (!studioFocus || historyOpen)" :conversations="conversations" :active-id="conversationId" :busy="sending" @create="newConversation" @select="(id) => { void selectConversation(id); if (studioFocus) historyOpen = false }" @rename="renameChat" @remove="removeChat" />
+    <template #composer>
+      <div v-if="domain" class="composer-options"><label class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label><small>先优化提示词，再进入专业制作流程</small></div>
+      <MessageComposer v-if="!domain" :key="conversationId" ref="composer" fast-domains :fast-domain="fastDomain" :fast-domain-busy="switchingFastDomain || !!dispatchingFastDomain[conversationId]" @select-fast-domain="selectFastDomain" @send="send" />
+      <MessageComposer v-else :key="conversationId" ref="composer" :disabled="sending" @send="send" />
+      <p class="home-composer-hint">{{ domain ? '描述目标，监督酱会逐步确认细节与结果。' : fastDomain === 'comic' ? '自动完成分析与生图，图片会保留在当前对话。' : fastDomain ? '快捷模式会自动处理；只有费用或必要审核才会请你决定。' : '直接提问或描述创意，结果会保留在当前对话。' }}</p>
+    </template>
     <div class="chat-home" :class="{ embedded, 'fast-chat': !domain }">
     <header v-if="domain" class="chat-home-head">
       <div v-if="studioFocus"><h1>AI 导演</h1></div>
@@ -681,13 +768,24 @@ watch(
     <div v-if="domain === 'commerce'" class="commerce-mode"><span>商品数据</span><button type="button" :aria-pressed="dataMode === 'production'" @click="dataMode = 'production'">Production</button><button type="button" :aria-pressed="dataMode === 'demo'" @click="dataMode = 'demo'">DEMO · Mock Data</button><strong v-if="dataMode === 'demo'">模拟数据，不代表真实市场商品</strong></div>
     <ChatMessageList :messages="messages" :media-jobs="mediaJobs" :streaming="streaming" :streaming-by-message="streamingByMessage" :run="activeRun" :activities="activities" :public-activities="publicActivities" :image-url="imageUrl" :inline-runs="inlineRuns" :pending-messages="pendingMessages" :activity-by-message="activityByMessage" :image-phases="imagePhases" :message-media="messageMedia" :message-media-errors="messageMediaErrors" :error-message-id="errorMessageId" :home-mode="!domain" :error="error" :empty-hint="domain ? presenterFor(domain).guideHint : undefined" :examples="domain ? presenterFor(domain).examples : undefined" :approval-busy="deciding" @retry="lastContent && send(lastContent)" @open-run="openRun" @decide-inline="decideInline" @decide-media="decideMedia" @example="(text) => composer?.fill(text)" />
     <div v-if="domain && pendingApproval" class="home-approval"><ApprovalCard :approval="pendingApproval" :domain="activeRun?.domain ?? 'studio'" :busy="sending" :image-url="imageUrl" @decide="decide" /></div>
-    <div v-if="domain" class="composer-dock"><MessageComposer ref="composer" :disabled="sending" @send="send" /><p><label class="enhance-toggle"><input v-model="enhancePrompt" type="checkbox" />AI 优化提示词</label>勾选后先优化提示词，再进入专业制作流程。</p></div>
     </div>
-  </component>
+  </WorkspaceShell>
 </template>
 
 <style scoped>
 .home-workspace .chat-home { height:100%; min-height:0; width:100%; }
 .home-conversation-title { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; font-size:14px; font-weight:600; }
 .home-composer-hint { margin:8px 0 0; color:var(--text-muted); font-size:11px; text-align:center; }
+/* 首页流式布局：对话区高度交给内容决定，滚动由 WorkspaceShell 的 .ws-shell-body.is-flow 承担。
+   这里必须用 :deep() —— .ws-shell-body 属于 WorkspaceShell，本组件的 scoped 属性不落在它身上；
+   同时该选择器要比上面那条 .home-workspace .chat-home 更具体，才能真正覆盖 height。 */
+.home-workspace :deep(.ws-shell-body.is-flow) .chat-home { height:auto; }
+.home-toolbar-actions { display:flex; align-items:center; gap:8px; margin-left:auto; }
+.home-recent { position:relative; }
+.home-recent-pop { position:absolute; z-index:30; top:calc(100% + 8px); right:0; display:flex; flex-direction:column; width:min(300px, 80vw); max-height:min(440px, 62vh); padding:12px 12px 4px; background:var(--surface); border:1px solid var(--border); border-radius:var(--radius-panel); box-shadow:var(--shadow-pop); }
+.home-recent-pop :deep(.conversation-list) { min-height:0; max-height:340px; }
+/* 浮层进出：与全站一致的克制动效（位移 4px，无回弹）。 */
+.home-pop-enter-active, .home-pop-leave-active { transition:opacity var(--duration-fast) var(--ease-standard), transform var(--duration-fast) var(--ease-out); }
+.home-pop-enter-from, .home-pop-leave-to { opacity:0; transform:translateY(-4px); }
+@media (prefers-reduced-motion:reduce) { .home-pop-enter-active, .home-pop-leave-active { transition:none; } }
 </style>

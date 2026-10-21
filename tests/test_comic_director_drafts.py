@@ -130,6 +130,92 @@ def test_instruction_revision_only_uses_current_bound_draft(app, model, monkeypa
     assert not saved["user_confirmed"]
 
 
+def test_compact_instruction_revision_preserves_draft_memory_and_history(app, model, monkeypatch):
+    conversation = app.create_conversation({"domain": "comic", "interaction_mode": "guided"})
+    project_id = _project(app.comic_projects)
+    spec = _execute(app, project_id, "professional", conversation_id=conversation["id"])[
+        "director_spec"]
+    original = app.comic_projects.get_director(project_id)
+    seen = []
+
+    def edit(messages):
+        payload = json.loads(messages[1]["content"])
+        seen.append(payload)
+        assert "changes" in messages[0]["content"]
+        return json.dumps({"changes": {
+            "director_plan.character_expression": "满怀爱意，直视镜头",
+            "director_plan.composition_strategy": "人物位于右三分线，左侧保留环境",
+            "cinematography.camera_language": "平视，视线交于镜头",
+        }}, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", edit)
+    saved = app.create_comic_director(project_id, _body(
+        app, project_id, spec, revision_instruction="她满怀爱意看着镜头，调整构图",
+        conversation_id=conversation["id"],
+    ))
+    lock = seen[0]["context"]["stable_context"]["creative_context_lock"]
+    assert lock and not lock["director_confirmed"]
+    assert lock["anchors"]["director_version"] == 1
+    assert saved["version"] == 2 and saved["review_required"]
+    assert saved["critic_result"] is None and not saved["user_confirmed"]
+    for field in ("character_presence", "subject_environment_relation", "style_boundary"):
+        assert saved["director_plan"][field] == getattr(original.director_plan, field)
+    assert saved["creative_decision"] == original.model_dump(mode="json")["creative_decision"]
+    assert saved["composition"] == saved["director_plan"]["composition_strategy"]
+    assert next(item for item in app.comic_projects.director_versions(project_id)
+                if item.version == 1) == original
+    provenance = saved["field_provenance"]
+    assert provenance["director_plan.character_expression"]["source_type"] == "model_choice"
+    assert provenance["director_plan.visual_strategy"] == spec["field_provenance"][
+        "director_plan.visual_strategy"]
+    runs = app.list_comic_project_tasks(project_id)["tasks"]
+    revision = next(item for item in runs if item.get("director_spec", {}).get("version") == 2)
+    assert app.runtime_store.get_run(revision["run_id"]).state["revision_instruction"] == (
+        "她满怀爱意看着镜头，调整构图")
+
+
+@pytest.mark.parametrize("output", [
+    '{"changes": {"director_plan.visual_strategy": "truncated',
+    '{"changes": {}}',
+    '{"changes": {"creative_decision.hard_constraints": []}}',
+    '{"changes": {"asset_versions": {}}}',
+    '{"changes": {"director_plan": {"visual_strategy": "invalid"}}}',
+    '{"changes": {"director_plan.continuity_rules": "not a list"}}',
+    '{"changes": {"director_plan.visual_strategy": "valid"}, "reasoning": "private"}',
+])
+def test_invalid_revision_never_saves_a_partial_or_unbound_plan(app, model, monkeypatch, output):
+    project_id = _project(app.comic_projects)
+    spec = _execute(app, project_id, "fast")["director_spec"]
+    original = app.comic_projects.get_director(project_id)
+    monkeypatch.setattr(app, "_comic_director_model", lambda _: output)
+    with pytest.raises(ToolError, match="有效公开草稿"):
+        app.create_comic_director(project_id, _body(
+            app, project_id, spec, revision_instruction="调整人物表情",
+        ))
+    assert app.comic_projects.get_director(project_id) == original
+    assert len(app.comic_projects.director_versions(project_id)) == 1
+
+
+def test_instruction_revision_cannot_cross_conversations_or_versions(app, model, monkeypatch):
+    owner = app.create_conversation({"domain": "comic", "interaction_mode": "guided"})
+    other = app.create_conversation({"domain": "comic", "interaction_mode": "guided"})
+    project_id = _project(app.comic_projects)
+    spec = _execute(app, project_id, "fast", conversation_id=owner["id"])["director_spec"]
+    calls = []
+    monkeypatch.setattr(app, "_comic_director_model", lambda messages: calls.append(messages))
+    with pytest.raises(ToolError, match="其他对话"):
+        app.create_comic_director(project_id, _body(
+            app, project_id, spec, revision_instruction="调整表情", conversation_id=other["id"],
+        ))
+    with pytest.raises(ToolError, match="已更新"):
+        app.create_comic_director(project_id, _body(
+            app, project_id, spec, expected_director_version=2,
+            revision_instruction="调整表情", conversation_id=owner["id"],
+        ))
+    assert calls == []
+    assert app.comic_projects.get_director(project_id).version == 1
+
+
 def test_confirmed_draft_with_changed_asset_cannot_start_next_workflow(app, model, monkeypatch):
     project_id = _project(app.comic_projects)
     asset = app.comic_assets.create(project_id, _style(), expected_project_version=1)

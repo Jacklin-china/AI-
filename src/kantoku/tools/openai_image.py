@@ -20,7 +20,13 @@ from loguru import logger
 from openai import APIStatusError, OpenAI
 
 from kantoku.config import ConfigError, ToolError, get_settings
-from kantoku.config.settings import ROOT, ImageSettings
+from kantoku.config.runtime_paths import (
+    atomic_write_bytes,
+    atomic_write_text,
+    get_runtime_paths,
+    resolve_runtime_path,
+)
+from kantoku.config.settings import ImageSettings
 from kantoku.core.tracing import Trace, write_trace
 from kantoku.schemas.media import ImageGenerationResult
 from kantoku.tools.image_gen import ProviderAccessResult, RequestIdentityValue
@@ -80,7 +86,7 @@ class OpenAIImageProvider:
 
     @staticmethod
     def _output_dir(configured: Path) -> Path:
-        return configured if configured.is_absolute() else ROOT / configured
+        return resolve_runtime_path(configured)
 
     def _validate_configuration(self) -> None:
         self._validate_endpoint()
@@ -299,7 +305,9 @@ class OpenAIImageProvider:
             try:
                 payload = json.loads(pending_url.read_text(encoding="utf-8"))
                 self._save_image(provider_job_id, self._download_url(payload["url"]))
-                pending_url.unlink()
+                # Legacy recovery pointers predate file registration; retain them.
+                get_runtime_paths().remove_file(pending_url, file_type="recovery",
+                                               if_registered=True)
             except (OSError, ValueError, KeyError, TypeError) as error:
                 raise ToolError(
                     "生图结果下载未完成，保留原供应商结果供继续查询",
@@ -332,11 +340,8 @@ class OpenAIImageProvider:
     def _save_pending_url(self, provider_job_id: str, url: str) -> None:
         self._check_result_url(url)
         path = self._pending_url_path(provider_job_id)
-        temporary = path.with_suffix(".tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            temporary.write_text(json.dumps({"url": url}), encoding="utf-8")
-            temporary.replace(path)
+            atomic_write_text(path, json.dumps({"url": url}), file_type="recovery")
         except OSError as error:
             raise ToolError("供应商图片地址保存失败", detail=type(error).__name__) from error
 
@@ -362,15 +367,12 @@ class OpenAIImageProvider:
         if not image_bytes.startswith(_PNG_SIGNATURE):
             raise ToolError("GPT-Image 返回的图片不是有效 PNG 数据，费用需要人工对账")
         path = self._path_for(provider_job_id)
-        temporary = path.with_suffix(".png.tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             if path.is_file():
                 if path.read_bytes() != image_bytes:
                     raise ToolError("同一 GPT-Image 请求返回不同图片，已保留原文件")
                 return path
-            temporary.write_bytes(image_bytes)
-            temporary.replace(path)
+            atomic_write_bytes(path, image_bytes)
         except ToolError:
             raise
         except OSError as error:

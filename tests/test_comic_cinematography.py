@@ -101,12 +101,22 @@ def test_camera_failure_saves_real_v2_draft_and_can_resume(tmp_path, mode, outpu
     assert run.state["stage_statuses"][SKILLS[1]] == "completed"
     assert run.state["stage_statuses"][SKILLS[2]] == "needs_revision"
     assert SKILLS[2] not in run.state["completed_stages"]
-    spec = store.get_director(project_id)
-    assert spec.schema_version == 2 and spec.cinematography.status != "complete"
-    assert spec.critic_result.verdict == "needs_revision"
-    assert spec.cinematography.material_language is None
-    with pytest.raises(ToolError, match="摄影方案待修订"):
-        require_approved_director(spec)
+    if mode == "professional":
+        assert result.director_spec is None and run.state["generation_incomplete"]
+        assert run.state["task_status"] == "generation_incomplete"
+        candidate = DirectorSpecDraft.model_validate(run.state["director_candidate"])
+        # 未完成校验的候选会作为草稿保存以便恢复；它不得被视为已确认方案，
+        # 下方 require_approved_director 仍必须拒绝投产。
+        saved_draft = store.get_director(project_id)
+        assert not store.human_director_confirmed(saved_draft)
+        assert director_execution_summary(run)["critic_feedback"] == []
+    else:
+        candidate = store.get_director(project_id)
+    assert candidate.schema_version == 2 and candidate.cinematography.status != "complete"
+    assert candidate.critic_result.verdict == "needs_revision"
+    assert candidate.cinematography.material_language is None
+    with pytest.raises(ToolError, match="待修订"):
+        require_approved_director(candidate)
     events = [item.payload for item in runtime.list_events(run.id)]
     names = {item["director_event"] for item in events}
     assert {"node_warning", "stage_output_saved", "director_draft_created"} <= names
@@ -125,6 +135,7 @@ def test_camera_failure_saves_real_v2_draft_and_can_resume(tmp_path, mode, outpu
     ))
     assert calls == [SKILLS[2]]
     assert runtime.get_run(resumed.run_id).status is ExecutionStatus.COMPLETED
+    # 两种模式都会先保存未完成校验的草稿以便恢复与继承，因此恢复后为 v2。
     assert resumed.director_spec.version == 2
 
 
@@ -175,11 +186,13 @@ def test_complete_legacy_camera_fingerprint_is_unchanged_and_incomplete_cannot_p
     payload.pop("critic_status")
     payload.pop("field_provenance")
     payload.pop("execution_policy")
+    payload.pop("reference_context")
     payload["cinematography"].pop("unresolved_decisions")
     payload["cinematography"].pop("status")
     payload["cinematography"].pop("public_decision")
     payload["cinematography"].pop("creative_reason")
-    for key in ("style_boundary", "character_expression", "character_pose", "character_presence"):
+    for key in ("style_boundary", "character_expression", "character_pose", "character_presence",
+                "characters_present"):
         payload["director_plan"].pop(key)
     legacy_hash = hashlib.sha256(json.dumps(
         payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
@@ -196,3 +209,47 @@ def test_complete_legacy_camera_fingerprint_is_unchanged_and_incomplete_cannot_p
     result = critic.review(partial, brief)
     assert result.verdict == "needs_revision" and calls == []
     assert result.allowed_patches == []
+
+
+@pytest.mark.parametrize("value,unresolved", [
+    ("近景特写", False),
+    ("第一人称近景特写", False),
+    ("中近景", False),
+    ("近景", False),
+    ("近景或特写", True),
+    ("中景、近景", True),
+])
+def test_compound_shot_size_is_one_decision(value, unresolved):
+    """“近景特写”这类复合表述指一个紧景别，不是两个候选。
+
+    此前按字符集去重，把复合词判成“未确定”，摄影方案无法完成，
+    导演方案因此一直无法确认。
+    """
+    from kantoku.domains.comic.cinematography import unresolved_execution
+
+    got = unresolved_execution({"shot_size": value}, ("shot_size",))
+    assert ("shot_size" in got) is unresolved
+
+
+@pytest.mark.parametrize("value,unresolved", [
+    ("呈现思考或远望时的静止神态", False),
+    ("眼神专注而略带疏离，嘴角自然放松", False),
+    ("目光凝视画面外右侧的固定一点", False),
+    ("为投掷或挥击留出空间", False),
+    ("近景或远景", True),
+    ("或者近景，或者远景", True),
+    ("任选一种机位", True),
+    ("先近景后特写", True),
+])
+def test_descriptive_or_is_not_an_undecided_parameter(value, unresolved):
+    """描述性并列里的单字“或”不是参数候选。
+
+    此前对单字“或”一刀切，把定稿文案里的“呈现思考或远望时的静止神态”
+    判成未定参数，方案永远提示“尚未确定唯一执行方案”，无法确认。
+    真正的候选由摄影参数词表负责识别。
+    """
+    from kantoku.domains.comic.cinematography import unresolved_execution
+
+    fields = ("character_expression", "composition_strategy")
+    got = unresolved_execution({"character_expression": value}, fields)
+    assert ("character_expression" in got) is unresolved

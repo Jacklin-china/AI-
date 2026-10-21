@@ -3,8 +3,13 @@
 from __future__ import annotations
 
 import argparse
+import signal
+
+from loguru import logger
 
 from kantoku.config.logging_setup import archive_development_log, setup_logging
+from kantoku.config.runtime_paths import get_runtime_paths
+from kantoku.core.database import database_manager
 from kantoku.doctor import print_doctor
 from kantoku.shells.web_studio import serve
 
@@ -21,19 +26,37 @@ def main() -> int:
     logs_parser.add_argument("action", choices=["archive"])
     args = parser.parse_args()
     if args.command == "logs":
-        archived = archive_development_log()
-        print(
-            f"Archived application log: {archived}"
-            if archived else "No application log to archive"
-        )
+        try:
+            archived = archive_development_log()
+            print(
+                f"Archived application log: {archived}"
+                if archived else "No application log to archive"
+            )
+        finally:
+            get_runtime_paths().close_staging()
+            database_manager.checkpoint_all()
         return 0
-    setup_logging()
     if args.command == "doctor":
         return print_doctor(live=args.live)
-    return serve(
-        port=getattr(args, "port", 8000),
-        open_browser=not getattr(args, "no_browser", False),
-    )
+
+    def interrupted(_signum, _frame):
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, interrupted)
+    if hasattr(signal, "SIGBREAK"):
+        signal.signal(signal.SIGBREAK, interrupted)
+    try:
+        setup_logging()
+        return serve(
+            port=getattr(args, "port", 8000),
+            open_browser=not getattr(args, "no_browser", False),
+        )
+    finally:
+        try:
+            get_runtime_paths().close_staging()
+            database_manager.checkpoint_all()
+        finally:
+            logger.remove()
 
 
 if __name__ == "__main__":

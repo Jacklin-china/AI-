@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import os
 import queue
-import shutil
 import threading
 import tkinter as tk
 from collections.abc import Callable
@@ -12,6 +11,7 @@ from pathlib import Path
 from tkinter import filedialog, messagebox, simpledialog, ttk
 
 from kantoku.config import KantokuError, get_settings
+from kantoku.config.runtime_paths import atomic_write_bytes, get_runtime_paths
 from kantoku.config.settings import ROOT
 from kantoku.core import budget
 from kantoku.perception.qc import qc_image
@@ -354,7 +354,7 @@ class Studio:
         if target:
             try:
                 if Path(target).resolve() != source:
-                    shutil.copy2(source, target)
+                    atomic_write_bytes(Path(target), source.read_bytes(), file_type="export")
                 self.status.set(f"图片已保存：{target}。请人工检查主体、细节、文字和使用授权。")
             except OSError as error:
                 self.error(error)
@@ -366,7 +366,7 @@ class Studio:
     def open_folder(self) -> None:
         try:
             directory = task_directory()
-            directory.mkdir(parents=True, exist_ok=True)
+            get_runtime_paths().ensure_directory(directory)
             self.open_path(directory)
         except OSError as error:
             self.error(error)

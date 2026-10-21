@@ -6,13 +6,17 @@ import hashlib
 import json
 import re
 import sqlite3
-from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
 
 from kantoku.config import ToolError, get_settings
+from kantoku.config.runtime_paths import (
+    atomic_write_bytes,
+    resolve_runtime_path,
+)
 from kantoku.config.settings import ROOT
 from kantoku.core.budget import get_reservation, load_generation_result
+from kantoku.core.database import database_manager
 from kantoku.perception.review import load_human_review
 from kantoku.tools.storyboard import load_storyboard
 
@@ -37,7 +41,7 @@ class ArchiveResult:
 
 def _database_path() -> Path:
     configured = get_settings().storage.sqlite_path
-    return configured if configured.is_absolute() else ROOT / configured
+    return resolve_runtime_path(configured)
 
 
 def _archive_root() -> Path:
@@ -70,14 +74,9 @@ def _write_once(path: Path, data: bytes) -> None:
         except OSError as error:
             raise ToolError("无法核对已有归档文件", detail=type(error).__name__) from error
         raise ToolError("归档目标已存在且内容不同，禁止覆盖")
-    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_bytes(data)
-        temporary.replace(path)
+        atomic_write_bytes(path, data)
     except OSError as error:
-        with suppress(OSError):
-            temporary.unlink(missing_ok=True)
         raise ToolError("归档文件写入失败", detail=type(error).__name__) from error
 
 
@@ -105,8 +104,7 @@ def _index_archive(result: ArchiveResult) -> None:
     database_path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path, timeout=30)
+        connection = database_manager.connect(database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         with connection:
@@ -180,8 +178,7 @@ def search_archived_images(
     connection: sqlite3.Connection | None = None
     try:
         database_path = _database_path()
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path, timeout=30)
+        connection = database_manager.connect(database_path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         rows = connection.execute(

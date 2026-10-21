@@ -40,7 +40,7 @@ function find(node, predicate) {
 }
 
 test('actual plus handler opens/closes the menu and each domain emits its real ID', async () => {
-  for (const domain of ['comic', 'commerce', 'studio']) {
+  for (const domain of ['comic']) {
     const host = element('root')
     const selected = []
     const app = renderer.createApp({ render: () => h(Composer, {
@@ -53,7 +53,9 @@ test('actual plus handler opens/closes the menu and each domain emits its real I
     assert.equal(plus().props['aria-expanded'], true)
     const menu = find(host, node => node.props.role === 'menu')
     assert.ok(menu)
-    menu.children.filter(node => node.props.role === 'menuitem')[['comic', 'commerce', 'studio'].indexOf(domain)].props.onClick()
+    const choices = menu.children.filter(node => node.props.role === 'menuitem')
+    assert.equal(choices.length, 1)
+    choices[0].props.onClick()
     await nextTick()
     assert.deepEqual(selected, [domain])
     assert.equal(plus().props['aria-expanded'], false)
@@ -62,4 +64,20 @@ test('actual plus handler opens/closes the menu and each domain emits its real I
     assert.equal(find(host, node => node.props.role === 'menu'), null)
     app.unmount()
   }
+})
+
+test('the actual composer leaves selection and copy/paste shortcuts to the browser', async () => {
+  const host = element('root'), sent = []
+  const app = renderer.createApp({ render: () => h(Composer, { onSend: text => sent.push(text) }) })
+  app.mount(host)
+  const input = find(host, node => node.tag === 'textarea')
+  let prevented = 0
+  for (const key of ['a', 'c', 'v', 'x', 'ArrowLeft', 'ArrowRight']) {
+    input.props.onKeydown({ key, ctrlKey: true, shiftKey: key.startsWith('Arrow'),
+      preventDefault() { prevented++ } })
+  }
+  assert.equal(prevented, 0)
+  assert.deepEqual(sent, [])
+  assert.equal(input.props.disabled, false)
+  app.unmount()
 })

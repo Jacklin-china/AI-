@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import base64
-import binascii
 import hashlib
 import json
 import re
@@ -23,13 +21,20 @@ from kantoku.config.runtime_paths import (
     get_runtime_paths,
     validate_runtime_path,
 )
+from kantoku.core.conversation_context import SourceRef
 from kantoku.core.runtime.models import ArtifactRecord, ArtifactType, utc_now
 from kantoku.core.runtime.store import RuntimeStore
 
 from .assets import ComicAssetStore
+from .constraints import (
+    CONSTRAINT_CONTRACT,
+    image_edit_constraint_basis,
+    verify_prompt_constraints,
+)
 from .context_declaration import BIBLE_SOURCE_KEYS
 from .critic import require_approved_director
 from .director_provenance import provenance_context, value_hash
+from .media import ComicMediaStore, decode_image
 from .models import (
     ComicAsset,
     ComicProjectSnapshot,
@@ -39,15 +44,20 @@ from .models import (
     ComicPromptDraft,
     ComicShot,
     ComicStoryboard,
+    CompleteImagePromptOutput,
+    CreativeConstraint,
     DirectorSpec,
+    ImageEditDraft,
+    ImageVersionRef,
     ShotStatus,
 )
 from .projects import ComicContextBuilder, ComicProjectStore
 from .storyboards import ComicStoryboardStore
 
-COMPILER_VERSION = "comic-prompt-3"
+COMPILER_VERSION = "comic-prompt-5"
 CONTEXT_VERSION = "image-bibles-1"
 BIBLE_CONTRACT = "separated-contexts-1"
+SEMANTIC_BIBLE_CONTRACT = "semantic-contexts-2"
 PROMPT_SECTIONS = {
     "character_context": "Character Bible / 人物设定",
     "world_context": "World Bible / 世界观设定",
@@ -58,33 +68,51 @@ PROMPT_SECTIONS = {
 
 def image_prompt(draft: ComicPromptDraft) -> str:
     """复制和 Provider 使用同一份内容，负向约束不能在提交时丢失。"""
-    return draft.positive_prompt + ("\n\nNegative Constraint / 禁止内容\n" + draft.negative_prompt
-                                    if draft.negative_prompt else "")
+    continuity = draft.context_sources.get("image_references", {}).get("continuity")
+    reference = ""
+    if continuity:
+        image = continuity["image"]
+        changes = "；".join(dict.fromkeys(item["quote"] for item in continuity["changes"]))
+        reference = (
+            f"请附上已采用的参考图片：{image['filename']}（v{image['version']}，"
+            f"SHA-256 {image['sha256']}）。文件名、版本和指纹仅用于 Kantoku 来源追踪，"
+            "不是图片地址或检索条件。外部应用可能重命名附件或转为 PNG，"
+            "请以本条消息实际附带的参考图为视觉基准，保留未被本轮明确修改的"
+            "主体身份与数量、外貌、服装、道具、场景结构、风格、构图和摄影。"
+            "下文是完整目标画面；不得将未改元素重新设计。"
+            + (f"本轮允许的变化：{changes}。" if changes else "本轮未授权改变既有视觉元素。")
+            + "没有附上这张参考图时，先要求提供参考图，不要仅凭文字重新猜画面。\n\n")
+    return reference + draft.positive_prompt + (
+        "\n\nNegative Constraint / 禁止内容\n" + draft.negative_prompt
+        if draft.negative_prompt else "")
 
 
 def prompt_fingerprint(draft: ComicPromptDraft) -> str:
     return value_hash({"positive": draft.positive_prompt, "negative": draft.negative_prompt})
 
 
-def prompt_sections(text: str) -> dict[str, str]:
+def prompt_sections(text: str, *, allow_empty: bool = False) -> dict[str, str]:
     """编辑的正文解析回已有 Prompt 修订，不保留与编辑内容不一致的 Bible。"""
-    result = {}
-    remaining = text
-    for name, heading in reversed(PROMPT_SECTIONS.items()):
-        if text.count(heading + "\n") != 1:
-            raise ToolError("完整 Prompt 标题缺失或重复",
-                            detail=f"module=prompt.sections field={name}")
-        prefix, separator, body = remaining.rpartition(heading + "\n")
-        if not separator or not body.strip():
-            raise ToolError("完整 Prompt 缺少内容", detail=f"module=prompt.sections field={name}")
-        result[name] = body.strip()
-        remaining = prefix.rstrip()
-    if remaining.strip():
+    pattern = (r"(?m)^(" + "|".join(re.escape(value)
+               for value in PROMPT_SECTIONS.values()) + r")\r?$")
+    headings = list(re.finditer(pattern, text))
+    if [item[1] for item in headings] != list(PROMPT_SECTIONS.values()):
+        raise ToolError("完整 Prompt 标题缺失、重复或顺序不正确",
+                        detail="module=prompt.sections field=headings")
+    if text[:headings[0].start()].strip():
         raise ToolError("完整 Prompt 标题前存在未归属内容", detail="module=prompt.sections")
+    result = {}
+    for index, name in enumerate(PROMPT_SECTIONS):
+        end = headings[index + 1].start() if index + 1 < len(headings) else len(text)
+        body = text[headings[index].end():end].strip()
+        if not body and not allow_empty:
+            raise ToolError("完整 Prompt 缺少内容", detail=f"module=prompt.sections field={name}")
+        result[name] = body
     return result
 
 
-def _asset_context(contexts: ComicPromptContexts, assets: list[ComicAsset]) -> None:
+def _asset_context(contexts: ComicPromptContexts, assets: list[ComicAsset], *,
+                   semantic_scope: bool = False) -> None:
     """固定事实按已有资产字段归属写入；场景/风格光线只进入 Shot。"""
     routes = {
         "character": {"appearance": ("character_context", "appearance"),
@@ -109,7 +137,7 @@ def _asset_context(contexts: ComicPromptContexts, assets: list[ComicAsset]) -> N
         for name, value in asset.details.model_dump(exclude={"kind"}).items():
             section, field = routes[asset.details.kind][name]
             if asset.details.kind == "style" and name == "camera_language" and value:
-                shot_field = ComicPromptContext.shot_field(value)
+                shot_field = "camera" if semantic_scope else ComicPromptContext.shot_field(value)
                 if shot_field:
                     section, field = "shot_context", shot_field
             target = getattr(contexts, section)
@@ -119,10 +147,133 @@ def _asset_context(contexts: ComicPromptContexts, assets: list[ComicAsset]) -> N
         # 自由文本约束由模型按语义归属，末尾仍核验原文；不能随意塞入构图。
 
 
+def prompt_constraints(snapshot: ComicProjectSnapshot,
+                       assets: list[ComicAsset]) -> list[CreativeConstraint]:
+    result = list(snapshot.creative_brief.semantic_constraints)
+    for asset in assets:
+        for requirement in asset.fixed_constraints:
+            result.append(CreativeConstraint(
+                constraint_id="constraint-" + value_hash({"asset": asset.asset_id,
+                    "version": asset.version, "requirement": requirement})[:24],
+                requirement=requirement, target=asset.name,
+                scope={"character": "identity", "scene": "world", "style": "style"}[
+                    asset.details.kind],
+                source_ref=SourceRef(id=f"asset:{asset.project_id}:{asset.asset_id}:{asset.version}",
+                                     kind="resource", version=asset.version),
+                source_quote=requirement, origin="asset_fact", trust="source_verified"))
+    return result
+
+
+# 用户要求按 scope 落到既有段落字段；这里只做定位，不新增合约字段。
+CONSTRAINT_SECTION_FIELDS: dict[str, tuple[str, tuple[tuple[str, str, int], ...]]] = {
+    "identity": ("character_context", (
+        ("appearance", "外貌", 600), ("clothing", "服装", 600),
+        ("fixed_features", "固定特征", 600), ("identity", "身份", 300))),
+    "world": ("world_context", (
+        ("environment", "环境", 1000), ("location", "地点", 600),
+        ("world_setting", "世界观", 600), ("time", "时间", 300))),
+    "style": ("style_context", (
+        ("art_style", "艺术风格", 600), ("photographic_style", "摄影风格", 600),
+        ("materials", "材质", 600), ("color", "色彩", 600))),
+    "shot": ("shot_context", (
+        ("pose", "姿态", 600), ("action", "动作", 600), ("camera", "镜头", 600),
+        ("composition", "构图", 600), ("lighting_changes", "光影变化", 1000))),
+    "output": ("shot_context", (
+        ("action", "动作", 600), ("composition", "构图", 600), ("camera", "镜头", 600))),
+}
+# 表情与神态在既有约定中由 Shot 的“姿态”承载，与 execution_emotion 投影保持一致。
+EXPRESSION_TERMS = re.compile(r"表情|神态|目光|眼神|情绪|神情|爱意")
+SECTION_MAX_CHARS = 2000
+# 正文未承载用户要求：语义覆盖缺失或原样文字缺失，都属于可补齐的编译遗漏。
+CONSTRAINT_GAP_PREFIXES = ("module=comic.constraints stage=coverage",
+                           "module=comic.constraints stage=exact")
+
+
+def constraint_gap_ids(error: ToolError) -> list[str]:
+    """从公开核验结论取回未被正文承载的要求编号，不解析自由文本。"""
+    ids = list(getattr(error, "review_uncovered", None) or [])
+    for issue in getattr(error, "review_issues", None) or []:
+        for constraint_id in issue.get("requirement_ids") or []:
+            if constraint_id not in ids:
+                ids.append(constraint_id)
+    return ids
+
+
+def _append_section_field(text: str, label: str, addition: str, limit: int) -> str | None:
+    """在既有字段行追加一句要求；字段已满或超长时返回 None 交给下一个字段。"""
+    lines = text.splitlines()
+    for index, line in enumerate(lines):
+        name, separator, value = line.partition("：")
+        if not separator or name != label:
+            continue
+        room = limit - len(value.strip()) - 1
+        if room <= 0:
+            return None
+        merged = "；".join(filter(None, [value.strip(), addition[:room]]))
+        lines[index] = f"{name}：{merged}"
+        return "\n".join(lines)
+    candidate = f"{label}：{addition[:limit]}"
+    return "\n".join([*lines, candidate]) if len(candidate) <= limit else None
+
+
+def project_constraint_requirements(
+    draft: ComicPromptDraft, constraints: list[CreativeConstraint],
+    constraint_ids: list[str], *, complete_prompt: bool,
+) -> list[dict[str, Any]]:
+    """把核验确认未被正文承载的用户要求写入对应字段。
+
+    只增补缺项，不改写已通过的句子，也不重新设计角色；写入位置沿用既有字段合约。
+    """
+    targets = {item.constraint_id: item for item in constraints}
+    projected: list[dict[str, Any]] = []
+    for constraint_id in constraint_ids:
+        item = targets.get(constraint_id)
+        if item is None or item.status != "active" or item.origin == "model_choice":
+            continue
+        text = (item.literal_value if item.verification == "exact" and item.literal_value
+                else item.requirement)
+        text = (text or "").strip()
+        if not text:
+            continue
+        if not complete_prompt:
+            if text in draft.positive_prompt:
+                continue
+            merged = "；".join(filter(None, [draft.positive_prompt.strip(), text]))
+            if len(merged) > 4000:
+                continue
+            draft.positive_prompt = merged
+            projected.append({"constraint_id": constraint_id, "field": "positive_prompt"})
+            continue
+        if any(text in getattr(draft, name) for name in PROMPT_SECTIONS):
+            continue
+        section, fields = CONSTRAINT_SECTION_FIELDS.get(
+            item.scope, CONSTRAINT_SECTION_FIELDS["shot"])
+        addition = (f"神态与情绪：{text}" if EXPRESSION_TERMS.search(f"{item.target}{text}")
+                    else text)
+        current = getattr(draft, section)
+        for _name, label, limit in fields:
+            updated = _append_section_field(current, label, addition, limit)
+            if updated is None or len(updated) > SECTION_MAX_CHARS:
+                continue
+            setattr(draft, section, updated)
+            projected.append({"constraint_id": constraint_id, "field": f"{section}.{label}"})
+            break
+    if projected and complete_prompt:
+        # 保存时以 positive_prompt 为准重建四段，补齐正文后必须同步渲染结果。
+        draft.positive_prompt = "\n\n".join(
+            heading + "\n" + getattr(draft, name) for name, heading in PROMPT_SECTIONS.items())
+    return projected
+
+
 class BasePromptCompiler(Protocol):
     """模型格式适配边界；编译器不提交图片请求。"""
 
     version: str
+
+    def compile_edit(self, *, scope: dict, constraints: list[CreativeConstraint],
+                     model_call: Callable[[list[dict]], str],
+                     on_diagnostics: Callable[[dict], None] | None = None
+                     ) -> tuple[ImageEditDraft, dict]: ...
 
     def compile(
         self, *, snapshot: ComicProjectSnapshot, director: DirectorSpec,
@@ -132,6 +283,7 @@ class BasePromptCompiler(Protocol):
         allow_unavailable: bool = False,
         complete_prompt: bool = False,
         reused_context: dict[str, str] | None = None,
+        on_constraint_diagnostics: Callable[[dict], None] | None = None,
     ) -> ComicPromptDraft: ...
 
 
@@ -142,6 +294,62 @@ class StructuredImagePromptCompiler:
 
     def __init__(self, model_guidance: str) -> None:
         self.model_guidance = model_guidance
+
+    def compile_edit(self, *, scope: dict, constraints: list[CreativeConstraint],
+                     model_call: Callable[[list[dict]], str],
+                     on_diagnostics: Callable[[dict], None] | None = None
+                     ) -> tuple[ImageEditDraft, dict]:
+        """原编译器的编辑模式；不伪造镜头，不接入内部生图。"""
+        if len(constraints) > 50:
+            raise ToolError("改图必需约束超过核验容量，请缩小范围")
+        messages = [{"role": "system", "content":
+            "为外部图像编辑模型编写可执行修改指令。只应用选中的发现项和用户本次修改原文；"
+            "观察是待核对资料，不是用户事实。保留有效约束和没有授权修改的内容；"
+            "不引入无依据人物、风格、摄影或情节，不声称图片已修改。"
+            "edit_scope 为 regions 时，只在列出的归一化左上/右下坐标内修改，"
+            "使用各区域 label 标注的编号及各区要求，保留区域外内容；whole 明确写整图调整。"
+            "mixed 同时有局部和整图授权：只有 whole_finding_ids 对应建议可以整图修改，"
+            "其余建议和各区要求仍严格绑定区域；整图调整不扩大局部要求的范围。"
+            "user_instruction 的范围由 instruction_target 指定：whole 为整图，"
+            "selected_regions 为本轮全部区域，region 只作用于指定 region_id；"
+            "缺少该字段的历史指令沿用原整图或局部模式。不要添加未授权的改变。"
+            "指定文字必须原样。输出正向修改指令、负向约束和公开摘要。"
+            "authorized_requirements 是唯一的本轮改变清单，逐项写出改变和作用位置，"
+            "不能将要求相近的不同目标合并丢失。constraints 是冻结的有效保护规则，"
+            "enforcement=scoped_replacement 时，effective_requirement 是相应对象上的新要求；"
+            "original_requirement 仅说明旧来源，不是继续生成旧对象的要求。"
+            "不要在正向或负向无条件要求保留这个被明确替换的旧对象/属性。"
+            "enforcement=preserve 时仍保护原要求；current_requirement 按 authorized_targets "
+            "的范围执行。原对象其他属性及范围外内容仍保持。"
+            "不能因旧方案另有目标就改动未授权区域，也不能宣称原图已符合未核实的目标。"
+            "historical_constraint_ids 是原方案的约束；明确的本轮人工修改可在授权对象和"
+            "范围内替代同一属性的旧用户要求，不同时要求生成新旧两种互斥对象。"
+            "局部修改不撤回其他区域、其他对象或未变属性的保护，资产固定事实仍不可更改。"
+            "current_constraint_targets 将本轮提取要求绑定到人工原文所在授权清单；"
+            "这些要求的范围以关联 requirement_id 的 target 为准，不扩展到整图。"
+            "inherited_constraint_replacements 是当前图片版本已确认的目标替代记录，"
+            "未被本轮人工再次修改时保护相应新要求，不重新生成旧对象。历史坐标只是来源，"
+            "不能当作当前图片的新选区；记录也不证明外部图片已经达成要求。"
+            "AI 报告的保留建议不属于本轮冻结硬约束，不能自行加入负向禁止。"
+            "只勾选 AI 建议不足以解除旧用户硬要求；语义不明确或冲突不能静默扩大范围。"
+            + self.model_guidance + "只返回 JSON："
+            + json.dumps(ImageEditDraft.model_json_schema(), ensure_ascii=False)},
+            {"role": "user", "content": json.dumps({"mode": "edit",
+                **{key: value for key, value in scope.items() if key not in {"protected_features",
+                                                                           "task"}},
+                "image_task_context": {"task": scope["task"], "use": "context_only"},
+                "constraints": image_edit_constraint_basis(scope, constraints)},
+                ensure_ascii=False)}]
+        try:
+            draft = ImageEditDraft.model_validate_json(model_call(messages))
+        except (ValueError, ValidationError):
+            raise ToolError("改图编译未返回有效结构",
+                            detail="module=prompt.compiler mode=edit") from None
+        receipt = verify_prompt_constraints(constraints,
+            sections={"positive_prompt": draft.positive_prompt},
+            negative_prompt=draft.negative_prompt, model_call=model_call, edit_scope=scope,
+            on_diagnostics=on_diagnostics)
+        return draft, receipt
 
     @staticmethod
     def _separate_contexts(result: dict) -> tuple[ComicPromptContexts, list[dict]]:
@@ -174,6 +382,46 @@ class StructuredImagePromptCompiler:
                     parts[name][field] = "，".join(fixed)
         return ComicPromptContexts.model_validate(parts), moves
 
+    @staticmethod
+    def _constraint_sections(draft: ComicPromptDraft, complete_prompt: bool) -> dict[str, str]:
+        return ({name: getattr(draft, name) for name in PROMPT_SECTIONS}
+                if complete_prompt else {"positive_prompt": draft.positive_prompt})
+
+    def _verify_constraints(
+        self, draft: ComicPromptDraft, constraints: list[CreativeConstraint], *,
+        complete_prompt: bool, model_call: Callable[[list[dict[str, str]]], str],
+        on_diagnostics: Callable[[dict], None] | None, final_attempt: bool,
+    ) -> dict:
+        """核验最终正文；末次仍缺项时先补齐正文，再独立复核，不把创作判为失败。"""
+        sections = self._constraint_sections(draft, complete_prompt)
+        try:
+            return verify_prompt_constraints(
+                constraints, sections=sections, negative_prompt=draft.negative_prompt,
+                model_call=model_call, on_diagnostics=on_diagnostics)
+        except ToolError as error:
+            uncovered = constraint_gap_ids(error)
+            if (not final_attempt or not uncovered
+                    or not (error.detail or "").startswith(CONSTRAINT_GAP_PREFIXES)):
+                raise
+            # 模型已重编一次仍遗漏：服务端把要求写进对应字段，正文必须真实承载它。
+            projected = project_constraint_requirements(
+                draft, constraints, uncovered, complete_prompt=complete_prompt)
+            logger.warning(
+                "prompt_constraint_projection trace_id={} uncovered={} projected={}",
+                current_trace_id(), uncovered, [item["field"] for item in projected])
+            if on_diagnostics:
+                on_diagnostics({
+                    "contract": CONSTRAINT_CONTRACT, "stage": "requirement_projection",
+                    "projected": projected, "uncovered": uncovered,
+                    "sections": self._constraint_sections(draft, complete_prompt),
+                    "negative_prompt": draft.negative_prompt,
+                })
+            # 正文已按 scope 补齐；独立复核仍存疑时以 advisory 如实交付，不中断创作。
+            return verify_prompt_constraints(
+                constraints, sections=self._constraint_sections(draft, complete_prompt),
+                negative_prompt=draft.negative_prompt, model_call=model_call,
+                on_diagnostics=on_diagnostics, allow_unverified=True)
+
     def compile(
         self, *, snapshot: ComicProjectSnapshot, director: DirectorSpec,
         storyboard: ComicStoryboard, shot: ComicShot, assets: list[ComicAsset],
@@ -182,6 +430,8 @@ class StructuredImagePromptCompiler:
         allow_unavailable: bool = False,
         complete_prompt: bool = False,
         reused_context: dict[str, str] | None = None,
+        on_constraint_diagnostics: Callable[[dict], None] | None = None,
+        repair: dict[str, Any] | None = None,
     ) -> ComicPromptDraft:
         require_approved_director(director, allow_advisory=allow_advisory,
                                   allow_unavailable=allow_unavailable)
@@ -206,6 +456,24 @@ class StructuredImagePromptCompiler:
             "storyboard": storyboard.version, "shot": shot.version,
         })
         context["model_target"] = model_target
+        if director.reference_context:
+            context["image_references"] = director.reference_context
+        required = list(dict.fromkeys([
+            *snapshot.creative_brief.hard_constraints, *director.constraints,
+            *(item for asset in assets for item in asset.fixed_constraints),
+        ]))
+        semantic_scope = snapshot.creative_brief.constraint_contract_version == 2
+        constraints = prompt_constraints(snapshot, assets) if semantic_scope else []
+        literal_constraints = [item for item in constraints if item.status == "active"
+                               and item.verification == "exact"]
+        literal_text = "；".join(f"{item.target}的文字为“{item.literal_value}”"
+                                for item in literal_constraints)
+        if literal_constraints:
+            context["literal_text_requirements"] = [item.model_dump(mode="json", include={
+                "target", "literal_value", "source_ref"}) for item in literal_constraints]
+        context["required_constraints"] = ([item.model_dump(mode="json") for item in constraints
+                                           if item.status == "active"]
+                                          if semantic_scope else required)
         director_fields = {
             "visual_direction", "storytelling_goal", "camera_language", "composition",
             "lighting", "color_language", "emotion", "character_focus", "constraints",
@@ -222,6 +490,11 @@ class StructuredImagePromptCompiler:
             name: getattr(shot, name, "") or getattr(director.cinematography, name, "")
             for name in camera_labels
         }
+        # 本镜头的表现优先于导演总体表现；表情属于当前 Shot，不能混入固定人物设定。
+        emotion_source = ("shot.emotion" if shot.emotion else
+                          "director.director_plan.character_expression")
+        execution_emotion = shot.emotion or (
+            director.director_plan.character_expression if director.director_plan else None)
         if complete_prompt:
             # 读取已有可信字段，不能让 Compiler 修改 DirectorSpec 或重复整份审核 JSON。
             context["stable_context"].pop("director_spec", None)
@@ -237,6 +510,13 @@ class StructuredImagePromptCompiler:
                 if name.startswith("lock:")}
             context["execution_camera"] = {name: value for name, value in execution_camera.items()
                                            if value}
+            if execution_emotion:
+                context["execution_emotion"] = execution_emotion
+        if repair is not None:
+            # 重编只针对已确认的缺项；失败候选不是已通过内容，不能直接沿用。
+            context["content_repair"] = {
+                "candidate": repair.get("candidate"), "issues": repair.get("issues") or [],
+                "sources": repair.get("sources") or {}}
         section_instruction = (
             "完整图片模式：只输出 JSON 对象，符合以下 JSON Schema。"
             "只返回 director_summary、character_context、world_context、"
@@ -248,37 +528,62 @@ class StructuredImagePromptCompiler:
             "world_context 只包含地点、时间、世界观、环境，不包含主体动作与前中后景构图；"
             "style_context 只包含艺术风格、摄影质感、色彩、材质，不包含本镜头机位或光源方向。"
             "shot_context 只包含动作、姿态、构图、镜头、光影变化。所有字段是一行描述。"
+            "literal_text_requirements 的指定文字由服务端原样填入 shot_context.literal_text，"
+            "此字段留空，不在其他字段改写这些文字；其可见位置围绕 target 对象安排。"
             "未知细节可作一次具体创作选择，不得列候选、伪装为用户事实或覆盖固定资产。"
             "execution_camera 是本镜头已选定的执行要求，正文必须一致，不能再选相反机位或光源。"
+            "execution_emotion 是本镜头已选定的神态与情绪，必须在 shot_context.pose 中落实，"
+            "不能只写在摘要或负向正文中；表情与目光不属于固定外貌。"
             "当前镜头的景别、机位、运动优先使用 current_shot；未指定时沿用导演摄影。"
+            "image_references.continuity 如存在，表示用户已采用的视觉基准；changes 是本轮"
+            "明确授权的叶子变化。locked_context_fields 必须原样保留，包括空值；不能用新"
+            "导演、分镜建议或修复覆盖。无文字描述的图像细节沿用参考图，不自行补造。"
             "导演的整体风格、色彩与主光逻辑不得改变。reused_bibles 是已保存的相同身份设定，"
             "必须沿用；镜头动作写在 shot_context。把构图落实为主体在画面的位置、朝向和前后景关系，"
             "把光线落实为光源位置、受光面与阴影，把色彩落实为主体与环境的关系。"
             "字段内容使用可直接交给图片模型的自然语言，不写来源 ID、审核术语或泛化质量标签。"
             "所有正文总长不超过2500字，"
             "negative_prompt 写具体禁止内容，不写泛化质量口号。"
+            "负向正文不能禁止用户必需的内容或指定文字。"
             "静态设定与镜头执行必须先分清：stable_context 和固定资产提供事实，"
             "shot_direction 提供导演执行要求，不能原封不动复制到静态三段。"
             "从导演文字提取永久身份、外貌、服装即可，姿态/受光/空间布局必须拆到 shot_context。"
-            "逐项检查：从站立远望切换到战斗姿态，这个属性是否还完全成立？"
+            "逐项检查：当本轮动作或拍摄方式变化时，这个属性是否仍成立？"
             "只有不随镜头变化的属性才能放在 Character、World、Style。"
             "前三段每个字段用简洁名词描述，建议60字内，不堆砌导演叙述。"
-            "例如外貌只描述发型、面容、体型；服装只描述款式和固有颜色，"
-            "不描述衣带飘动、背光边缘或受光肤色；身份不写夜立山巅。"
-            "World 的地点只写山巅岩台，环境只写松枝、云海、远山，"
-            "不写左下方、右侧中景或画外光源。摄影风格只写质感，"
-            "如真实摄影或写实插画，近远景纵深属于 Shot 镜头；未知年龄输出空字符串。"
-            + json.dumps(ComicPromptContexts.model_json_schema(), ensure_ascii=False)
+            "外貌只描述持续的发型、面容、体型，服装只描述款式和固有颜色，"
+            "不混入当轮动态和受光变化；身份不混入姿态。"
+            "World 地点和环境描述场景本身，不混入本镜头的画面位置或画外光源。"
+            "摄影风格只写质感，空间布局和纵深属于 Shot；未知年龄输出空字符串。"
+            + ("没有人物或某段不适用时使用空字段，不要为了填字段虚构人物或场景。"
+               if semantic_scope else "人物身份不能为空。")
+            + json.dumps(CompleteImagePromptOutput.model_json_schema(), ensure_ascii=False)
         ) if complete_prompt else (
             "只返回 JSON：director_summary、positive_prompt、negative_prompt。")
         messages = [
             {"role": "system", "content": (
                 "你是漫剧镜头 Prompt 编译器，不是生图模型。根据当前镜头的叙事目的、"
                 "导演方案和固定资产版本组织内容；不要把情绪机械映射到固定机位或光线。"
-                "用户硬约束和资产固定约束必须在 positive_prompt 中逐字保留，"
+                + ("required_constraints 是有来源的语义要求。只覆盖 active 要求；"
+                   "保持对象、关系、范围和否定，普通视觉要求允许准确改写。"
+                   "只有 verification=exact 的 literal_value 必须完整原样写入正向正文。"
+                   "scope=shot 且涉及表情、神态、目光或情绪的要求必须写进 "
+                   "shot_context.pose 的“神态与情绪：”，不能只写动作、摘要或负向正文。"
+                   "不把委托措辞、来源 ID 或模型选择冒充用户硬约束。"
+                   if semantic_scope else
+                   "required_constraints 是去重后的不可变原文。每项必须完整、逐字保留在"
+                   "四段 Context 的相应字段正文中，不能只放在摘要或 negative_prompt，"
+                   "也不能拆分成多个字段或换成近义表达；用户原话同样保留。"
+                   "系统由这些字段组成最终正向 Prompt，无需返回 positive_prompt 字段。"
+                   if complete_prompt else
+                   "用户硬约束和资产固定约束必须在 positive_prompt 中逐字保留。") +
                 "不得替换主体。negative_prompt 只写需要避免的具体偏差。"
                 + section_instruction +
                 f"目标模型注意事项：{self.model_guidance}"
+                + ("content_repair 是上一次已通过结构校验但遗漏本轮要求的候选正文。"
+                   "按 issues 指出的缺项在对应 scope 字段补齐，保留其余已成立的身份、"
+                   "世界、风格与镜头设定，不重新设计角色，也不删改已覆盖的内容。"
+                   if repair is not None else "")
             )},
             {"role": "user", "content": json.dumps(context, ensure_ascii=False)},
         ]
@@ -318,7 +623,7 @@ class StructuredImagePromptCompiler:
                 for name, value in (reused_context or {}).items():
                     if name in PROMPT_SECTIONS:
                         result[name] = ComicPromptContexts.model_fields[name].annotation.from_text(
-                            value).model_dump()
+                            value, semantic_scope=semantic_scope).model_dump()
                 for path, value in context.get("locked_context_fields", {}).items():
                     section, field = path.split(".", 1)
                     if (section not in PROMPT_SECTIONS or field not in
@@ -327,10 +632,26 @@ class StructuredImagePromptCompiler:
                     if not isinstance(result.get(section), dict):
                         raise ValueError("partial context reuse requires structured fields")
                     result[section][field] = value
-                contexts, scope_relocations = self._separate_contexts(result)
-                _asset_context(contexts, assets)
+                if semantic_scope:
+                    contexts = ComicPromptContexts.model_validate(
+                        {name: result[name] for name in PROMPT_SECTIONS},
+                        context={"semantic_scope": True})
+                    scope_relocations = []
+                else:
+                    contexts, scope_relocations = self._separate_contexts(result)
+                _asset_context(contexts, assets, semantic_scope=semantic_scope)
+                if literal_constraints:
+                    contexts.shot_context.literal_text = literal_text
                 if shot.action:
                     contexts.shot_context.action = shot.action
+                if execution_emotion:
+                    emotion = "；".join(execution_emotion.splitlines())
+                    pose = contexts.shot_context.pose
+                    # 短表现直接投影，避免模型漏掉已经确认的本轮表情；长说明仍由
+                    # 编译器凝练并接受下方语义核验，不截断来源或突破原字段容量。
+                    projected = "；".join(filter(None, [pose, f"神态与情绪：{emotion}"]))
+                    if emotion not in pose and len(projected) <= 600:
+                        contexts.shot_context.pose = projected
                 for name, value in execution_camera.items():
                     if not value:
                         continue
@@ -344,7 +665,12 @@ class StructuredImagePromptCompiler:
                     if fact not in getattr(target, field):
                         setattr(target, field, "；".join(
                             filter(None, [getattr(target, field), fact])))
-                contexts = ComicPromptContexts.model_validate(contexts.model_dump())
+                # 最后投影锁定字段，防止 Shot/摄影和约束补全前的普通组装覆盖图片基准。
+                for path, value in context.get("locked_context_fields", {}).items():
+                    section, field = path.split(".", 1)
+                    setattr(getattr(contexts, section), field, value)
+                contexts = ComicPromptContexts.model_validate(contexts.model_dump(),
+                    context={"semantic_scope": semantic_scope})
                 result.update(contexts.sections())
                 # 复用已校验的稳定内容，模型不能换服装/世界/风格；禁止内容同样保持。
                 if (reused_context or {}).get("negative_prompt"):
@@ -352,8 +678,10 @@ class StructuredImagePromptCompiler:
                 result["positive_prompt"] = "\n\n".join(
                     heading + "\n" + result[name] for name, heading in PROMPT_SECTIONS.items())
                 result.update(context_version=CONTEXT_VERSION, context_sources={
-                    "bible_contract": BIBLE_CONTRACT,
-                    "structured_contexts": contexts.model_dump(),
+                    "bible_contract": SEMANTIC_BIBLE_CONTRACT if semantic_scope else BIBLE_CONTRACT,
+                    "structured_contexts": contexts.model_dump(exclude={
+                        "shot_context": {"literal_text"}}
+                        if not semantic_scope and not contexts.shot_context.literal_text else None),
                     "scope_relocations": scope_relocations,
                     "source_type": "model_choice", "trust_status": "creative_choice",
                     "model_request_id": request_id,
@@ -430,7 +758,19 @@ class StructuredImagePromptCompiler:
                         for name, value in execution_camera.items() if value
                     },
                 }
+                if execution_emotion:
+                    lineage["execution_emotion"] = {
+                        "value": execution_emotion, "field_path": emotion_source,
+                        "target_field": "shot_context.pose",
+                    }
+                if literal_constraints:
+                    lineage["literal_text"] = [{"constraint_id": item.constraint_id,
+                        "source_ref": item.source_ref.model_dump(mode="json"),
+                        "value_sha256": value_hash(item.literal_value), "target": item.target}
+                        for item in literal_constraints]
                 result["context_sources"]["input_lineage"] = lineage
+                if director.reference_context:
+                    result["context_sources"]["image_references"] = director.reference_context
                 asset_kinds = {"character_context": "character", "world_context": "scene",
                                "style_context": "style"}
                 for name, provenance in result["context_sources"]["field_provenance"].items():
@@ -462,12 +802,56 @@ class StructuredImagePromptCompiler:
             raise ToolError("Prompt 编译模型未返回有效结构",
                             detail=f"module=prompt.compiler request_id={request_id} "
                             f"field={field} reason={reason}") from error
-        required = [*snapshot.creative_brief.hard_constraints, *director.constraints]
-        for asset in assets:
-            required.extend(asset.fixed_constraints)
-        missing = [item for item in required if item not in draft.positive_prompt]
-        if missing:
-            raise ToolError("Prompt 编译遗漏不可变约束", detail=f"missing_count={len(missing)}")
+        if semantic_scope:
+            if literal_constraints and not complete_prompt:
+                draft.positive_prompt += "\n指定文字：" + literal_text
+                if len(draft.positive_prompt) > 4000:
+                    raise ToolError("必需文字超过 Prompt 容量，请缩小范围",
+                                    detail="module=comic.constraints stage=capacity")
+            try:
+                draft.context_sources["constraint_review"] = self._verify_constraints(
+                    draft, constraints, complete_prompt=complete_prompt,
+                    model_call=model_call, on_diagnostics=on_constraint_diagnostics,
+                    # 单段正文没有四段结构可重编，直接走服务端补齐。
+                    final_attempt=repair is not None or not complete_prompt,
+                )
+            except ToolError as error:
+                # 只交回已通过 Schema 的公开草稿作一次内容修复；不能带入非法输出。
+                error.prompt_candidate = draft.model_dump(mode="json", include={
+                    "director_summary", "negative_prompt", *PROMPT_SECTIONS})
+                uncovered = constraint_gap_ids(error)
+                if (repair is not None or not uncovered or not complete_prompt
+                        or not (error.detail or "").startswith(CONSTRAINT_GAP_PREFIXES)):
+                    raise
+                logger.warning(
+                    "prompt_content_repair_started trace_id={} project_id={} shot_id={} "
+                    "uncovered={}", current_trace_id(), snapshot.project.project_id,
+                    shot.shot_id, uncovered)
+                # 首次正文遗漏用户要求：带公开核验结论重编一次，把要求写进对应段落。
+                return self.compile(
+                    snapshot=snapshot, director=director, storyboard=storyboard, shot=shot,
+                    assets=assets, model_target=model_target, model_call=model_call,
+                    allow_advisory=allow_advisory, allow_unavailable=allow_unavailable,
+                    complete_prompt=complete_prompt, reused_context=reused_context,
+                    on_constraint_diagnostics=on_constraint_diagnostics,
+                    repair={"reason": error.message, "candidate": error.prompt_candidate,
+                            "issues": getattr(error, "review_issues", []),
+                            "sources": getattr(error, "review_sources", {})})
+        missing = [str(index) for index, item in enumerate(required)
+                   if item not in draft.positive_prompt]
+        if missing and not semantic_scope:
+            raise ToolError("Prompt 编译遗漏不可变约束",
+                            detail=f"module=prompt.compiler request_id={request_id} "
+                            "field=positive_prompt reason=missing_immutable_constraints "
+                            f"missing_count={len(missing)} missing_indices={','.join(missing)}")
+        if complete_prompt and director.reference_context.get("continuity"):
+            final = ComicPromptContexts.from_sections({key: getattr(draft, key)
+                for key in PROMPT_SECTIONS}, semantic_scope=semantic_scope)
+            for path, value in context.get("locked_context_fields", {}).items():
+                section, field = path.split(".", 1)
+                if getattr(getattr(final, section), field) != value:
+                    raise ToolError("本轮要求与已采用图片的保留字段冲突，请明确需要修改的元素",
+                                    detail=f"module=comic.continuity field={path}")
         logger.info(
             "comic prompt compiled project_id={} shot_id={} output_chars={}",
             snapshot.project.project_id, shot.shot_id, len(raw),
@@ -503,6 +887,7 @@ class ComicPromptStore:
         self.storyboards = storyboards
         self.assets = assets
         self.runtime = runtime
+        self.media = ComicMediaStore(projects, runtime)
         self.projects.runtime_store = runtime
 
     def list(self, project_id: str) -> list[ComicPromptArtifact]:
@@ -518,7 +903,10 @@ class ComicPromptStore:
         for prompt in sorted(self.list(shot.project_id),
                              key=lambda item: item.created_at, reverse=True):
             if (prompt.context_version != CONTEXT_VERSION
-                    or prompt.context_sources.get("bible_contract") != BIBLE_CONTRACT
+                    or prompt.context_sources.get("bible_contract") != (
+                        SEMANTIC_BIBLE_CONTRACT if self.projects.get(
+                            shot.project_id).creative_brief.constraint_contract_version == 2
+                        else BIBLE_CONTRACT)
                     or prompt.director_spec_version != director.version
                     or prompt.creative_brief_version != director.creative_brief_version):
                 continue
@@ -580,7 +968,8 @@ class ComicPromptStore:
         # 在原 Artifact 表按 Prompt 归属筛选；不读取其他项目的图片内容，不写 Core 表。
         query = (
             "SELECT id FROM artifacts WHERE type=? AND source='comic.external_image' "
-            "AND status='ready' AND json_extract(metadata_json, '$.project_id')=? "
+            "AND status='ready' AND lifecycle_state='active' "
+            "AND json_extract(metadata_json, '$.project_id')=? "
             "AND json_extract(metadata_json, '$.shot_id')=? "
             "AND json_extract(metadata_json, '$.prompt_artifact_id')=?"
         )
@@ -598,6 +987,17 @@ class ComicPromptStore:
         shot = self._prompt_shot(prompt)
         uploaded = self._external_image(prompt)
         return {**prompt.model_dump(mode="json"), "final_prompt": image_prompt(prompt),
+                "reference_attachments": [
+                    *prompt.context_sources.get("image_references", {}).get("bindings", []),
+                    *([{"image": {key: continuity["image"][key] for key in ("image_id", "version")},
+                        "artifact_id": continuity["image"]["artifact_id"],
+                        "source_project_id": continuity["image"]["project_id"],
+                        "sha256": continuity["image"]["sha256"],
+                        "filename": continuity["image"]["filename"],
+                        "roles": ["identity", "style", "composition"],
+                        "target": "已采用画面的未修改元素"}]
+                      if (continuity := prompt.context_sources.get(
+                          "image_references", {}).get("continuity")) else [])],
                 "shot_sequence_number": shot.sequence_number, "shot_subject": shot.subject,
                 "user_confirmed": self.confirmed(prompt),
                 "external_image": {"artifact_id": uploaded.id, "status": "image_uploaded",
@@ -623,33 +1023,20 @@ class ComicPromptStore:
                 or prompt.director_spec_version != director.version
                 or prompt.context_version != CONTEXT_VERSION or prompt.model_target != "external"):
             raise ToolError("外部图片关联的 Prompt 或镜头版本已变化")
-        try:
-            header, encoded = data_url.split(",", 1)
-            if header not in {"data:image/png;base64", "data:image/jpeg;base64",
-                              "data:image/webp;base64"}:
-                raise ValueError("unsupported content type")
-            content = base64.b64decode(encoded, validate=True)
-        except (ValueError, binascii.Error) as error:
-            raise ToolError("外部图片格式不正确", detail="module=external_image.decode") from error
-        if not content or len(content) > 5 * 1024 * 1024:
-            raise ToolError("外部图片必须在 5 MB 以内", detail="module=external_image.validate")
-        signatures = {
-            "data:image/png;base64": content.startswith(b"\x89PNG\r\n\x1a\n")
-            and len(content) >= 45 and content[-12:] == b"\x00\x00\x00\x00IEND\xaeB`\x82",
-            "data:image/jpeg;base64": content.startswith(b"\xff\xd8\xff")
-            and content.endswith(b"\xff\xd9") and len(content) >= 32,
-            "data:image/webp;base64": content.startswith(b"RIFF") and content[8:12] == b"WEBP"
-            and len(content) >= 32 and int.from_bytes(content[4:8], "little") + 8 == len(content),
-        }
-        if not signatures[header]:
-            raise ToolError("文件内容不是有效的 PNG、JPEG 或 WebP 图片",
-                            detail="module=external_image.validate")
+        content, _mime, suffix = decode_image(data_url)
         digest = hashlib.sha256(content).hexdigest()
         duplicate = self._external_image(prompt, content_sha256=digest)
+        created = duplicate is None
+        if duplicate is not None:
+            existing_path = validate_runtime_path(Path(duplicate.location or ""))
+            if not existing_path.is_file():
+                raise ToolError("已保存图片的原文件缺失，请在图片工作台重传缺失原文件",
+                                detail="module=external_image.import source=content_missing")
+            if hashlib.sha256(existing_path.read_bytes()).hexdigest() != digest:
+                raise ToolError("已保存图片的原文件已改变，不能作为重复上传返回",
+                                detail="module=external_image.import source=content_changed")
         if duplicate is None:
             output_dir = validate_runtime_path(output_dir)
-            suffix = {"data:image/png;base64": ".png", "data:image/jpeg;base64": ".jpg",
-                      "data:image/webp;base64": ".webp"}[header]
             path = output_dir / (uuid4().hex + suffix)
             atomic_write_bytes(path, content)
             duplicate = ArtifactRecord(
@@ -684,7 +1071,8 @@ class ComicPromptStore:
         logger.info("COMIC_EXTERNAL_IMAGE_IMPORTED trace_id={} project_id={} shot_id={} "
                     "prompt_artifact_id={} artifact_id={} status=image_uploaded",
                     current_trace_id(), shot.project_id, shot_id, prompt.artifact_id, duplicate.id)
-        return {"artifact_id": duplicate.id, "artifact_type": "image", "shot_id": shot_id,
+        return {"artifact_id": duplicate.id, "artifact_type": "image", "created": created,
+                "shot_id": shot_id,
                 "storyboard_id": shot.storyboard_id, "version": prompt.version,
                 "media_preparation": {"image_mode": "external", "status": "image_uploaded",
                                       "shot_id": shot_id, "prompt_artifact_id": prompt.artifact_id,
@@ -702,6 +1090,23 @@ class ComicPromptStore:
                 or snapshot.project.director_id is None):
             raise ToolError("导演方案已变化，请先创建当前方案的分镜")
         director = self.projects.get_director(shot.project_id)
+        with self.projects._connect() as connection:
+            row = connection.execute("SELECT version,payload_json FROM comic_entity_versions "
+                "WHERE project_id=? AND entity_type='image_references' "
+                "ORDER BY version DESC LIMIT 1", (shot.project_id,)).fetchone()
+        if row:
+            reference_snapshot = json.loads(row["payload_json"])
+            bindings = reference_snapshot["bindings"]
+            expected = director.reference_context.get("reference_version", 0)
+            if (bindings or director.reference_context) and expected != int(row["version"]):
+                raise ToolError("参考用途已变化，请重新生成导演方案")
+            for binding in director.reference_context.get("bindings", []):
+                image = self.media.require_image(ImageVersionRef.model_validate(binding["image"]),
+                    shot.project_id, reference_snapshot["conversation_id"], allow_related=True)
+                if (binding.get("artifact_id") != image.artifact_id
+                        or binding.get("source_project_id", image.project_id) != image.project_id
+                        or binding.get("sha256") != image.sha256):
+                    raise ToolError("导演参考图片的来源不一致")
         self.projects.require_confirmed_director(director)
         refs = [*shot.character_asset_versions, *shot.scene_asset_versions]
         if shot.style_version is not None:
@@ -818,29 +1223,34 @@ class ComicPromptStore:
         expected_shot_version: int, model_target: str, compiler_version: str,
         run_id: str, source: str = "compiled", expected_version: int | None = None,
         restored_from_version: int | None = None,
+        constraint_model_call: Callable[[list[dict[str, str]]], str] | None = None,
     ) -> ComicPromptArtifact:
         # 外部模型调用在事务外；事务内再次验证所有来源版本，避免保存过时结果。
         snapshot, director, storyboard, shot, assets = self.source(shot_id)
+        semantic_scope = snapshot.creative_brief.constraint_contract_version == 2
         previous = self.get(shot_id) if source in {"edited", "restored"} else None
-        if (previous and previous.context_sources.get("bible_contract") == BIBLE_CONTRACT
+        if (previous and previous.context_sources.get("bible_contract") in {
+                BIBLE_CONTRACT, SEMANTIC_BIBLE_CONTRACT}
                 and draft.context_version != CONTEXT_VERSION):
             raise ToolError("不能将结构化 Prompt 降级为未分段正文",
                             detail="module=prompt.sections schema=separated-contexts-1")
         if draft.context_version == CONTEXT_VERSION:
-            draft = draft.model_copy(update=prompt_sections(draft.positive_prompt))
+            draft = draft.model_copy(update=prompt_sections(draft.positive_prompt,
+                                                          allow_empty=semantic_scope))
             if not draft.negative_prompt.strip():
                 raise ToolError("完整 Prompt 缺少禁止内容", detail="module=prompt.sections")
             inherited_sources = (previous.context_sources if source == "edited" and previous
                                  else draft.context_sources)
             contexts = None
-            if (inherited_sources.get("bible_contract") == BIBLE_CONTRACT
+            if (inherited_sources.get("bible_contract") in {BIBLE_CONTRACT, SEMANTIC_BIBLE_CONTRACT}
                     or (previous and previous.context_sources.get("bible_contract")
-                        == BIBLE_CONTRACT)):
+                        in {BIBLE_CONTRACT, SEMANTIC_BIBLE_CONTRACT})):
                 try:
                     contexts = ComicPromptContexts.from_sections({
-                        name: getattr(draft, name) for name in PROMPT_SECTIONS})
+                        name: getattr(draft, name) for name in PROMPT_SECTIONS},
+                        semantic_scope=semantic_scope)
                     fixed = contexts.model_copy(deep=True)
-                    _asset_context(fixed, assets)
+                    _asset_context(fixed, assets, semantic_scope=semantic_scope)
                     if fixed != contexts:
                         raise ValueError("固定资产字段必须保留在对应 Context 字段")
                 except (ValueError, ValidationError) as error:
@@ -878,12 +1288,28 @@ class ComicPromptStore:
                 draft.context_sources["field_provenance"] = fields
             if contexts is not None:
                 draft.context_sources = {**draft.context_sources,
-                                         "bible_contract": BIBLE_CONTRACT,
-                                         "structured_contexts": contexts.model_dump()}
+                                         "bible_contract": (SEMANTIC_BIBLE_CONTRACT
+                                                            if semantic_scope else BIBLE_CONTRACT),
+                                         "structured_contexts": contexts.model_dump(exclude={
+                                             "shot_context": {"literal_text"}} if not semantic_scope
+                                             and not contexts.shot_context.literal_text else None)}
         required = [*snapshot.creative_brief.hard_constraints, *director.constraints]
         for asset in assets:
             required.extend(asset.fixed_constraints)
-        if any(item not in draft.positive_prompt for item in required):
+        if semantic_scope:
+            # 编辑请求中的凭据不可信；只复用数据库中的上一版，正文变更则重新审核。
+            receipt = (previous.context_sources.get("constraint_review") if previous
+                       else draft.context_sources.get("constraint_review") if source == "compiled"
+                       else None)
+            draft.context_sources["constraint_review"] = verify_prompt_constraints(
+                prompt_constraints(snapshot, assets),
+                sections=({name: getattr(draft, name) for name in PROMPT_SECTIONS}
+                          if draft.context_version else {"positive_prompt": draft.positive_prompt}),
+                negative_prompt=draft.negative_prompt, model_call=constraint_model_call,
+                receipt=receipt,
+                # 同一正文已如实标注 advisory 时不再阻断保存；结论随凭据保留。
+                allow_unverified=bool((receipt or {}).get("delivery") == "advisory"))
+        elif any(item not in draft.positive_prompt for item in required):
             raise ToolError("Prompt 缺少当前作品的不可变约束")
         with self.projects._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+from contextlib import closing
 from http.client import HTTPConnection
 from typing import Any
 
@@ -14,6 +14,7 @@ from test_web_studio import app as app_fixture
 from test_web_studio import server as server_fixture
 
 from kantoku.config import ToolError
+from kantoku.core.database import database_manager
 from kantoku.core.runtime.models import ExecutionStatus
 from kantoku.domains.comic.critic import require_approved_director
 from kantoku.domains.comic.models import (
@@ -27,6 +28,38 @@ from kantoku.shells import web_studio
 # 复用已有离线 fixture，不复制应用初始化逻辑。
 app = app_fixture
 server = server_fixture
+EXECUTABLE_VISUAL_FIELDS = {
+    "style_boundary": "电影级东方幻想，湿润竹林与布料材质清晰",
+    "character_presence": "东方修仙少女，黑色长发，白色古风长裙，玉簪",
+    "character_pose": "站立迎战，身体朝向前方，右手握剑",
+}
+
+
+def test_first_generation_model_wait_is_bounded_without_changing_other_calls(monkeypatch):
+    from types import SimpleNamespace
+
+    calls = []
+
+    def call(_messages, **options):
+        calls.append(options)
+        return SimpleNamespace(content="{}")
+
+    monkeypatch.setattr(web_studio, "chat", call)
+    monkeypatch.setattr(web_studio.time, "monotonic", lambda: 100.0)
+    token = web_studio._comic_generation_deadline.set(112.0)
+    try:
+        assert web_studio.StudioApplication._comic_director_model([]) == "{}"
+        assert calls[-1]["timeout_s"] == 12.0
+        assert calls[-1]["single_attempt"] is True
+        web_studio._comic_generation_deadline.set(99.0)
+        with pytest.raises(TimeoutError):
+            web_studio.StudioApplication._comic_director_model([])
+        assert len(calls) == 1  # 耗尽等待预算不会再次提交供应商。
+    finally:
+        web_studio._comic_generation_deadline.reset(token)
+    web_studio.StudioApplication._comic_director_model([])
+    assert calls[-1]["timeout_s"] is None
+    assert calls[-1]["single_attempt"] is False
 
 
 @pytest.fixture
@@ -42,7 +75,10 @@ def model(app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch) ->
                 calls.append(skill_id)
                 context = json.loads(messages[1]["content"])
                 assert "chat_history" not in context["context"]
-                return json.dumps(next(iter(_parts()[skill_id].values())), ensure_ascii=False)
+                output = next(iter(_parts()[skill_id].values()))
+                if skill_id == SKILLS[1]:
+                    output.update(EXECUTABLE_VISUAL_FIELDS)
+                return json.dumps(output, ensure_ascii=False)
         calls.append("comic.director_critic")
         return json.dumps({
             "public_summary": "约束与视觉因果符合故事。", "confidence": 0.9,
@@ -157,6 +193,9 @@ def test_diverse_creative_contracts_use_current_project_context_not_previous_out
             "visual_strategy": plan_text, "visual_focus": request,
             "creative_choices": [plan_text], "composition_strategy": plan_text,
             "color_strategy": "蓝灰环境色与人物服装形成清晰色彩对比",
+            "style_boundary": "电影级东方幻想，保留当前主体与环境材质",
+            "character_presence": request,
+            "character_pose": "身体朝向前方，动作遵循当前需求",
         })
         parts[SKILLS[2]]["cinematography"].update({
             "shot_size": "全景", "camera_angle": "平视",
@@ -197,7 +236,10 @@ def test_creation_mode_executes_through_shared_coordinator(
         key: value for key, value in result["director_spec"].items()
         if key in DirectorSpecDraft.model_fields
     })
-    require_approved_director(spec)
+    assert spec.critic_result is None
+    require_approved_director(app.comic_projects.get_director(project_id))
+    assert result["generation_mode"] == "FIRST_GENERATION"
+    assert result["review_required"] is False
     assert result["status"] == "completed"
     assert model == SKILLS[:4]
     assert app.comic_director.runtime_store is app.runtime_store
@@ -220,15 +262,17 @@ def test_creation_mode_executes_through_shared_coordinator(
             skill.removeprefix("comic.") for skill in SKILLS
         ]
         assert all(item["input_versions"]["creative_brief"] == 1 for item in summary["stages"])
-        assert all(item["output_summary"] for item in summary["stages"])
-        assert summary["critic_result"]["verdict"] == "pass"
+        assert all(item["output_summary"] for item in summary["stages"]
+                   if item["stage"] != "director_critic")
+        assert summary["stages"][3]["output"] == {}
+        assert summary["critic_result"] is None
 
 
 def test_modes_have_same_v2_contract_and_do_not_add_runtime_tables(
     app: web_studio.StudioApplication, model: list[str],
 ) -> None:
     def tables() -> set[str]:
-        with sqlite3.connect(app.runtime_store.path) as connection:
+        with closing(database_manager.connect(app.runtime_store.path)) as connection, connection:
             return {row[0] for row in connection.execute("SELECT name FROM sqlite_master")}
 
     initial = tables()
@@ -328,24 +372,37 @@ def test_critic_problem_returns_real_draft_and_persists_diagnostics_after_restar
 
     monkeypatch.setattr(app, "_comic_director_model", critic_problem)
     result = _execute(app, project_id, mode)
+    if reply == "revision" and mode == "professional":
+        assert result["status"] == "completed" and result["director_spec_status"] == "reviewed"
+        assert not result["ready_for_prompt"] and not result["director_spec"]["user_confirmed"]
+        assert app.comic_projects.get_director(project_id).critic_result.verdict == "needs_revision"
+        assert result["director_spec"]["critic_result"] is None
+        assert result["director_spec"]["critic_feedback"] == []
+        restarted = web_studio.StudioApplication()
+        assert restarted.list_comic_project_tasks(project_id)["tasks"][0] == result
+        return
     assert result["status"] == "waiting"
     assert result["director_spec_status"] == "draft" and not result["ready_for_prompt"]
     draft = result["director_spec"]
     assert draft["schema_version"] == 2 and draft["draft"]
     assert draft["spec_id"] and draft["version"] == 1
-    expected = DirectorSpecDraft.model_validate(_parts()[SKILLS[4]]["director_spec"])
+    expected_parts = _parts()[SKILLS[4]]["director_spec"]
+    expected_parts["director_plan"].update(EXECUTABLE_VISUAL_FIELDS)
+    expected = DirectorSpecDraft.model_validate(expected_parts)
     assert draft["creative_decision"] == expected.creative_decision.model_dump()
     assert draft["director_plan"] == expected.director_plan.model_dump()
     assert all(draft["cinematography"][key] == value for key, value in
                _parts()[SKILLS[2]]["cinematography"].items())
     assert draft["cinematography"]["camera_language"] == draft["camera_language"]
     summary = result["director_execution_summary"]
-    assert "草案已生成" in summary["status_label"]
+    assert any(label in summary["status_label"] for label in (
+        "内部自动校验未完成", "导演自动补全未完成"))
+    assert not summary["review_required"] and summary["critic_feedback"] == []
     statuses = [stage["status"] for stage in summary["stage_statuses"]]
     assert statuses[:3] == ["completed"] * 3 and statuses[-1] == "waiting"
     if reply == "revision":
         assert statuses[3] == "needs_revision"
-        assert "补充构图理由" in summary["status_label"]
+        assert "补充构图理由" not in summary["status_label"]
     else:
         assert statuses[3] == "unavailable"
         assert draft["critic_result"] is None and draft["critic_status"] == "unavailable"
@@ -516,6 +573,11 @@ def test_new_brief_in_same_project_does_not_send_old_director_to_model(
         assert context["relevant_assets"] == []
         parts = _parts()
         parts[SKILLS[0]]["creative_decision"]["hard_constraints"] = ["机器人", "咖啡师"]
+        parts[SKILLS[1]]["director_plan"].update({
+            "style_boundary": "电影级未来都市写实质感，金属与玻璃材质清晰",
+            "character_presence": "未来城市机器人咖啡师，银色金属外壳，工作围裙",
+            "character_pose": "站在吧台后，机械手握住咖啡杯",
+        })
         for skill, schema in zip(SKILLS[:3], ("CreativeDecision", "DirectorPlan",
                                              "CinematographyPlan"), strict=True):
             if f'"title": "{schema}"' in messages[0]["content"]:

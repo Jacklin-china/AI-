@@ -203,10 +203,11 @@ def test_fast_uses_one_core_run_and_saves_reviewed_v2(tmp_path: Path) -> None:
     assert names[0] == "director_run_started" and names[-1] == "director_run_completed"
     assert "director_mode_selected" in names
     assert names.count("director_stage_completed") == 5
-    assert "director_critic_completed" in names
+    assert "internal_validator_completed" in names
+    assert "director_critic_completed" not in names
 
 
-def test_professional_records_each_stage_and_public_critic(tmp_path: Path) -> None:
+def test_professional_records_each_stage_and_internal_validator(tmp_path: Path) -> None:
     coordinator, store, runtime, calls = _setup(tmp_path)
     project_id = _project(store)
 
@@ -218,7 +219,7 @@ def test_professional_records_each_stage_and_public_critic(tmp_path: Path) -> No
     run = runtime.get_run(result.run_id)
     assert run.state["completed_stages"] == SKILLS
     assert run.state["project_version_after"] == store.get(project_id).project.current_version
-    assert "director_critic_completed" in _event_names(runtime, result.run_id)
+    assert "internal_validator_completed" in _event_names(runtime, result.run_id)
     assert len(runtime.list_runs(domain="comic", interaction_mode=InteractionMode.GUIDED)) == 1
     for event in runtime.list_events(result.run_id):
         assert event.payload["trace_id"] == result.trace_id

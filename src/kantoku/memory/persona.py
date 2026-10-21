@@ -11,7 +11,9 @@ from typing import Annotated
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from kantoku.config import SchemaError, ToolError, get_settings
+from kantoku.config.runtime_paths import resolve_runtime_path
 from kantoku.config.settings import ROOT
+from kantoku.core.database import database_manager
 
 NonBlank = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1)]
 SCHEMA_PATH = ROOT / "db" / "schema.sql"
@@ -46,7 +48,7 @@ def parse_persona(raw: str) -> Persona:
 def _database_path() -> Path:
     """把配置中的相对 SQLite 路径固定到项目根目录。"""
     configured = get_settings().storage.sqlite_path
-    return configured if configured.is_absolute() else ROOT / configured
+    return resolve_runtime_path(configured)
 
 
 def _read_schema() -> str:
@@ -65,8 +67,7 @@ def _connect() -> sqlite3.Connection:
     path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
+        connection = database_manager.connect(path)
         connection.row_factory = sqlite3.Row
         connection.executescript(_read_schema())
         return connection

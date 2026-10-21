@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import errno
+import socket
+import ssl
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from datetime import UTC, datetime
 from time import monotonic, perf_counter, sleep
@@ -10,7 +13,7 @@ from urllib.parse import urlsplit
 from uuid import uuid4
 
 from loguru import logger
-from openai import APIConnectionError, APIStatusError, OpenAI
+from openai import APIConnectionError, APIStatusError, APITimeoutError, OpenAI
 from openai.types.chat import (
     ChatCompletion,
     ChatCompletionMessage,
@@ -137,7 +140,58 @@ def _error_summary(error: BaseException) -> str:
     """生成不包含密钥和提示词正文的错误摘要。"""
     if isinstance(error, APIStatusError):
         return f"{type(error).__name__}(status={error.status_code})"
+    reason = _connection_reason(error)
+    if reason is not None and reason[0] not in {"connection_failed", "timeout"}:
+        return f"{type(error).__name__}(reason={reason[0]})"
     return type(error).__name__
+
+
+def _connection_reason(error: BaseException) -> tuple[str, str] | None:
+    """Only inspect exception types/codes; provider text and proxy credentials stay private."""
+    if not isinstance(error, (APIConnectionError, OSError)):
+        return None
+    chain: list[BaseException] = []
+    pending = [error]
+    seen: set[int] = set()
+    while pending and len(chain) < 16:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        chain.append(current)
+        # Some HTTP transports suppress __cause__ while retaining the socket error in context.
+        for related in (current.__context__, current.__cause__):
+            if isinstance(related, BaseException):
+                pending.append(related)
+    for current in chain:
+        if isinstance(current, socket.gaierror):
+            return "dns_failed", "模型服务地址解析失败，请检查网络或代理后重试"
+        if isinstance(current, ssl.SSLCertVerificationError):
+            return "certificate_failed", "模型服务证书校验失败，请检查系统时间及代理证书配置"
+        if isinstance(current, ssl.SSLError):
+            return "tls_failed", "模型服务安全连接失败，请检查网络或代理配置"
+        if isinstance(current, OSError):
+            codes = {current.errno, getattr(current, "winerror", None)}
+            if codes & {errno.EADDRINUSE, errno.EADDRNOTAVAIL, 10048, 10049}:
+                return "local_address_conflict", (
+                    "本机网络地址或端口冲突，请检查代理及其他网络程序后重试"
+                )
+            if codes & {errno.ECONNREFUSED, 10061}:
+                return "connection_refused", "网络连接被拒绝，请检查模型服务或代理是否可用"
+            if codes & {errno.ENETUNREACH, errno.EHOSTUNREACH, 10051, 10065}:
+                return "network_unreachable", "无法到达模型服务，请检查网络或代理后重试"
+            if codes & {errno.ECONNRESET, errno.ECONNABORTED, 10053, 10054}:
+                return "connection_interrupted", "模型服务连接中断，请检查网络或代理后重试"
+    if any(isinstance(current, (APITimeoutError, TimeoutError)) for current in chain):
+        return "timeout", "等待模型服务超时，请检查网络或代理后重试"
+    if any(isinstance(current, (APIConnectionError, ConnectionError)) for current in chain):
+        return "connection_failed", "无法连接模型服务，请检查网络或代理后重试"
+    return None
+
+
+def _failure_message(message: str, error: BaseException) -> str:
+    reason = _connection_reason(error)
+    return f"{message}：{reason[1]}" if reason is not None else message
 
 
 def _request_with_retry(
@@ -194,8 +248,8 @@ def _request_with_retry(
                 component="llm", provider=provider_host, provider_role=provider,
                 request_id=request_id,
             ).warning(
-                "provider request failed model={} error_type={} latency_ms={} "
-                "retry_count={}", model, type(error).__name__,
+                "provider request failed model={} error_type={} reason={} latency_ms={} "
+                "retry_count={}", model, type(error).__name__, _error_summary(error),
                 round((monotonic() - started_at) * 1000), attempt,
             )
             if not _is_retryable(error) or attempt == retry:
@@ -333,7 +387,7 @@ def chat(
     except Exception as primary_error:
         if single_attempt or not _should_fallback(primary_error):
             raise LLMError(
-                "主模型调用失败",
+                _failure_message("主模型调用失败", primary_error),
                 detail=_error_summary(primary_error),
             ) from primary_error
 
@@ -364,7 +418,7 @@ def chat(
             raise
         except Exception as fallback_error:
             raise LLMError(
-                "主模型和备用模型调用均失败",
+                _failure_message("主模型和备用模型调用均失败", fallback_error),
                 detail=(
                     f"primary={_error_summary(primary_error)}；"
                     f"fallback={_error_summary(fallback_error)}"
@@ -453,7 +507,9 @@ def stream_chat(
         )
         if isinstance(error, LLMError):
             raise
-        raise LLMError("主模型流式调用失败", detail=_error_summary(error)) from error
+        raise LLMError(
+            _failure_message("主模型流式调用失败", error), detail=_error_summary(error)
+        ) from error
     finally:
         if client is not None:
             try:
@@ -470,6 +526,8 @@ def vision_chat(
     temperature: float | None = None,
     response_format: ResponseFormat | None = None,
     timeout_s: float | None = None,
+    single_attempt: bool = False,
+    on_usage: Callable[[int, int, bool], None] | None = None,
 ) -> ChatCompletionMessage:
     """调用独立视觉模型；不降级到不支持看图的文本模型。"""
     settings = get_settings()
@@ -483,7 +541,7 @@ def vision_chat(
             base_url=settings.llm.vision_base_url,
             api_key=settings.llm.vision_api_key(),
             timeout_s=selected_timeout,
-            retry=settings.llm.retry,
+            retry=0 if single_attempt else settings.llm.retry,
             messages=messages,
             model=settings.llm.model_vision,
             temperature=(selected_temperature if settings.llm.vision_use_temperature else None),
@@ -492,11 +550,12 @@ def vision_chat(
             response_format=response_format,
             tools=None,
             extra_body=settings.llm.vision_extra_body,
+            on_usage=on_usage,
         )
     except ConfigError:
         raise
     except Exception as error:
         raise LLMError(
-            "视觉模型调用失败",
+            _failure_message("视觉模型调用失败", error),
             detail=_error_summary(error),
         ) from error

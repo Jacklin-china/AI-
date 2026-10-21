@@ -4,7 +4,7 @@
 
 任何 AI（Work、Cursor、Claude Code 等）修改代码之前必须先阅读此文件。
 
-后续每次修改前，必须按顺序完整阅读本文件、[AI_CODE_RULES.md](docs/engineering/AI_CODE_RULES.md)、[产品原则](docs/product/product-principles.md)、[工程手册](docs/engineering/README.md)，再核对[架构例外清单](docs/architecture/exceptions.md)及实际调用方。已有架构例外只允许兼容维护，不得复制、扩展或借机重构；用户当前任务范围优先。
+后续每次修改前，必须按顺序完整阅读本文件、[AI_CODE_RULES.md](docs/engineering/AI_CODE_RULES.md)、[产品原则](docs/product/product-principles.md)、[工程手册](docs/engineering/README.md)，再核对[架构例外清单](docs/architecture/exceptions.md)及实际调用方，并阅读[运行存储规范](docs/engineering/runtime-policy.md)。已有架构例外只允许兼容维护，不得复制、扩展或借机重构；用户当前任务范围优先。
 
 目标：
 

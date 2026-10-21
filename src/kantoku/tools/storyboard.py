@@ -9,7 +9,9 @@ from typing import Any
 
 from kantoku.agent.tools_registry import register
 from kantoku.config import SchemaError, ToolError, get_settings
+from kantoku.config.runtime_paths import resolve_runtime_path
 from kantoku.config.settings import ROOT
+from kantoku.core.database import database_manager
 from kantoku.core.llm import chat
 from kantoku.schemas.storyboard import Storyboard, parse_storyboard
 
@@ -43,7 +45,7 @@ _SYSTEM_PROMPT = """你是 AI 漫剧分镜师。请把用户剧本转换成严�
 def _database_path() -> Path:
     """把配置的相对数据库路径稳定解析到项目根目录。"""
     configured = get_settings().storage.sqlite_path
-    return configured if configured.is_absolute() else ROOT / configured
+    return resolve_runtime_path(configured)
 
 
 def _read_schema() -> str:
@@ -62,8 +64,7 @@ def save_storyboard(storyboard: Storyboard) -> None:
     database_path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path)
+        connection = database_manager.connect(database_path)
         connection.executescript(_read_schema())
         with connection:
             connection.execute("DELETE FROM shot WHERE episode = ?", (storyboard.episode,))
@@ -103,8 +104,7 @@ def load_storyboard(episode: str) -> Storyboard | None:
     database_path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        database_path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(database_path)
+        connection = database_manager.connect(database_path)
         connection.row_factory = sqlite3.Row
         connection.executescript(_read_schema())
         rows = connection.execute(

@@ -149,7 +149,7 @@ const comic: DomainPresenter = {
   nodeLabel: (nodeId) => comicLabels[nodeId] ?? nodeId,
   eventText: (event) => genericEventText(event, (node) => comicLabels[node] ?? node),
   artifactName: (source) =>
-    ({ 'comic.archive': '成片归档', 'comic.image': '分镜图' } as Record<string, string>)[source] ??
+    ({ 'comic.archive': '成片归档', 'comic.image': '分镜图', 'comic.prompt.compiler': '镜头提示词', 'comic.external_image': '外部上传图片' } as Record<string, string>)[source] ??
     fallbackName(source),
   approvalTitle: (kind) => (kind === 'cost_approval' ? '生成前费用确认' : '需要你审核当前画面'),
 }
@@ -168,7 +168,7 @@ const studio: DomainPresenter = {
   nodeLabel: (nodeId) => studioLabels[nodeId] ?? comicLabels[nodeId] ?? nodeId,
   eventText: (event) => genericEventText(event, (node) => studioLabels[node] ?? comicLabels[node] ?? node),
   artifactName: (source) =>
-    ({ 'comic.archive': '成片归档', 'comic.image': '生成图片' } as Record<string, string>)[source] ??
+    ({ 'comic.archive': '成片归档', 'comic.image': '生成图片', 'comic.prompt.compiler': '镜头提示词', 'comic.external_image': '外部上传图片' } as Record<string, string>)[source] ??
     fallbackName(source),
   approvalTitle: (kind) => (kind === 'cost_approval' ? '生成前费用确认' : '需要你审核当前画面'),
 }

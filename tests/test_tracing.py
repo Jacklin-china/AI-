@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-import sqlite3
 from dataclasses import replace
 from pathlib import Path
 
 import pytest
 
 from kantoku.core import tracing as tracing_module
+from kantoku.core.database import database_manager
 from kantoku.core.tracing import Trace, init_trace_table, recent_traces, write_trace
 
 
@@ -36,7 +36,7 @@ def test_init_trace_table_is_idempotent(trace_db: Path) -> None:
     init_trace_table()
     init_trace_table()
 
-    connection = sqlite3.connect(trace_db)
+    connection = database_manager.connect(trace_db)
     try:
         row = connection.execute(
             "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'trace'"
@@ -122,7 +122,7 @@ def test_tied_timestamps_use_insertion_order(trace_db: Path) -> None:
 
 def test_legacy_database_upgrade_preserves_records_and_other_tables(trace_db: Path) -> None:
     trace_db.parent.mkdir(parents=True)
-    connection = sqlite3.connect(trace_db)
+    connection = database_manager.connect(trace_db)
     try:
         connection.execute(
             "CREATE TABLE trace (id INTEGER PRIMARY KEY AUTOINCREMENT, ts TEXT, kind TEXT, "
@@ -144,7 +144,7 @@ def test_legacy_database_upgrade_preserves_records_and_other_tables(trace_db: Pa
     assert legacy.model == "old"
     assert legacy.usage_reported is None
     write_trace(replace(_trace(ts="2026-09-11T10:00:00+00:00", ok=True), usage_reported=True))
-    connection = sqlite3.connect(trace_db)
+    connection = database_manager.connect(trace_db)
     try:
         assert connection.execute("SELECT id FROM trace ORDER BY id").fetchall() == [(42,), (43,)]
         assert connection.execute("SELECT value FROM unrelated").fetchone() == ("keep-me",)

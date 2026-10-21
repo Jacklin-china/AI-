@@ -4,23 +4,23 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 from pathlib import Path
-from tempfile import NamedTemporaryFile
 
 from openai.types.chat import ChatCompletionMessage
 
 from kantoku.config import ToolError
+from kantoku.config.runtime_paths import (
+    atomic_write_text,
+    probe_writable_directory,
+)
 from kantoku.core.llm import vision_chat
 from kantoku.perception.qc import load_qc_predictions, qc_image, validate_qc_request
 from kantoku.schemas.qc import HumanQcLabel, QcPrediction
 
 
 def _write_predictions(path: Path, predictions: Sequence[QcPrediction]) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
     content = "\n".join(item.model_dump_json() for item in predictions) + "\n"
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(content, encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        atomic_write_text(path, content)
     except (OSError, UnicodeError) as error:
         raise ToolError(
             "无法保存视觉质检预测",
@@ -33,15 +33,7 @@ def _validate_output_path(path: Path) -> None:
     if path.exists() and not path.is_file():
         raise ToolError("视觉质检结果路径必须是文件", detail=f"path={path}")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        with NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            dir=path.parent,
-            prefix=f".{path.name}.",
-            suffix=".probe",
-        ) as stream:
-            stream.write("")
+        probe_writable_directory(path.parent)
     except (OSError, UnicodeError) as error:
         raise ToolError(
             "视觉质检结果目录不可写",

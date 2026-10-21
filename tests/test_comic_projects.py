@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from kantoku.config import ToolError
+from kantoku.core.database import database_manager
 from kantoku.core.runtime.store import RuntimeStore
 from kantoku.domains.comic.models import ComicProjectInput, CreativeBriefUpdate
 from kantoku.domains.comic.projects import ComicContextBuilder, ComicProjectStore
@@ -76,7 +77,7 @@ def test_brief_update_is_atomic_conflict_safe_and_same_put_is_idempotent(tmp_pat
             "expected_version": 1, "original_request": "相互冲突的修改",
         }))
     assert store.get(project_id) == changed
-    with sqlite3.connect(store.path) as connection:
+    with closing(database_manager.connect(store.path)) as connection, connection:
         count = connection.execute(
             "SELECT COUNT(*) FROM comic_entity_versions WHERE project_id=?",
             (project_id,),
@@ -110,7 +111,7 @@ def test_parallel_brief_updates_cannot_overwrite_each_other(tmp_path: Path) -> N
 def test_project_scope_and_legacy_rows_are_untouched(tmp_path: Path) -> None:
     path = tmp_path / "existing.db"
     RuntimeStore(path)
-    with sqlite3.connect(path) as connection:
+    with closing(database_manager.connect(path)) as connection, connection:
         connection.execute(
             "CREATE TABLE shot (episode TEXT NOT NULL, shot_no INTEGER NOT NULL, "
             "desc TEXT NOT NULL)"
@@ -123,7 +124,7 @@ def test_project_scope_and_legacy_rows_are_untouched(tmp_path: Path) -> None:
     assert store.get(first.project.project_id).creative_brief.project_id != (
         store.get(second.project.project_id).creative_brief.project_id
     )
-    with sqlite3.connect(path) as connection:
+    with closing(database_manager.connect(path)) as connection, connection:
         assert connection.execute("SELECT * FROM shot").fetchall() == [
             ("旧作品", 1, "原有镜头"),
         ]

@@ -6,6 +6,7 @@ import PublishArtifact from '../../domains/commerce/artifacts/PublishArtifact.vu
 import QcArtifact from '../../domains/commerce/artifacts/QcArtifact.vue'
 import RequirementArtifact from '../../domains/commerce/artifacts/RequirementArtifact.vue'
 import GenericArtifactContent from './GenericArtifactContent.vue'
+import MediaArtifactContent from './MediaArtifactContent.vue'
 
 const renderers = new Map<string, Component>()
 
@@ -13,8 +14,8 @@ export function registerArtifactRenderer(schemaName: string, component: Componen
   renderers.set(schemaName, component)
 }
 
-export function resolveArtifactRenderer(schemaName: string): Component {
-  return renderers.get(schemaName) ?? GenericArtifactContent
+export function resolveArtifactRenderer(schemaName: string, type?: string): Component {
+  return renderers.get(schemaName) ?? (type === 'image' || type === 'video' ? MediaArtifactContent : GenericArtifactContent)
 }
 
 registerArtifactRenderer('commerce.requirement', RequirementArtifact)

@@ -8,12 +8,34 @@ from enum import StrEnum
 from typing import Any
 
 from kantoku.config import ToolError
+from kantoku.core.conversation_context import ConversationContext
 from kantoku.core.conversations import (
     ConversationRecord,
     ExecutionMode,
     IntentPlan,
     InteractionMode,
 )
+
+
+def conversation_memory(store, settings, *, allowed_actions=None) -> ConversationContext:
+    """Shared context assembly for chat and domain entry points."""
+    return ConversationContext(
+        store,
+        budget=settings.context_token_budget,
+        summary_budget=settings.context_summary_tokens,
+        recall_budget=settings.context_recall_tokens,
+        allowed_actions=allowed_actions
+        or (
+            "chat",
+            "create",
+            "clarify",
+            "image.generate",
+            "image.edit",
+            "video.generate",
+            "comic_production",
+            "commerce_production",
+        ),
+    )
 
 
 class ConversationAction(StrEnum):

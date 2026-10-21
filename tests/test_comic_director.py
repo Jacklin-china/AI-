@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import json
-import sqlite3
+from contextlib import closing
 from pathlib import Path
 
 import pytest
 
 from kantoku.config import ToolError
+from kantoku.core.database import database_manager
 from kantoku.domains.comic.director import execute_director_stage, plan_director_spec
 from kantoku.domains.comic.models import (
     ComicProjectInput,
@@ -149,7 +150,7 @@ def test_director_rejects_stale_project_missing_constraints_and_invalid_model(
 
 def test_migrates_phase2_database_without_changing_legacy_rows(tmp_path: Path) -> None:
     path = tmp_path / "phase2.db"
-    with sqlite3.connect(path) as connection:
+    with closing(database_manager.connect(path)) as connection, connection:
         connection.execute(
             "CREATE TABLE comic_schema_migrations "
             "(version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL)"
@@ -171,7 +172,7 @@ def test_migrates_phase2_database_without_changing_legacy_rows(tmp_path: Path) -
     store = ComicProjectStore(path)
     project_id = _project(store)
     assert store.get(project_id).project.director_id is None
-    with sqlite3.connect(path) as connection:
+    with closing(database_manager.connect(path)) as connection, connection:
         assert connection.execute("SELECT * FROM shot").fetchall() == [("旧作品", 1)]
         assert connection.execute(
             "SELECT version FROM comic_schema_migrations ORDER BY version"

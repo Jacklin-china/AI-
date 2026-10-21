@@ -21,6 +21,7 @@ dev = ["pytest>=8.0", "ruff>=0.5"]
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+cache-dir = "cache/ruff"
 # 排除 AI 协作工作目录：其中的 .py 是一次性取色/测量/截图脚本，
 # 不属于项目源码，不应进入 lint 门禁（详见 AGENTS.md 的完成标准）。
 exclude = [".workbuddy", "frontend"]
@@ -31,6 +32,10 @@ select = ["E", "F", "I", "B", "UP", "SIM"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-q"
+cache_dir = "cache/pytest"
+
+[tool.uv]
+cache-dir = "cache/uv"
 
 [build-system]
 requires = ["hatchling"]

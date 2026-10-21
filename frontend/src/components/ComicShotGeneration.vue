@@ -2,6 +2,7 @@
 import type { CoreRun } from '../types'
 import ImageGenerationPlaceholder from './chat/ImageGenerationPlaceholder.vue'
 import ChatImageAttachment from './chat/ChatImageAttachment.vue'
+import ComicImageImport from './comic/ComicImageImport.vue'
 
 defineProps<{
   run: CoreRun | null
@@ -14,14 +15,10 @@ defineProps<{
   externalImageUrl?: string
   uploading?: boolean
   promptError?: string
+  copying?: boolean
+  copyFeedback?: string
 }>()
-const emit = defineEmits<{ retry: []; resume: []; editPrompt: []; changeModel: []; viewPrompt: []; copyPrompt: []; upload: [file: File]; preview: [media: { url: string; filename: string }] }>()
-function selectExternalImage(event: Event): void {
-  const input = event.target as HTMLInputElement
-  const file = input.files?.[0]
-  if (file) emit('upload', file)
-  input.value = ''
-}
+const emit = defineEmits<{ retry: []; resume: []; editPrompt: []; changeModel: []; viewPrompt: []; copyPrompt: []; copyText: []; upload: [file: File]; preview: [media: { url: string; filename: string }] }>()
 </script>
 <template>
   <div v-if="imageMode === 'external'" class="shot-generation" :data-media-status="externalImageUrl ? 'image_uploaded' : preparing ? 'preparing_prompt' : externalPrompt ? 'awaiting_external_image' : 'prompt_pending'">
@@ -31,10 +28,12 @@ function selectExternalImage(event: Event): void {
       <p role="status">{{ uploading ? '正在导入外部图片…' : externalImageUrl ? '外部图片已导入资产库' : '等待外部图片' }}</p>
       <div class="draft-actions">
         <button class="ui-button sm" @click="emit('viewPrompt')">查看完整 Prompt</button>
-        <button class="ui-button sm" @click="emit('copyPrompt')">复制生图 Prompt</button>
+        <button class="ui-button sm" :disabled="copying" @click="emit('copyPrompt')">{{ Array.isArray(externalPrompt.reference_attachments) && externalPrompt.reference_attachments.length ? '复制图文' : '复制生图 Prompt' }}</button>
+        <template v-if="Array.isArray(externalPrompt.reference_attachments) && externalPrompt.reference_attachments.length"><button class="ui-button quiet sm" :disabled="copying" @click="emit('copyText')">仅复制文字</button><button class="ui-button quiet sm" @click="emit('viewPrompt')">查看参考图</button></template>
         <button class="ui-button quiet sm" :disabled="disabled || uploading" @click="emit('editPrompt')">修改 Prompt</button>
-        <label class="ui-button sm">上传图片<input type="file" accept="image/png,image/jpeg,image/webp" :disabled="disabled || uploading" @change="selectExternalImage" /></label>
       </div>
+      <p v-if="copyFeedback" role="status">{{ copyFeedback }}</p>
+      <ComicImageImport label="上传图片" :disabled="disabled" :uploading="uploading" @upload="emit('upload', $event)" />
       <ChatImageAttachment v-if="externalImageUrl" :media="{ url: externalImageUrl, filename: 'external-image.png' }" @open="emit('preview', $event)" />
     </template>
     <p v-else class="pane-note">生成完整 Image Prompt，复制到 ChatGPT Image 等外部模型后上传图片。</p>

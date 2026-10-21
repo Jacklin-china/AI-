@@ -16,6 +16,7 @@ from pydantic import ValidationError
 
 from kantoku.config import BudgetError, ToolError
 from kantoku.config.observability import current_run_id, public_error
+from kantoku.config.runtime_paths import atomic_write_bytes, resolve_runtime_path
 from kantoku.core.budget import (
     ReservationRequest,
     claim_submission,
@@ -92,7 +93,7 @@ class LocalFakeImageProvider:
             raise ToolError("假供应商实际费用必须是非负整数分")
         if not isinstance(model_id, str) or not model_id.strip():
             raise ToolError("假供应商模型标识不能为空")
-        self.output_dir = output_dir
+        self.output_dir = resolve_runtime_path(output_dir)
         self.model_id = model_id.strip()
         self.actual_fen = actual_fen
         self.submit_count = 0
@@ -156,8 +157,7 @@ class LocalFakeImageProvider:
             raise ToolError("假供应商找不到任务")
         path = self.output_dir / f"shot-{shot_no:03d}-{provider_job_id}.png"
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_bytes(_ONE_PIXEL_PNG)
+            atomic_write_bytes(path, _ONE_PIXEL_PNG)
         except OSError as error:
             raise ToolError("假图保存失败", detail=type(error).__name__) from error
         return ImageGenerationResult(

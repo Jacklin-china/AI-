@@ -17,7 +17,8 @@ from urllib.parse import urlsplit
 from volcengine.visual.VisualService import VisualService
 
 from kantoku.config import ConfigError, ToolError, TracingError, get_settings
-from kantoku.config.settings import ROOT, ImageSettings
+from kantoku.config.runtime_paths import atomic_write_bytes, resolve_runtime_path
+from kantoku.config.settings import ImageSettings
 from kantoku.core.tracing import Trace, write_trace
 from kantoku.schemas.media import ImageGenerationResult
 from kantoku.tools.image_gen import ProviderAccessResult, RequestIdentityValue
@@ -81,7 +82,7 @@ class VolcengineJimengProvider:
 
     @staticmethod
     def _output_dir(configured: Path) -> Path:
-        return configured if configured.is_absolute() else ROOT / configured
+        return resolve_runtime_path(configured)
 
     def _configure_client(self, *, load_credentials: bool) -> None:
         self._validate_output_geometry()
@@ -509,15 +510,12 @@ class VolcengineJimengProvider:
             raise ToolError("即梦返回的图片不是有效 PNG 数据")
         digest = hashlib.sha256(task_id.encode("utf-8")).hexdigest()[:24]
         path = self.output_dir / f"jimeng-{digest}.png"
-        temporary = path.with_suffix(".png.tmp")
         try:
-            path.parent.mkdir(parents=True, exist_ok=True)
             if path.is_file():
                 if path.read_bytes() != image_bytes:
                     raise ToolError("同一即梦任务返回了不同图片，已保留原文件")
                 return path
-            temporary.write_bytes(image_bytes)
-            temporary.replace(path)
+            atomic_write_bytes(path, image_bytes)
         except ToolError:
             raise
         except OSError as error:

@@ -17,6 +17,7 @@ from .models import (
     ComicAsset,
     ComicProjectSnapshot,
     ComicShot,
+    ComicShotAssetRef,
     ComicShotDraft,
     ComicStoryboard,
     ComicStoryboardDraft,
@@ -31,10 +32,34 @@ from .projects import ComicContextBuilder, ComicProjectStore
 def plan_storyboard(
     snapshot: ComicProjectSnapshot, director: DirectorSpec, *, task: str | None,
     assets: list[ComicAsset], model_call: Callable[[list[dict[str, str]]], str],
+    locked_context: dict | None = None,
 ) -> ComicStoryboardPlan:
     """用当前 Brief/Director/相关资产动态规划，不使用固定镜数或镜头模板。"""
+    single_image = director.execution_policy == "single_image"
+    if (single_image and not locked_context and director.director_plan
+            and director.director_plan.character_presence and director.cinematography):
+        # 单幅构图已由导演选定，不再交给分镜模型拆成环境/反应/特写序列。
+        plan, camera = director.director_plan, director.cinematography
+        refs = {
+            kind: [ComicShotAssetRef(asset_id=asset.asset_id, version=asset.version)
+                   for asset in assets if asset.details.kind == kind]
+            for kind in ("character", "scene", "style")
+        }
+        return ComicStoryboardPlan(
+            title=director.creative_decision.intent_summary[:200], description=plan.visual_strategy,
+            shots=[ComicShotDraft(
+                purpose=director.creative_decision.intent_summary,
+                subject=plan.character_presence, action=plan.character_pose,
+                environment=plan.subject_environment_relation,
+                emotion=director.creative_decision.emotional_target,
+                shot_size=camera.shot_size, camera_angle=camera.camera_angle,
+                camera_movement=camera.movement or "",
+                character_asset_versions=refs["character"], scene_asset_versions=refs["scene"],
+                style_version=refs["style"][0] if refs["style"] else None,
+            )],
+        )
     context = ComicContextBuilder.build(
-        snapshot, task=task, director=director, assets=assets,
+        snapshot, task=task, director=director, assets=assets, creative_lock=locked_context,
     )
     messages = [
         {"role": "system", "content": (
@@ -45,6 +70,15 @@ def plan_storyboard(
             "camera_angle、camera_movement、character_asset_versions、"
             "scene_asset_versions、style_version。资产引用仅可使用上下文中存在的"
             "asset_id 与 version；没有依据时使用空列表或 null，禁止捏造资产。"
+            + ("当前导演指定单张画面，只返回一个包含主体的镜头，不增加空镜、反应镜头"
+               "或特写序列。完整继承导演角色、世界、构图和摄影决策。"
+               if single_image else "")
+            + ("当前是已有作品的镜头补充，只返回一个镜头。creative_context_lock 中的"
+               "Character、World、Style 是已确认设定，当前输入只修改动作、姿态、构图"
+               "与光影；不得另造角色、世界或风格。‘她/他’指锁定角色，地点简称继承锁定世界；"
+               "未创建独立角色资产不表示没有人物依据。按已确认 Director Decision "
+               "落实唯一景别、机位与视角，用户指定的背影等视角必须落入当前镜头。"
+               if locked_context else "")
         )},
         {"role": "user", "content": json.dumps(context.model_dump(), ensure_ascii=False)},
     ]
@@ -60,6 +94,22 @@ def plan_storyboard(
             refs.append(shot.style_version)
         if any((ref.asset_id, ref.version) not in allowed for ref in refs):
             raise ToolError("分镜模型引用了上下文之外的资产")
+    if single_image and len(plan.shots) != 1:
+        raise ToolError("当前方案为单张画面，分镜规划不得扩展成多个镜头")
+    if locked_context:
+        if len(plan.shots) != 1:
+            raise ToolError("镜头补充需要一个明确镜头，请重新描述当前动作")
+        base = ComicShot.model_validate_json(json.dumps(locked_context["base_shot"]))
+        if base.project_id != snapshot.project.project_id:
+            raise ToolError("锁定的角色镜头不属于当前作品")
+        # 模型可决定镜头摄影，不能更改已锁定的角色、世界与资产版本。
+        plan.shots = [plan.shots[0].model_copy(update={
+            "subject": base.subject, "environment": base.environment, "action": task,
+            "shot_size": base.shot_size, "camera_angle": base.camera_angle,
+            "camera_movement": base.camera_movement,
+            "character_asset_versions": base.character_asset_versions,
+            "scene_asset_versions": base.scene_asset_versions, "style_version": base.style_version,
+        })]
     return plan
 
 

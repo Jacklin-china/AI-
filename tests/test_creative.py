@@ -2,12 +2,15 @@
 
 from types import SimpleNamespace
 
+import pytest
+
 from kantoku.capabilities.creative import (
     CreativeContext,
     compile_image_prompt,
     creative_brief,
     plan_creative_turn,
 )
+from kantoku.config import ToolError
 
 
 def test_followup_edits_last_image_without_requiring_a_template() -> None:
@@ -32,22 +35,18 @@ def test_followup_edits_last_image_without_requiring_a_template() -> None:
     assert "本次主体：熊二" in prompt
 
 
-def test_creative_planner_falls_back_to_image_edit_on_model_failure() -> None:
+def test_creative_planner_reports_failure_without_guessing_inheritance() -> None:
     previous = CreativeContext(subject="熊大", artifact_id="artifact-bear")
 
     def unavailable(*_args: object, **_kwargs: object) -> None:
         raise TimeoutError("offline")
 
-    decision = plan_creative_turn(
-        "背景保持不变，换个人物", previous,
-        trace_id="trace-creative-offline", classify=unavailable,
-    )
-    assert decision.action == "image.edit"
-    assert decision.use_reference
-    assert "背景保持不变，换个人物" in compile_image_prompt(decision, previous)
+    with pytest.raises(ToolError, match="判断失败"):
+        plan_creative_turn("背景保持不变，换个人物", previous,
+                           trace_id="trace-creative-offline", classify=unavailable)
 
 
-def test_explicit_edit_does_not_change_route_when_model_labels_it_generate() -> None:
+def test_semantic_result_is_not_overridden_by_fixed_change_keyword() -> None:
     previous = CreativeContext(subject="小埋", artifact_id="artifact-previous")
     decision = plan_creative_turn(
         "换成海老名", previous, trace_id="trace-edit-stable",
@@ -55,14 +54,15 @@ def test_explicit_edit_does_not_change_route_when_model_labels_it_generate() -> 
             '{"action":"image.generate","subject":"海老名","use_reference":false}'
         )),
     )
-    assert decision.action == "image.edit"
-    assert decision.use_reference
+    assert decision.action == "image.generate"
+    assert not decision.use_reference
     assert decision.subject == "海老名"
 
 
 def test_image_whereabouts_is_chat_not_another_paid_image() -> None:
     previous = CreativeContext(subject="熊大", artifact_id="artifact-bear")
-    decision = plan_creative_turn("图片在哪里", previous, trace_id="trace-creative-where")
+    decision = plan_creative_turn("图片在哪里", previous, trace_id="trace-creative-where",
+        classify=lambda *_args, **_kwargs: SimpleNamespace(content='{"action":"chat"}'))
     assert decision.action == "chat"
 
 
@@ -71,10 +71,10 @@ def test_video_request_after_image_cannot_become_another_image() -> None:
     decision = plan_creative_turn(
         "生成无一郎竹林战斗视频", previous, trace_id="trace-video-route",
         classify=lambda *_args, **_kwargs: SimpleNamespace(content=(
-            '{"action":"image.generate","subject":"无一郎"}'
+            '{"action":"video.generate","subject":"无一郎"}'
         )),
     )
-    assert decision.action == "chat"
+    assert decision.action == "video.generate"
 
 
 def test_untemplated_first_request_can_be_understood_as_image() -> None:
@@ -94,7 +94,7 @@ def test_correction_brief_explains_interpretation_instead_of_echoing_request() -
     decision = plan_creative_turn(
         "我是说熊出没的吉吉国王", previous, trace_id="trace-brief-correction",
         classify=lambda *_args, **_kwargs: SimpleNamespace(content=(
-            '{"action":"image.edit","subject":"其他人物",'
+            '{"action":"image.edit","subject":"熊出没的吉吉国王",'
             '"style":"卡通动画","use_reference":true}'
         )),
     )

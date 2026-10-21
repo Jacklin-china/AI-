@@ -6,6 +6,9 @@ import ts from 'typescript'
 const source = readFileSync(new URL('../src/components/chat/conversationPresentation.ts', import.meta.url), 'utf8')
 const compiled = ts.transpileModule(source, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
 const { conversationTaskTitle, ownsConversationRun } = await import(`data:text/javascript;base64,${Buffer.from(compiled).toString('base64')}`)
+const directorSource = readFileSync(new URL('../src/domains/comic/directorPresentation.ts', import.meta.url), 'utf8')
+const directorCompiled = ts.transpileModule(directorSource, { compilerOptions: { module: ts.ModuleKind.ES2022 } }).outputText
+const { directorConversationExecutions } = await import(`data:text/javascript;base64,${Buffer.from(directorCompiled).toString('base64')}`)
 
 test('first task gets a short title without changing the original request', () => {
   const cases = [
@@ -34,7 +37,14 @@ test('homepage and Comic reuse the same shell, history list and conversation-key
   assert.match(comic, /const epoch = \+\+conversationEpoch\s+resetConversationView\(\)/)
   assert.match(comic, /const conversation = owner/)
   assert.match(comic, /owner !== activeConversationId.value/)
-  assert.doesNotMatch(comic, /kantoku-comic-conversation:|getCurrentDirector\(/)
+  // 会话来源必须唯一：不允许再引入一套 conversation 键（此前出现过 kantoku-comic-conversation: 的重复绑定）。
+  assert.doesNotMatch(comic, /kantoku-comic-conversation:/)
+  // getCurrentDirector 只允许读"作品当前已保存的导演稿"，用于 UX-010 刷新后可继续编辑；
+  // 它不得被用作会话/选版的来源（那必须走 Run 体系）。
+  if (comic.includes('getCurrentDirector(')) {
+    assert.match(comic, /currentDirector = ref/)
+    assert.match(comic, /active\.value\?\.director_spec/)
+  }
 })
 
 test('switching conversation during submission keeps the original owner and ignores its late response', async () => {
@@ -52,6 +62,7 @@ test('switching conversation during submission keeps the original owner and igno
     composer: ref(null), draftKey: ref('old-draft'), activeConversationId: ref('old'),
     mode: ref('fast'), manualDirectorApproval: ref(true), pendingText: ref(''), previousRunIds: ref([]), executions: ref([]),
     error: ref(''), restoredSpec: ref(null), selectedRun: ref(''), drafts: ref({}),
+    runs: ref({}), directorConversationExecutions, submittingDirector: ref(false), pendingRequestId: ref(''),
     invalidate() {}, createComicProject: () => created,
     getComicProject() { throw new Error('unexpected project inheritance') },
     async createDirectorExecution(id, options) { submissions.push({ id, options }); return { run_id: 'old-run' } },
@@ -60,7 +71,7 @@ test('switching conversation during submission keeps the original owner and igno
     failureText: String, selectDirectorExecution() { return null },
   }
   const names = Object.keys(environment).filter(name => name !== 'epoch' && name !== 'disposed')
-  const execute = new Function('environment', `const {${names.join(',')}} = environment; ${output}; return execute`)(environment)
+  const execute = new Function('environment', `const {${names.join(',')}} = environment; const workSelectionEpoch=0,activeWork={value:null}; ${output}; return execute`)(environment)
   const pending = execute('少年雨夜思念故乡')
   environment.epoch++
   environment.activeConversationId.value = 'new'
@@ -91,15 +102,15 @@ test('external workspace late director response cannot bind its project to the n
     composer: ref(null), draftKey: ref('draft'), activeConversationId: ref('old'),
     mode: ref('professional'), manualDirectorApproval: ref(true), pendingText: ref(''),
     previousRunIds: ref([]), executions: ref([]), error: ref(''), restoredSpec: ref(null),
-    productionRun: ref(null), runs: ref({}), invalidate() {},
-    selectedRun: ref(''), drafts: ref({}),
+    productionRun: ref(null), runs: ref({}), directorConversationExecutions, invalidate() {}, submittingDirector: ref(false),
+    selectedRun: ref(''), drafts: ref({}), pendingRequestId: ref(''),
     createDirectorExecution(id, payload) { submissions.push({ id, payload }); return response },
     async getComicProject() { return { project: { project_id: 'old-project', current_version: 1 } } },
     refresh() { throw new Error('must not refresh another conversation') },
     failureText: String,
   }
   const names = Object.keys(environment).filter(name => name !== 'epoch' && name !== 'disposed')
-  const execute = new Function('environment', `const {${names.join(',')}}=environment; let pendingCreation=null,productionAdvanced=false; ${output}; return execute`)(environment)
+  const execute = new Function('environment', `const {${names.join(',')}}=environment; const workSelectionEpoch=0,activeWork={value:null}; let pendingCreation=null,productionAdvanced=false; ${output}; return execute`)(environment)
   const pending = execute('少女竹林')
   await new Promise(resolve => setImmediate(resolve))
   environment.epoch++

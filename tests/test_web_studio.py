@@ -39,13 +39,15 @@ from kantoku.tools.image_gen import LocalFakeImageProvider
 
 
 @pytest.fixture
-def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApplication:
+def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+        request: pytest.FixtureRequest) -> web_studio.StudioApplication:
     settings = _settings(tmp_path / "budget.db")
     settings.image = SimpleNamespace(
         prompt_max_chars=1000, force_single=True, model="test", width=100, height=100
     )
     settings.llm = SimpleNamespace(model_chat="text-test", model_vision="vision-test")
     settings.search = SimpleNamespace(enabled=True, timeout_s=2, max_results=4)
+    settings.runtime = web_studio.RuntimeSettings()
     settings.budget.autonomous_image_auto_cny = Decimal("0.30")
     settings.budget.image_conversation_cny = Decimal("5.00")
     for module in (web_studio, studio, budget):
@@ -65,10 +67,53 @@ def app(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> web_studio.StudioApp
         lambda requirement, _prompt, _trace: f"已按你的要求生成一张{requirement}。",
     )
     application = web_studio.StudioApplication()
+    def context_model(messages):
+        payload = json.loads(messages[1]["content"])
+        if payload["current_request"] == "图片在哪里":
+            images = [item for item in [*payload["recalled"].values(), *payload["available"]]
+                      if item.get("kind") == "artifact" and item.get("type") == "image"]
+            if images:
+                image = images[0]
+                if image.get("read_required"):
+                    return json.dumps({"action": "chat", "relation": "recall", "goal": "展示图片",
+                                       "reads": [{"kind": "artifact", "id": image["id"]}]})
+                return json.dumps({"action": "chat", "relation": "recall", "goal": "展示图片",
+                    "response_artifact_id": image["id"], "sources": [
+                        {"id": image["id"], "kind": "artifact", "version": image["version"]}]})
+        runs = [item for item in [*payload["recalled"].values(), *payload["available"]]
+                if item.get("kind") == "run" and item.get("version")]
+        if runs and runs[0].get("read_required"):
+            return json.dumps({"action": "create", "relation": "continue",
+                "goal": payload["current_request"],
+                "reads": [{"kind": "run", "id": runs[0]["id"]}]})
+        return json.dumps({"action": "create", "relation": "continue" if runs else "new",
+                           "goal": payload["current_request"], "sources": [
+                               {"id": runs[0]["id"], "kind": "run", "version": runs[0]["version"],
+                                "fields": ["character_context", "world_context", "style_context"]}
+                           ] if runs else [],
+                           "tasks": [], "reads": []}, ensure_ascii=False)
+
+    monkeypatch.setattr(application, "_conversation_context_model", context_model)
+    def creative_model(messages, **_kwargs):
+        from kantoku.core.conversations import IntentPlanner
+        payload = json.loads(messages[-1]["content"])
+        requirement = payload["request"]
+        previous = payload["last_completed_image"]
+        plan = IntentPlanner().plan(requirement, image_context=bool(previous))
+        action = plan.intent if plan.intent in {
+            "image.generate", "image.edit", "video.generate"} else "chat"
+        if previous and requirement.startswith("换成"):
+            action = "image.edit"
+        return SimpleNamespace(content=json.dumps({"action": action, "subject": requirement,
+            "style": "", "composition": "", "background": "",
+            "use_reference": action == "image.edit"}))
+
+    monkeypatch.setattr(creative, "chat", creative_model)
+    request.addfinalizer(application.runner.close)
     # 离线测试显式替身；涉及创意隔离的测试单独提供语义边界结果。
-    monkeypatch.setattr(application, "_comic_intent_model", lambda _messages: json.dumps({
-        "new_creative_direction": False, "reason": "offline continuation fixture",
-    }))
+    monkeypatch.setattr(application, "_comic_intent_model", lambda messages: json.dumps(
+        {"edit_scopes": ["action"]} if "edit_scopes" in messages[0]["content"] else {
+            "new_creative_direction": False, "reason": "offline continuation fixture"}))
     return application
 
 
@@ -120,6 +165,48 @@ def test_http_root_and_session_boundary(server: int, app: web_studio.StudioAppli
         state = json.loads(response.read())
         assert state["tasks"] == []
         assert state["budgets"] == {}
+    finally:
+        connection.close()
+
+
+def test_http_artifact_trash_restore_and_version_boundary(
+    server: int, app: web_studio.StudioApplication, tmp_path: Path,
+) -> None:
+    run = app.runtime_store.create_run("test", "test.asset", {}, "finish")
+    image = tmp_path / "preserved.png"
+    image.write_bytes(b"preserved media")
+    artifact = app.runtime_store.create_artifact(
+        type=ArtifactType.IMAGE, run_id=run.id, node_id="finish", source="test.image",
+        location=str(image), metadata={"origin": "real"},
+    )
+    headers = {"Content-Type": "application/json", "X-Studio-Token": app.token}
+    connection = HTTPConnection("127.0.0.1", server, timeout=5)
+
+    def request(method: str, path: str, body: dict | None = None, authenticated=True):
+        connection.request(method, path, json.dumps(body) if body is not None else None,
+                           headers if authenticated else {"Content-Type": "application/json"})
+        response = connection.getresponse()
+        return response.status, response.read()
+
+    try:
+        path = f"/api/artifacts/{artifact.id}"
+        assert request("POST", path + "/trash", {"expected_lifecycle_version": 1}, False)[0] == 403
+        assert app.runtime_store.get_artifact(artifact.id).lifecycle_state == "active"
+        assert request("POST", path + "/trash", {})[0] == 400
+        status, body = request("POST", path + "/trash", {"expected_lifecycle_version": 1})
+        assert status == 200 and json.loads(body)["lifecycle_state"] == "trashed"
+        assert json.loads(request("GET", "/api/artifacts")[1])["artifacts"] == []
+        trash = json.loads(request("GET", "/api/artifacts?lifecycle=trashed")[1])["artifacts"]
+        history = json.loads(request("GET", f"/api/artifacts?run_id={run.id}")[1])["artifacts"]
+        assert trash[0]["id"] == history[0]["id"] == artifact.id
+        assert request("GET", path + "/content") == (200, b"preserved media")
+        assert request("POST", path + "/restore", {"expected_lifecycle_version": 2})[0] == 200
+        status, body = request("POST", path + "/trash", {"expected_lifecycle_version": 1})
+        error = json.loads(body)
+        assert status == 400 and "刷新" in error["safe_message"]
+        assert error["error_id"].startswith("ERR-") and error["trace_id"] != "-"
+        assert app.runtime_store.get_artifact(artifact.id).lifecycle_state == "active"
+        assert image.read_bytes() == b"preserved media"
     finally:
         connection.close()
 
@@ -635,6 +722,61 @@ def test_home_image_chat_generates_conversation_artifact_without_run_or_studio_t
     assert app.image_service.provider.submit_count == 1
 
 
+def test_artifact_purge_endpoint_only_clears_recycle_bin_entries(
+    app: web_studio.StudioApplication, tmp_path: Path,
+) -> None:
+    media = tmp_path / "purge-media.png"
+    media.write_bytes(b"paid image")
+    run = app.runtime_store.create_run("test", "test.artifacts", {}, "finish")
+    artifact = app.runtime_store.create_artifact(
+        type=ArtifactType.IMAGE, run_id=run.id, node_id="finish", source="test.image",
+        location=str(media), metadata={"origin": "real"},
+    )
+    # 彻底删除只接受版本参数，未知动作一律拒绝。
+    with pytest.raises(ToolError, match="参数无效"):
+        app.change_core_artifact(artifact.id, "purge", {"version": 1})
+    with pytest.raises(ToolError, match="参数无效"):
+        app.change_core_artifact(artifact.id, "delete", {"expected_lifecycle_version": 1})
+    # 正常资产不能绕过回收站直接彻底删除，媒体文件保持不变。
+    with pytest.raises(ToolError, match="只有回收站中的资产"):
+        app.change_core_artifact(artifact.id, "purge", {"expected_lifecycle_version": 1})
+    assert media.is_file()
+    assert [item["id"] for item in app.query_core_artifacts()] == [artifact.id]
+
+    trashed = app.change_core_artifact(artifact.id, "trash", {"expected_lifecycle_version": 1})
+    assert trashed["lifecycle_state"] == "trashed"
+    assert app.query_core_artifacts() == []
+    with pytest.raises(ToolError, match="状态已变化"):
+        app.change_core_artifact(artifact.id, "purge", {"expected_lifecycle_version": 1})
+
+    purged = app.change_core_artifact(
+        artifact.id, "purge", {"expected_lifecycle_version": trashed["lifecycle_version"]},
+    )
+    assert purged["lifecycle_state"] == "purged"
+    assert not media.exists()
+    assert app.query_core_artifacts() == []
+    assert app.query_core_artifacts(lifecycle_state="trashed") == []
+    # 重复请求幂等：已彻底删除的资产不再改动状态。
+    assert app.change_core_artifact(
+        artifact.id, "purge", {"expected_lifecycle_version": trashed["lifecycle_version"]},
+    )["lifecycle_state"] == "purged"
+
+
+def test_purged_artifact_cannot_serve_a_file_retained_for_another_asset(app, tmp_path):
+    media = tmp_path / "shared-original.png"
+    media.write_bytes(b"shared original")
+    run = app.runtime_store.create_run("test", "test.artifacts", {}, "finish")
+    records = [app.runtime_store.create_artifact(
+        type=ArtifactType.IMAGE, run_id=run.id, node_id="finish", source="test.image",
+        location=str(media), metadata={"origin": "real"},
+    ) for _ in range(2)]
+    app.change_core_artifact(records[0].id, "trash", {"expected_lifecycle_version": 1})
+    app.change_core_artifact(records[0].id, "purge", {"expected_lifecycle_version": 2})
+    assert app.get_core_artifact_content(records[1].id).read_bytes() == b"shared original"
+    with pytest.raises(ToolError, match="已彻底删除"):
+        app.get_core_artifact_content(records[0].id)
+
+
 def test_home_natural_image_request_skips_parameter_questions_and_preserves_subject(
     app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -720,6 +862,8 @@ def test_generic_image_followup_reuses_subject_instead_of_inventing_one(
     app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(web_studio, "_enhance_prompt", lambda text, _trace: text)
+    monkeypatch.setattr(creative, "chat", lambda *_args, **_kwargs: SimpleNamespace(
+        content='{"action":"image.generate","subject":"蜡笔小新中正男","use_reference":false}'))
     conversation = app.create_conversation({"interaction_mode": "autonomous"})
     app.runtime_store.add_conversation_message(
         conversation["id"], role=MessageRole.USER, type=MessageType.TEXT,
@@ -746,12 +890,20 @@ def test_home_creative_followup_uses_completed_artifact_as_real_reference(
         return original_submit(**kwargs)
 
     monkeypatch.setattr(provider, "submit", capture_submit)
-    monkeypatch.setattr(creative, "chat", lambda *_args, **_kwargs: SimpleNamespace(
+    def understand(messages, **_kwargs):
+        incoming = json.loads(messages[-1]["content"])
+        if incoming["request"] == "图片在哪里":
+            return SimpleNamespace(content='{"action":"chat"}')
+        previous = incoming["last_completed_image"]
+        if not previous:
+            return SimpleNamespace(content='{"action":"image.generate","subject":"熊大",'
+                                   '"style":"写实","use_reference":false}')
+        return SimpleNamespace(
         content=(
             '{"action":"image.edit","subject":"熊二","style":"写实",'
             '"composition":"半身头像","background":"树林","use_reference":true}'
-        ),
-    ))
+        ))
+    monkeypatch.setattr(creative, "chat", understand)
     conversation = app.create_conversation({"interaction_mode": "autonomous"})
     first = list(app.stream_conversation(conversation["id"], {
         "content": "帮我生成熊大的写实头像", "generation_request_id": "generation-creative-first",
@@ -1736,6 +1888,8 @@ def test_home_fast_mode_infers_domain_without_opening_professional_workflow_page
     app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(app.runner, "submit", lambda _execute: None)
+    monkeypatch.setattr(app, "_conversation_context_model", lambda _: json.dumps({
+        "action": "comic_production", "relation": "new", "goal": "制作三镜头漫剧"}))
     monkeypatch.setattr(
         web_studio, "plan_creative_turn",
         lambda content, _prior, **_kwargs: creative.CreativeDecision(
@@ -1765,6 +1919,8 @@ def test_home_fast_mode_infers_domain_without_opening_professional_workflow_page
 def test_home_explicit_image_request_still_generates_when_creative_model_misses_intent(
     app: web_studio.StudioApplication, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.setattr(app, "_conversation_context_model", lambda _: json.dumps({
+        "action": "image.generate", "relation": "new", "goal": "竹林里的卡通剑士"}))
     monkeypatch.setattr(
         web_studio, "plan_creative_turn",
         lambda content, _prior, **_kwargs: creative.CreativeDecision(

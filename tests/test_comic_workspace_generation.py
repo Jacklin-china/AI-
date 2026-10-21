@@ -10,6 +10,7 @@ from test_home_quick_domain import production as production_fixture
 
 from kantoku.config import ToolError
 from kantoku.core import budget
+from kantoku.core.runtime.models import ArtifactType
 from kantoku.domains.comic.critic import require_approved_director
 
 app = app_fixture
@@ -91,7 +92,9 @@ def test_provider_403_is_not_reported_as_storyboard_or_approval_failure(
     assert run["image_execution"]["can_regenerate"]
 
 
-def test_workspace_defaults_to_current_director_board_and_keeps_history(app, production):
+def test_workspace_defaults_to_current_director_board_and_keeps_history(
+    app, production, monkeypatch,
+):
     request = _workspace_production_request(app)
     project_id = request["production_project_id"]
 
@@ -102,10 +105,15 @@ def test_workspace_defaults_to_current_director_board_and_keeps_history(app, pro
         })
 
     historical = create_board()
+    def semantic_change(messages):
+        return ('{"edit_scopes":["character_context","world_context"]}'
+                if "edit_scopes" in messages[0]["content"] else
+                '{"new_creative_direction":false,"reason":"离线同一方案修改"}')
+    monkeypatch.setattr(app, "_comic_intent_model", semantic_change)
     spec = app.create_comic_director(project_id, {
         "expected_project_version": app.comic_projects.get(project_id).project.current_version,
         "conversation_id": request["conversation_id"], "creation_mode": "professional",
-        "task": "中式修仙少女站在竹林",
+        "task": "重新设计：中式修仙少女站在竹林",
     })["director_spec"]
     app.confirm_comic_director(project_id, {
         "version": spec["version"],
@@ -157,6 +165,25 @@ def test_professional_director_confirm_storyboard_and_selected_image(
         assert spec.critic_result.verdict == "pass"
     with pytest.raises(ToolError, match="确认|尚未通过"):
         app.comic_projects.require_confirmed_director(spec)
+    if critic_output == "unavailable":
+        # This legacy direct-project entry has no workspace_work_id recovery policy.
+        # An unavailable first-generation validator must not authorize production.
+        assert director_run.state["generation_incomplete"] is True
+        assert not app.get_comic_director(project_id)["validation"]["can_confirm"]
+        calls = list(production)
+        with pytest.raises(ToolError, match="内部验证"):
+            app.confirm_comic_director(project_id, {
+                "version": spec.version,
+                "expected_project_version": request["expected_project_version"],
+            })
+        assert production == calls
+        assert not app.comic_projects.human_director_confirmed(spec)
+        assert not app.runtime_store.list_approvals()
+        assert not app.list_comic_storyboards(project_id)["storyboards"]
+        assert not app.runtime_store.list_artifacts(type=ArtifactType.PROMPT)
+        assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+        assert not budget.list_ledger(project=project_id)
+        return
     confirmed = app.confirm_comic_director(project_id, {
         "version": spec.version, "expected_project_version": request["expected_project_version"],
     })
@@ -232,3 +259,130 @@ def test_failed_shot_new_attempt_succeeds_and_cost_error_logs_are_complete(
                   "estimated_cost_cny=", "actual_cost_cny=0.3", "latency_ms=",
                   "http_status=403", "provider_error_code=AccessDenied.Unpurchased"):
         assert field in output
+
+
+@pytest.mark.parametrize("critic_unavailable", [False, True])
+def test_external_workspace_stops_at_real_prompt_without_any_image_side_effects(
+    app, production, monkeypatch, tmp_path, critic_unavailable,
+):
+    original = app._comic_director_model
+
+    def model(messages):
+        response = original(messages)
+        if critic_unavailable and '"title": "SemanticReview"' in messages[0]["content"]:
+            payload = json.loads(response)
+            payload.pop("confidence")
+            return json.dumps(payload)
+        return response
+
+    monkeypatch.setattr(app, "_comic_director_model", model)
+    request = _workspace_production_request(app, confirm=False)
+    project_id = request["production_project_id"]
+    spec = app.comic_projects.get_director(project_id)
+    assert (spec.critic_status == "unavailable") is critic_unavailable
+    assert (spec.critic_result is None) is critic_unavailable
+    if critic_unavailable:
+        director_run = next(run for run in app.runtime_store.list_runs()
+                            if run.workflow == "comic.director")
+        assert director_run.state["generation_incomplete"] is True
+        assert not app.get_comic_director(project_id)["validation"]["can_confirm"]
+        calls = list(production)
+        with pytest.raises(ToolError, match="内部验证"):
+            app.confirm_comic_director(project_id, {
+                "version": spec.version,
+                "expected_project_version": request["expected_project_version"],
+            })
+        assert production == calls
+        assert not app.comic_projects.human_director_confirmed(spec)
+        assert not app.runtime_store.list_approvals()
+        assert not app.list_comic_storyboards(project_id)["storyboards"]
+        assert not app.runtime_store.list_artifacts(type=ArtifactType.PROMPT)
+        assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+        assert not budget.list_ledger(project=project_id)
+        assert not list(tmp_path.rglob("studio-*.json"))
+        return
+    app.confirm_comic_director(project_id, {
+        "version": spec.version, "expected_project_version": request["expected_project_version"],
+    })
+    board = app.create_comic_storyboard(project_id, {
+        "expected_project_version": request["expected_project_version"],
+        "generate": True, "task": "当前导演方案分镜",
+    })
+    shot = app.comic_storyboards.get_shot(board["shots"][0]["shot_id"])
+    before_tasks = list(tmp_path.rglob("studio-*.json"))
+    before_ledger = budget.list_ledger(project=project_id)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("external workspace must never enter image execution or image billing")
+
+    for target in (
+        "kantoku.tools.image_gen.gen_image", "kantoku.tools.studio.gen_image",
+        "kantoku.domains.comic.services.create_task",
+        "kantoku.domains.comic.services.execute_task",
+        "kantoku.domains.comic.services.qc_image",
+        "kantoku.domains.comic.services.archive_reviewed_image",
+        "kantoku.core.budget.reserve", "kantoku.core.budget.settle",
+        "kantoku.core.budget.estimate_image_fen",
+    ):
+        monkeypatch.setattr(target, forbidden)
+    for name in ("submit", "query", "validate_request", "check_access"):
+        monkeypatch.setattr(app.image_service.provider, name, forbidden)
+    calls = list(production)
+    result = app.compile_comic_prompt(shot.shot_id, {
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+        "expected_shot_version": shot.version, "image_mode": "external",
+        "conversation_id": request["conversation_id"],
+    })
+    assert production[len(calls):] == ["prompt"]
+    artifact = app.runtime_store.get_artifact(result["artifact_id"])
+    assert artifact.type.value == "prompt" and artifact.metadata["positive_prompt"]
+    assert artifact.metadata["model_target"] == "external"
+    assert result["media_preparation"]["status"] == "awaiting_external_image"
+    assert result["media_preparation"]["prompt_status"] == "ready"
+    run = app.runtime_store.get_run(artifact.run_id)
+    assert run.workflow == "comic.prompt.compile" and run.status.value == "completed"
+    assert run.state["media_preparation"] == result["media_preparation"]
+    assert run.state["conversation_id"] == request["conversation_id"]
+    assert not run.state.get("request_id")  # no image-generation attempt or StudioTask
+    assert not [r for r in app.runtime_store.list_runs() if r.workflow == "comic.production.v1"]
+    assert not app.runtime_store.list_artifacts(type=ArtifactType.IMAGE)
+    assert budget.list_ledger(project=project_id) == before_ledger
+    assert list(tmp_path.rglob("studio-*.json")) == before_tasks
+    assert app.comic_storyboards.get_shot(shot.shot_id) == shot
+    assert app.comic_projects.get_director(project_id) == spec
+    assert app.comic_prompts.get(shot.shot_id).artifact_id == artifact.id
+    assert result["artifact_id"] == app.comic_prompts.versions(shot.shot_id)[0].artifact_id
+    events = app.runtime_store.list_events(run.id)
+    assert any(e.payload.get("status") == "awaiting_external_image" for e in events)
+    assert not app.runtime_store.approval_for_node(run.id, "cost_approval")
+
+
+def test_external_prompt_requires_human_confirmation_and_owned_guided_conversation(
+    app, production,
+):
+    request = _workspace_production_request(app)
+    project_id = request["production_project_id"]
+    board = app.create_comic_storyboard(project_id, {
+        "expected_project_version": request["expected_project_version"], "generate": True,
+    })
+    shot = board["shots"][0]
+    body = {
+        "expected_project_version": app.comic_projects.get(project_id).project.current_version,
+        "expected_shot_version": shot["version"], "image_mode": "external",
+    }
+    other = app.create_conversation({"interaction_mode": "guided", "domain": "comic"})
+    before = list(production)
+    with pytest.raises(ToolError, match="创作会话"):
+        app.compile_comic_prompt(shot["shot_id"], {**body, "conversation_id": other["id"]})
+    assert production == before
+    # An automatic policy authorization cannot replace explicit director confirmation.
+    for approval in app.runtime_store.list_approvals():
+        if approval.request.get("kind") == "comic.director.confirmation":
+            with app.runtime_store._connect() as connection:
+                connection.execute("UPDATE approvals SET response_json=? WHERE id=?",
+                                   (json.dumps({"human_review": False}), approval.id))
+    with pytest.raises(ToolError, match="确认"):
+        app.compile_comic_prompt(shot["shot_id"], {
+            **body, "conversation_id": request["conversation_id"],
+        })
+    assert production == before

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+from copy import deepcopy
 from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
@@ -160,8 +161,10 @@ def test_additive_optional_fields_keep_historical_approval_hash_compatible() -> 
     payload.pop("critic_status")
     payload.pop("field_provenance")
     payload.pop("execution_policy")
+    payload.pop("reference_context")
     payload["cinematography"].pop("unresolved_decisions")
-    for field in ("style_boundary", "character_expression", "character_pose", "character_presence"):
+    for field in ("style_boundary", "character_expression", "character_pose",
+                  "character_presence", "characters_present"):
         payload["director_plan"].pop(field)
     for field in ("status", "public_decision", "creative_reason"):
         payload["cinematography"].pop(field)
@@ -509,7 +512,7 @@ def test_semantic_review_rejects_cot_and_fabricated_evidence() -> None:
     assert result.suggested_patches == []
 
 
-def test_major_review_waits_in_existing_run_without_saving_a_spec(tmp_path: Path) -> None:
+def test_generated_major_review_repairs_then_retains_unfinished_candidate(tmp_path: Path) -> None:
     coordinator, projects, runtime, _calls = _setup(tmp_path)
     project_id = _project(projects)
     coordinator.critic_engine = DirectorCriticEngine(
@@ -519,21 +522,26 @@ def test_major_review_waits_in_existing_run_without_saving_a_spec(tmp_path: Path
     result = coordinator.execute(_request(projects, project_id, "professional"))
 
     assert result.needs_review and result.director_spec is None
+    # 未完成生成保留真实 needs_revision 结论供内部诊断与恢复；
+    # 是否向用户外显由上层按 generation_mode 决定，不在此伪造为通过。
+    assert result.critic_result is not None
     assert result.critic_result.verdict == "needs_revision"
     run = RuntimeStore(runtime.path).get_run(result.run_id)
     assert run.status == ExecutionStatus.WAITING
-    assert run.state["task_status"] == "needs_review"
+    assert run.state["task_status"] == "generation_incomplete"
+    assert run.state["generation_repair_count"] == 1
+    assert run.state["critic_result"]["verdict"] == "needs_revision"
     assert run.state["director_candidate"]["schema_version"] == 2
     assert len(runtime.list_runs()) == 1
     names = [item.payload["director_event"] for item in runtime.list_events(run.id)]
-    assert "director_critic_started" in names
-    assert "director_critic_completed" in names
-    assert "director_review_blocked" in names
+    assert "internal_validator_started" in names
+    assert "internal_validator_completed" in names
+    assert "internal_validation_blocked" in names
     assert "director_spec_created" not in names
-    saved = projects.get_director(project_id)
-    assert saved.version == 1 and saved.critic_result.verdict == "needs_revision"
-    with pytest.raises(ToolError):
-        projects.require_confirmed_director(saved)
+    assert names.count("internal_validator_completed") == 2
+    # 未完成校验的候选作为草稿保存以便恢复；它不得被当作已确认方案投产。
+    saved_draft = projects.get_director(project_id)
+    assert not projects.human_director_confirmed(saved_draft)
 
 
 def test_compiler_rejects_unreviewed_or_changed_v2_before_model_call(tmp_path: Path) -> None:
@@ -588,23 +596,56 @@ def test_default_engine_uses_existing_shared_text_call(monkeypatch: pytest.Monke
     assert calls == [{"response_format": {"type": "json_object"}}]
 
 
-def test_coordinator_persists_patch_events_and_the_approved_candidate(tmp_path: Path) -> None:
+@pytest.mark.parametrize("mode", ["fast", "professional"])
+def test_coordinator_keeps_fast_patches_and_professional_director_quality_repair(
+    tmp_path: Path, mode: str,
+) -> None:
     coordinator, projects, runtime, _calls = _setup(tmp_path)
     project_id = _project(projects)
     replies = [_semantic([_finding(_spec())], [_patch(_spec())]), _semantic()]
     coordinator.critic_engine = DirectorCriticEngine(lambda _messages: replies.pop(0))
+    execute = coordinator.stage_executor
 
-    result = coordinator.execute(_request(projects, project_id, "professional"))
+    def repair_stage(skill_id, inputs, context):
+        output = deepcopy(execute(skill_id, inputs, context))
+        if context.get("context", {}).get("generation_feedback") and skill_id == SKILLS[1]:
+            assert context["context"]["generation_feedback"][0]["level"] == "warning"
+            output["director_plan"]["composition_strategy"] = _patch(_spec())["value"]
+        return output
 
-    assert not result.needs_review
-    require_approved_director(projects.get_director(project_id))
-    assert result.director_spec.composition == _patch(_spec())["value"]
+    coordinator.stage_executor = repair_stage
+
+    result = coordinator.execute(_request(projects, project_id, mode))
+
+    saved = projects.get_director(project_id)
     run = runtime.get_run(result.run_id)
-    assert run.state["revision_count"] == 1
     events = runtime.list_events(run.id)
     names = [item.payload["director_event"] for item in events]
-    assert names.count("director_patch_applied") == 1
-    assert names.count("director_critic_completed") == 2
+    if mode == "fast":
+        assert not result.needs_review
+        require_approved_director(saved)
+        assert result.director_spec.composition == _patch(_spec())["value"]
+        assert run.state["revision_count"] == 1
+        assert names.count("director_patch_applied") == 1
+        assert names.count("internal_validator_completed") == 2
+    else:
+        assert not result.needs_review and result.director_spec is not None
+        assert run.status is ExecutionStatus.COMPLETED
+        assert saved.critic_result.verdict == "pass"
+        assert not projects.human_director_confirmed(saved)
+        assert saved.composition == _patch(_spec())["value"]
+        assert run.state["revision_count"] == 0
+        assert "director_patch_applied" not in names
+        assert names.count("internal_validator_completed") == 2
+        assert names.count("director_generation_repair_started") == 1
+        assert _calls.count(SKILLS[1]) == 2 and _calls.count(SKILLS[2]) == 2
+        # 首次建议交回原导演修正并复审，仍需单独人工确认。
+        confirmed = projects.confirm_director(
+            project_id, version=saved.version,
+            expected_project_version=projects.get(project_id).project.current_version,
+            allow_advisory=True,
+        )
+        assert projects.human_director_confirmed(confirmed)
     for event in events:
         assert event.payload["trace_id"] == result.trace_id
         assert event.payload["project_id"] == project_id
@@ -638,7 +679,7 @@ def test_review_failure_preserves_real_draft_without_approving_it(tmp_path: Path
     assert failure["exception"]["type"] == "ToolError"
     names = [event.payload["director_event"] for event in runtime.list_events(run.id)]
     assert "director_draft_created" in names
-    assert "director_critic_failed" in names
+    assert "internal_validator_failed" in names
     assert "critic_unavailable" in names and "node_warning" in names
     assert "director_critic_completed" not in names
     with pytest.raises(ToolError):
@@ -753,3 +794,35 @@ def test_failure_after_one_patch_persists_revision_and_resume_reviews_it(tmp_pat
     ))
     assert recovered.director_spec is not None
     assert recovered.director_spec.composition == _patch(_spec())["value"]
+
+
+def test_warning_hard_constraint_is_advisory_not_a_hard_block() -> None:
+    """warning 级硬约束冲突是建议，不得被代码升级成硬阻断。
+
+    否则方案在各节点显示“已完成”，却永远无法确认进入分镜，
+    公开反馈与结论互相矛盾。
+    """
+    from kantoku.domains.comic.critic import (
+        DirectorCriticEngine,
+        require_approved_director,
+    )
+    from kantoku.domains.comic.models import DirectorCriticFinding
+
+    spec = _spec()
+    advisory = DirectorCriticFinding.model_validate({
+        **_finding(spec, severity="warning"),
+        "code": "HARD_CONSTRAINT_CONFLICT",
+    })
+    review = DirectorCriticEngine._result(spec, [advisory], [], "公开摘要", 0.9)
+    assert review.verdict == "needs_revision"
+    # 建议级结论允许在保留真实 needs_revision 的前提下确认。
+    require_approved_director(
+        spec.model_copy(update={"critic_result": review}), allow_advisory=True)
+
+    # error 级仍必须阻断，且不能靠 allow_advisory 放行。
+    hard = advisory.model_copy(update={"severity": "error"})
+    blocked = DirectorCriticEngine._result(spec, [hard], [], "公开摘要", 0.9)
+    assert blocked.verdict == "blocked"
+    with pytest.raises(ToolError, match="阻断"):
+        require_approved_director(
+            spec.model_copy(update={"critic_result": blocked}), allow_advisory=True)

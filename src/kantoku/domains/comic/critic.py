@@ -42,6 +42,98 @@ from .models import (
     DirectorSpecDraft,
 )
 
+
+def public_critic_feedback(review: Any) -> list[dict[str, str]]:
+    """公开反馈是原审核的解释投影，不改变 DirectorSpec 或审核证据。"""
+    if review is None:
+        return []
+    data = review.model_dump() if hasattr(review, "model_dump") else review
+    labels = {
+        "shot_size": "景别", "camera_angle": "机位", "camera_movement": "摄影机运动",
+        "light_source": "主光来源", "light_direction": "主光方向", "lighting": "光线设计",
+        "color_relationship": "色彩方案", "color_strategy": "色彩设计",
+        "composition_strategy": "构图", "composition": "构图", "character_focus": "人物",
+        "character_concept": "人物设定", "world_concept": "世界设定",
+        "environment": "场景", "scene_relationship": "场景关系",
+        "constraints": "约束", "hard_constraints": "用户硬约束",
+        "asset_versions": "资产来源", "cinematography": "摄影方案",
+        "creative_choices": "导演选择依据", "creative_decision": "故事理解",
+        "character_presence": "人物设定", "character_pose": "人物姿态与视角",
+        "style_boundary": "风格规范", "subject_environment_relation": "人物与环境关系",
+        "narrative_context": "人物与世界设定",
+    }
+    feedback = []
+    for finding in data.get("findings", []):
+        code = finding.get("code", "")
+        path = finding.get("field_path") or "director_review"
+        label = labels.get(path.split(".")[-1], "当前导演方案")
+        level = "blocking" if finding.get("severity") == "error" or code in {
+            "CINEMATOGRAPHY_INCOMPLETE", "REVIEW_EXECUTION_FAILED",
+        } else "warning"
+        issue_type = "logical_conflict" if level == "blocking" else "photography_advice"
+        message = f"{label}需要调整" if level == "blocking" else f"{label}优化建议"
+        evidence = finding.get("evidence") or f"{label}尚未提供明确依据。"
+        expected = finding.get("expected")
+        target = "审核要求" if level == "blocking" else "优化目标"
+        reason = f"当前内容：{evidence}；{target}：{expected}。" if expected else evidence
+        suggestion = finding.get("suggested_action") or f"请补充{label}并重新审核。"
+        if code == "EXECUTION_DECISION_UNRESOLVED":
+            issue_type = "required_parameter"
+            message = f"{label}尚未确定唯一执行方案"
+            reason = f"当前{label}为“{evidence}”，仍包含候选项，后续镜头无法确定执行参数。"
+            suggestion = f"请为{label}选择并填写一个最终值，再重新审核；未提供时可让导演选择。"
+        elif code == "CINEMATOGRAPHY_INCOMPLETE":
+            issue_type = "required_parameter"
+            message = "摄影方案缺少必要参数"
+            reason = "当前摄影方案尚不完整，无法确定后续镜头如何拍摄。"
+            suggestion = "请补充景别、机位、摄影机运动、主光与色彩方案，再重新审核。"
+        elif code in {"HARD_CONSTRAINT_MISSING", "DIRECTOR_REASON_MISSING"}:
+            issue_type = "required_parameter"
+            reason = f"{label}缺少必要内容：{finding.get('expected') or '尚未填写'}。"
+            suggestion = f"请在{label}中补齐这些内容后重新审核。"
+        elif level == "blocking":
+            leaf = path.split(".")[-1]
+            has_evidence = bool(str(finding.get("evidence", "")).strip())
+            character_fields = {
+                "character_concept", "character_focus", "character_presence", "subject",
+            }
+            scene_fields = {
+                "world_concept", "environment", "scene_relationship",
+                "subject_environment_relation",
+            }
+            missing_character = code in {
+                "CHARACTER_MISSING", "CHARACTER_CONTEXT_MISSING",
+            } or (code == "CONTEXT_MISSING" and leaf in character_fields) \
+                or (not has_evidence and leaf in character_fields)
+            missing_scene = code in {
+                "WORLD_MISSING", "SCENE_MISSING", "WORLD_CONTEXT_MISSING",
+            } or (code == "CONTEXT_MISSING" and leaf in scene_fields) \
+                or (not has_evidence and leaf in scene_fields)
+            if missing_character:
+                issue_type, message = "missing_character", "缺少人物设定"
+                suggestion = "请说明当前角色身份和固定外貌，或选择已有角色资产，再重新审核。"
+            elif missing_scene:
+                issue_type, message = "missing_scene", "缺少场景设定"
+                suggestion = "请补充地点、时间与环境，或选择已有场景资产，再重新审核。"
+        elif level == "warning":
+            issue_type = "composition_advice" if "composition" in path else \
+                "color_advice" if "color" in path else \
+                "atmosphere_advice" if any(word in path for word in ("emotion", "atmosphere")) \
+                else "photography_advice"
+        impacts = {
+            "missing_character": "外部图片模型缺少固定人物依据，无法保持角色身份、外貌与服装一致。",
+            "missing_scene": "外部图片模型无法确定地点、时间与环境，镜头之间可能出现世界设定漂移。",
+            "logical_conflict": "外部图片模型会收到相互矛盾的视觉要求，人物与环境可能不一致。",
+            "required_parameter": f"外部图片模型无法确定{label}，可能随机选择或混合多个方案。",
+        }
+        feedback.append({"level": level, "issue_type": issue_type, "message": message,
+                         "reason": str(reason), "suggestion": str(suggestion),
+                         "affected_field": path, "affected_field_label": label,
+                         "impact": impacts[issue_type] + "需修改后确认。" if level == "blocking"
+                         else f"可改善{label}，不阻止最终确认。"})
+    return feedback
+
+
 REVIEW_VERSION = "director-critic-1"
 # 读范围来自现有公开 Schema；写范围独立且显式，不能把“可审核”误当“可修改”。
 CRITIC_ALLOWED_FIELD_PATHS = frozenset(
@@ -119,11 +211,14 @@ def director_hash(spec: DirectorSpecDraft) -> str:
         payload.pop("field_provenance", None)
     if payload.get("execution_policy") is None:
         payload.pop("execution_policy", None)
+    if not payload.get("reference_context"):
+        payload.pop("reference_context", None)
     # 新增的可选表现字段为空时不改变历史审核指纹。
     plan = payload.get("director_plan")
     if isinstance(plan, dict):
         for key in (
             "style_boundary", "character_expression", "character_pose", "character_presence",
+            "characters_present",
         ):
             if plan.get(key) is None:
                 plan.pop(key, None)
@@ -286,6 +381,8 @@ def _normalize_patch(
     return patch.model_copy(update={"field": normalized_path, "expected_value": expected})
 
 
+
+
 def _has_evidence(value: Any, evidence: str) -> bool:
     if isinstance(value, str):
         # 排版空白不是事实差异；不做语义猜测或模糊匹配。
@@ -296,6 +393,8 @@ def _has_evidence(value: Any, evidence: str) -> bool:
     if isinstance(value, list):
         return any(_has_evidence(item, evidence) for item in value)
     return False
+
+
 
 
 def _invalid_patch(field: str, reason: str) -> DirectorCriticFinding:
@@ -325,9 +424,12 @@ class DirectorCriticEngine:
         assets: list[ComicAsset] | None = None,
         storyboard: ComicStoryboard | None = None,
         shot: ComicShot | None = None,
+        current_shot_instruction: str | None = None,
+        context_diff: dict[str, Any] | None = None,
     ) -> DirectorCriticResult:
         try:
-            return self._review(spec, brief, assets or [], storyboard, shot)
+            return self._review(spec, brief, assets or [], storyboard, shot,
+                                current_shot_instruction, context_diff)
         except Exception as error:
             # Run 内由审核闭环或 Coordinator 生成唯一 error_id；独立调用复用日志入口。
             if current_run_id() is None:
@@ -348,6 +450,8 @@ class DirectorCriticEngine:
         assets: list[ComicAsset],
         storyboard: ComicStoryboard | None,
         shot: ComicShot | None,
+        current_shot_instruction: str | None = None,
+        context_diff: dict[str, Any] | None = None,
     ) -> DirectorCriticResult:
         if spec.schema_version != 2:
             raise ToolError("Director Critic 需要 DirectorSpec v2")
@@ -470,12 +574,36 @@ class DirectorCriticEngine:
             "allowed_field_paths": sorted(CRITIC_ALLOWED_FIELD_PATHS),
             "patch_fields": sorted(PATCH_FIELDS),
         }
+        if current_shot_instruction:
+            context["current_shot_instruction"] = current_shot_instruction
+        if context_diff is not None:
+            context["context_diff"] = context_diff
+            # 用户本轮主动改动的字段是“新要求”，不是与旧值自相矛盾。
+            # 显式列出，审核器才不会把被替换的旧描述当成不可动的硬约束。
+            changed = [
+                item.get("field_path") for item in context_diff.get("changes", [])
+                if isinstance(item, dict) and item.get("field_path")
+            ]
+            # 同语义簇由本轮状态指令牵动，同样属于用户请求的变更范围。
+            changed.extend(context_diff.get("action_semantic_cluster", []) or [])
+            if changed:
+                context["user_requested_changes"] = changed
         messages = [
             {"role": "system", "content": (
                 "审核当前导演方案的视觉因果、用户约束语义、角色/场景/风格一致性、"
                 "构图/色彩/光影/人物关系的公开创作理由以及空泛模板词。"
                 "结合具体故事判断；孤独也可在战斗中表达，禁止情绪到固定镜头的映射。"
                 "不要创造新方案或改写用户约束。"
+                "若有 current_shot_instruction，这是同一创作的下一镜头要求："
+                "Brief 继续约束角色、世界和风格，本次动作与构图以当前镜头要求为准，"
+                "不要因动作不同于上一镜头而报告冲突；显式硬约束和固定资产仍不可改写。"
+                "主体或其他设定是否替换，依据本轮实际来源及有效约束判断。"
+                "不能因为创作动词或新主体出现，就丢弃仍有效的用户硬约束或固定资产事实。"
+                "user_requested_changes 列出的是用户本轮明确要求改动的字段。"
+                "这些字段的旧值已经被用户替换，方案的当前值就是用户要的最终结果。"
+                "禁止把它们与被替换的旧值比对后判为矛盾或冲突，"
+                "也禁止建议用户撤回、删除或忽略本轮镜头指令。"
+                "只有当当前值与未被本次改动触及的用户硬约束或固定资产矛盾时才算冲突。"
                 "field_provenance 的引用指向 provenance_sources，知识为方法依据，"
                 "model_choice 不能作为用户或资产事实；检查各层最终决定是否一致。"
                 "只返回 JSON：public_summary、confidence、"
@@ -545,7 +673,8 @@ class DirectorCriticEngine:
             "Director Critic Debug received_findings={} verified_findings={} "
             "ignored_findings={} unverified_findings={} spec_hash={}",
             len(semantic.findings), len(verified),
-            len(semantic.findings) - len(semantic_findings), len(unverified), director_hash(spec),
+            len(semantic.findings) - len(semantic_findings), len(unverified),
+            director_hash(spec),
         )
         return self._result(
             spec, findings, semantic.suggested_patches if not unverified else [],
@@ -603,7 +732,10 @@ class DirectorCriticEngine:
         confidence: float,
     ) -> DirectorCriticResult:
         errors = any(item.severity == "error" for item in findings)
-        blocked = any(item.code in {
+        # 只有 error 级才是硬阻断。warning 级是审核自己给出的“建议”判断，
+        # 代码不得把它升级成阻断：否则方案在各节点显示已完成，
+        # 却永远无法确认进入分镜（公开反馈与结论互相矛盾）。
+        blocked = any(item.severity == "error" and item.code in {
             "HARD_CONSTRAINT_MISSING", "HARD_CONSTRAINT_CONFLICT", "ASSET_VERSION_MISMATCH",
             "ASSET_CONTEXT_INVALID", "CONTEXT_SCOPE_CONFLICT", "CONTEXT_VERSION_MISMATCH",
             "SHOT_SCOPE_CONFLICT", "SHOT_ASSET_MISMATCH", "ASSET_CONSTRAINT_CONFLICT",
@@ -745,6 +877,9 @@ class DirectorCriticEngine:
         storyboard: ComicStoryboard | None = None,
         shot: ComicShot | None = None,
         emit: EventSink | None = None,
+        allow_patches: bool = True,
+        current_shot_instruction: str | None = None,
+        context_diff: dict[str, Any] | None = None,
     ) -> DirectorReviewOutcome:
         current = spec.model_copy(update={"critic_status": None, "critic_result": None})
         revision_count = 0
@@ -792,6 +927,8 @@ class DirectorCriticEngine:
                     assets=assets,
                     storyboard=storyboard,
                     shot=shot,
+                    current_shot_instruction=current_shot_instruction,
+                    context_diff=context_diff,
                 )
             except Exception as error:
                 # No valid review exists: retain the candidate, never fabricate Critic content.
@@ -814,7 +951,8 @@ class DirectorCriticEngine:
                 break
             if emit:
                 emit("director_revision_requested", {"verdict": result.verdict})
-            if attempt == 0 and result.allowed_patches and result.suggested_patches:
+            if (allow_patches and attempt == 0 and result.allowed_patches
+                    and result.suggested_patches):
                 try:
                     revised = self.apply_patches(current, result)
                 except Exception as error:

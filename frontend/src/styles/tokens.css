@@ -28,8 +28,8 @@
 
   /* ---- Text ---- */
   --text-primary: #171a1e;   /* 由 #1c2025 加深：正文对比度 13.9:1 → 15.8:1 */
-  --text-secondary: #626a73;
-  --text-muted: #878e98;
+  --text-secondary: #5a626b; /* 由 #626a73 加深：白底 6.2:1，11–12px 辅助文字也够用 */
+  --text-muted: #656d78;     /* 由 #878e98 加深：白底 3.3:1 → 5.2:1，可承载版本号/来源等关键小字 */
 
   /* ---- Border（严格对齐 WorkBuddy 浅色主题：default #dcdee3 / muted #e8eaed / input #e5e7eb）
        采用 WorkBuddy 的冷调灰（带轻微蓝味），而非纯中性灰，避免与底座 UI 观感不一致 ---- */

@@ -20,7 +20,9 @@ from pydantic import (
 
 from kantoku.agent.context import select_recent_history
 from kantoku.config import ToolError, get_settings
+from kantoku.config.runtime_paths import resolve_runtime_path
 from kantoku.config.settings import ROOT
+from kantoku.core.database import database_manager
 from kantoku.memory import Persona
 from kantoku.schemas.qc import ReworkPlan
 from kantoku.schemas.storyboard import Shot
@@ -213,7 +215,7 @@ def create_rework_recipe(
 def _database_path() -> Path:
     """把配置中的相对 SQLite 路径固定到项目根目录。"""
     configured = get_settings().storage.sqlite_path
-    return configured if configured.is_absolute() else ROOT / configured
+    return resolve_runtime_path(configured)
 
 
 def _connect() -> sqlite3.Connection:
@@ -221,8 +223,7 @@ def _connect() -> sqlite3.Connection:
     path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
+        connection = database_manager.connect(path)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         _migrate_recipe_schema(connection)

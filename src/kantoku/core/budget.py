@@ -13,7 +13,9 @@ from loguru import logger
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, ValidationError
 
 from kantoku.config import BudgetError, ToolError, get_settings
+from kantoku.config.runtime_paths import resolve_runtime_path
 from kantoku.config.settings import ROOT
+from kantoku.core.database import database_manager
 from kantoku.schemas.media import ImageGenerationResult
 
 SCHEMA_PATH = ROOT / "db" / "schema.sql"
@@ -93,15 +95,14 @@ class BudgetSummary(BaseModel):
 
 def _database_path() -> Path:
     configured = get_settings().storage.sqlite_path
-    return configured if configured.is_absolute() else ROOT / configured
+    return resolve_runtime_path(configured)
 
 
 def _connect() -> sqlite3.Connection:
     path = _database_path()
     connection: sqlite3.Connection | None = None
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path, timeout=30)
+        connection = database_manager.connect(path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
         existing_columns = {

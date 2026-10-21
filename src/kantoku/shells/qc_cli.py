@@ -9,6 +9,9 @@ from collections.abc import Callable, Sequence
 from pathlib import Path
 
 from kantoku.config import KantokuError, ToolError, get_settings
+from kantoku.config.runtime_paths import (
+    atomic_write_text,
+)
 from kantoku.core.budget import get_reservation, load_generation_result
 from kantoku.perception.qc import (
     evaluate_qc_baseline,
@@ -269,11 +272,8 @@ def _baseline(args: argparse.Namespace) -> int:
 
 
 def _write_text(path: Path, content: str) -> None:
-    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(content, encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        atomic_write_text(path, content)
     except (OSError, UnicodeError) as error:
         raise ToolError("无法保存质检输出", detail=type(error).__name__) from error
 

@@ -122,6 +122,42 @@ def test_compiler_uses_only_pinned_shot_context_and_checks_constraints(tmp_path:
     assert runtime.list_artifacts(type=ArtifactType.IMAGE) == []
 
 
+def test_missing_requirement_is_projected_into_matching_section() -> None:
+    """编译器遗漏的表情要求必须落到 Shot 姿态，并同步重建正向正文。"""
+    from kantoku.core.conversation_context import SourceRef
+    from kantoku.domains.comic.models import CreativeConstraint
+    from kantoku.domains.comic.prompts import (
+        project_constraint_requirements,
+        prompt_sections,
+    )
+
+    constraint = CreativeConstraint(
+        constraint_id="constraint-expression", requirement="一脸充满爱意得看着镜头",
+        target="人物面部表情与目光：充满爱意地看向镜头", scope="shot",
+        source_ref=SourceRef(id="message-1", kind="message"),
+        source_quote="一脸充满爱意得看着镜头", origin="user_request", trust="source_verified")
+    draft = ComicPromptDraft.model_validate({
+        "director_summary": "当前镜头",
+        "positive_prompt": "占位",
+        "negative_prompt": "避免夸张甜腻表情",
+        "context_version": "image-bibles-1",
+        "character_context": "身份：少女\n外貌：黑色长发",
+        "world_context": "地点：樱花树下",
+        "style_context": "艺术风格：日系清新摄影",
+        "shot_context": "动作：少女站定回望镜头\n姿态：回眸姿态",
+    })
+    projected = project_constraint_requirements(
+        draft, [constraint], [constraint.constraint_id], complete_prompt=True)
+    assert projected == [{"constraint_id": "constraint-expression",
+                          "field": "shot_context.姿态"}]
+    assert "神态与情绪：一脸充满爱意得看着镜头" in draft.shot_context
+    # 保存时以 positive_prompt 重建四段，正文必须与字段保持同一份内容。
+    assert prompt_sections(draft.positive_prompt)["shot_context"] == draft.shot_context
+    # 已承载的要求不重复写入。
+    assert project_constraint_requirements(
+        draft, [constraint], [constraint.constraint_id], complete_prompt=True) == []
+
+
 def test_prompt_versions_artifacts_and_stale_shot_rejected(tmp_path: Path) -> None:
     path = tmp_path / "db.sqlite"
     runtime, projects, assets, boards, prompts, shot, _unused = _setup(path)

@@ -3,7 +3,8 @@ import { ref } from 'vue'
 import { Pencil, Trash2 } from 'lucide-vue-next'
 import type { Conversation } from '../../types'
 
-defineProps<{ conversations: Conversation[]; activeId: string; busy: boolean; listOnly?: boolean }>()
+type HistoryEntry = Pick<Conversation, 'id' | 'title'>
+defineProps<{ conversations: HistoryEntry[]; activeId: string; busy: boolean; listOnly?: boolean }>()
 const emit = defineEmits<{
   create: []
   select: [id: string]
@@ -14,7 +15,7 @@ const search = ref('')
 const editing = ref('')
 const title = ref('')
 
-function startRename(item: Conversation): void {
+function startRename(item: HistoryEntry): void {
   editing.value = item.id
   title.value = item.title
 }

@@ -19,6 +19,9 @@ export interface Route {
   workspacePage?: string
   directorStage?: string
   conversationId?: string
+  directorRunId?: string
+  workId?: string
+  taskId?: string
   creationMode?: 'fast' | 'professional'
 }
 
@@ -26,20 +29,61 @@ export const directorStagePaths: Record<string, string> = {
   creative_understanding: 'understanding', visual_direction: 'visual-direction',
   cinematography: 'cinematography', director_critic: 'critic', director_assemble: 'plan',
 }
-const workspacePages = ['conversation', 'director', 'storyboard', 'assets', 'prompt', 'history']
+/* 漫剧七步制作导航 + 三个辅助入口（design-spec §13）。
+   01 画面方案 → 02 生图指令 → 03 图片优化 → 04 改图指令 → 05 版本比较 → 06 故事编排 → 07 导出材料 → 08 视频生成。
+   旧的 director / storyboard 值保留为兼容别名，历史链接不会 404。 */
+export const workspacePages = ['conversation', 'plan', 'prompt', 'images', 'optimize', 'revision', 'compare', 'story', 'export', 'video', 'assets', 'history']
+/** 旧 page → 新 page 的别名映射：只做归一化，不丢信息。 */
+export const legacyPageAliases: Record<string, string> = { director: 'plan', storyboard: 'story' }
+function normalizePage(page: string | undefined): string | undefined {
+  if (!page) return undefined
+  return workspacePages.includes(page) ? page : legacyPageAliases[page]
+}
 function workspaceSuffix(next: Route): string {
-  if (!next.workspacePage || !workspacePages.includes(next.workspacePage)) return ''
-  return `/${next.workspacePage}${next.workspacePage === 'director' ? `/${directorStagePaths[next.directorStage ?? 'director_assemble'] ?? 'plan'}` : ''}`
+  const page = normalizePage(next.workspacePage)
+  if (!page) return ''
+  return `/${page}${page === 'plan' ? `/${directorStagePaths[next.directorStage ?? 'director_assemble'] ?? 'plan'}` : ''}`
 }
 
 export const route = ref<Route>(parse(window.location.pathname + (window.location.search ?? '')))
+
+const lastWorkspaces = new Map<string, Route>()
+function rememberWorkspace(next: Route): void {
+  if (!['workspace', 'workspace_run'].includes(next.name)
+    || !(next.workId || next.conversationId || next.runId)) return
+  const domain = next.domain ?? 'comic'
+  lastWorkspaces.set(domain, { ...next })
+  try { window.sessionStorage.setItem(`kantoku-workspace-route:${domain}`, href(next)) }
+  catch { /* Navigation still works when browser storage is unavailable. */ }
+}
+
+/** Global navigation resumes a selection; explicit creation stays in the workspace. */
+export function workspaceEntry(domain = 'comic'): Route {
+  const remembered = lastWorkspaces.get(domain)
+  if (remembered) return { ...remembered }
+  try {
+    const saved = window.sessionStorage.getItem(`kantoku-workspace-route:${domain}`)
+    if (saved) {
+      const next = parse(saved)
+      if (['workspace', 'workspace_run'].includes(next.name) && next.domain === domain
+        && (next.workId || next.conversationId || next.runId)) return next
+    }
+  } catch { /* A missing or invalid saved location falls back to the read-only work list. */ }
+  return { name: 'workspace', domain }
+}
 
 export function parse(path: string): Route {
   if (path.includes('?')) {
     const [pathname, query] = path.split('?')
     const conversationId = new URLSearchParams(query).get('conversation')
+    const directorRunId = new URLSearchParams(query).get('director_run')
+    const workId = new URLSearchParams(query).get('work')
+    const taskId = new URLSearchParams(query).get('task')
     const mode = new URLSearchParams(query).get('mode')
     return { ...parse(pathname!), ...(conversationId ? { conversationId } : {}),
+      ...(directorRunId ? { directorRunId } : {}),
+      ...(workId ? { workId } : {}),
+      ...(taskId ? { taskId } : {}),
       ...(mode === 'fast' || mode === 'professional' ? { creationMode: mode } : {}) }
   }
   const clean = path.replace(/\/+$/, '') || '/'
@@ -67,11 +111,13 @@ export function parse(path: string): Route {
        因此 /workspace 与 /workspace/comic 等价，不会落回通用创作工作台。 */
     const domain = parts[1] ?? 'comic'
     const offset = parts[2] === 'run' && parts[3] ? 4 : 2
-    const page = parts[offset]
+    const rawPage = parts[offset]
     const node = parts[offset + 1]
-    const workspace = page && workspacePages.includes(page) ? {
+    // 旧 page 值（director / storyboard）在此归一化为新七步值，directorStage 继续透传给 01 画面方案。
+    const page = normalizePage(rawPage)
+    const workspace = page ? {
       workspacePage: page,
-      ...(page === 'director' ? { directorStage: Object.keys(directorStagePaths).find(stage => directorStagePaths[stage] === node) ?? 'director_assemble' } : {}),
+      ...(page === 'plan' ? { directorStage: Object.keys(directorStagePaths).find(stage => directorStagePaths[stage] === node) ?? 'director_assemble' } : {}),
     } : {}
     if (parts[2] === 'run' && parts[3]) {
       return { name: 'workspace_run', domain, runId: decodeURIComponent(parts[3]), ...workspace }
@@ -95,6 +141,9 @@ export function parse(path: string): Route {
 export function href(next: Route): string {
   const query = new URLSearchParams()
   if (next.conversationId) query.set('conversation', next.conversationId)
+  if (next.directorRunId) query.set('director_run', next.directorRunId)
+  if (next.workId) query.set('work', next.workId)
+  if (next.taskId) query.set('task', next.taskId)
   if (next.creationMode) query.set('mode', next.creationMode)
   return hrefPath(next) + (query.size ? `?${query}` : '')
 }
@@ -103,9 +152,9 @@ function hrefPath(next: Route): string {
     case 'home':
       return '/'
     case 'workspace':
-      return `/workspace/${next.domain ?? 'studio'}${workspaceSuffix(next)}`
+      return `/workspace/${next.domain ?? 'comic'}${workspaceSuffix(next)}`
     case 'workspace_run':
-      return `/workspace/${next.domain ?? 'studio'}/run/${encodeURIComponent(next.runId ?? '')}${workspaceSuffix(next)}`
+      return `/workspace/${next.domain ?? 'comic'}/run/${encodeURIComponent(next.runId ?? '')}${workspaceSuffix(next)}`
     case 'task_run':
       return `/tasks/run/${encodeURIComponent(next.runId ?? '')}`
     case 'task_batch':
@@ -126,6 +175,7 @@ export function navigate(next: Route, replace = false): void {
     else window.history.pushState({}, '', path)
   }
   route.value = { ...next }
+  rememberWorkspace(next)
   window.scrollTo({ top: 0 })
 }
 
@@ -135,4 +185,6 @@ export function openRun(domain: string, runId: string): void {
 
 window.addEventListener('popstate', () => {
   route.value = parse(window.location.pathname + (window.location.search ?? ''))
+  rememberWorkspace(route.value)
 })
+rememberWorkspace(route.value)

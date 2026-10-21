@@ -23,11 +23,6 @@ PLAN_EXECUTION_FIELDS = (
     "visual_focus", "subject_environment_relation", "composition_strategy", "color_strategy",
     "style_boundary", "character_expression", "character_pose", "character_presence",
 )
-ALTERNATIVES = re.compile(
-    r"或者|或是|还是|抑或|二选一|任选|可选|视情况|(?:\b(?:or|either|alternatively)\b)|"
-    r"(?<!不)或|渐进|切换|先.{0,15}(?:后|再)|(?:远景|全景|中景|近景|特写)\s*[/／→至到]",
-    re.IGNORECASE,
-)
 UNDECIDED = re.compile(r"待定|未定|待确认|任选|取决于|按当前|依据当前|后续确定|视情况")
 SHOT_SIZE = re.compile(
     r"远景|全景|中景|近景|特写|全身|半身|胸像|腰部|"
@@ -40,13 +35,53 @@ CAMERA_POSITION = re.compile(
 
 
 def _decision_text(value: str) -> str:
-    # “不使用仰拍或俯拍”是排除说明，不能算两个被选中的机位。
+    # 否定谓语的宾语可以包含“或”；例如“不被线条或树叶切过”不是两个构图。
+    # 只裁剪否定谓语之后的内容，保留它之前的真正候选，不按动词逐个打补丁。
     negative = re.compile(
-        r"^(?:全图|画面|人物|环境)?(?:不(?:采用|使用|表现|出现|新增|引入|依靠|设|做|含|打开|"
-        r"保留|切|夸张|直视|靠|奔跑|跳跃|施法|挥剑|移动)|不要|禁止|避免|而非)"
+        r"不要|禁止|避免|避开|而非|没有|无(?!论|法)|"
+        r"不(?!同|断|仅|但|过|足|明|确定|完整|可)"
     )
-    return "，".join(part for part in re.split(r"[，,。；;\n]", value)
-                    if not negative.search(part.strip()))
+    return "，".join(negative.split(part, maxsplit=1)[0]
+                    for part in re.split(r"[，,。；;\n]", value))
+
+
+# 描述性并列（如“为投掷或挥击留出空间”）不是参数候选；
+# 只有连接同类摄影参数的“或”才表示尚未确定。
+DESCRIPTIVE_OR = re.compile(
+    r"(?:为|供|以便|便于|用于|适合|预留|留出|允许|支持|便于)[^，,。；;]{0,12}或|"
+    r"(?:投掷|挥击|挥动|挥砸|攻击|防御|战斗|动作|走位|移动|静止|站立|坐|躺|转身|"
+    r"抬手|伸手|举锤|持锤)[^，,。；;]{0,8}或|"
+    # 描述性延续：“呈现思考或远望时的静止神态”里的“或”是在继续描写，
+    # 不是候选值——候选值不会接着用“时的…神态/样子/表情”展开下去。
+    r"或[^，,。；;]{0,12}时[^，,。；;]{0,10}(?:神态|样子|表情|状态|感觉|氛围)"
+)
+PARAMETER_OR = re.compile(
+    r"(?:远景|全景|中景|近景|特写|平视|俯拍|俯视|仰拍|仰视|低角度|低机位|高机位|"
+    r"水平机位|正面|侧面|背面|鸟瞰|顶视|主观视角|客观视角)\s*或\s*"
+    r"(?:远景|全景|中景|近景|特写|平视|俯拍|俯视|仰拍|仰视|低角度|低机位|高机位|"
+    r"水平机位|正面|侧面|背面|鸟瞰|顶视|主观视角|客观视角)"
+)
+
+
+def _is_alternative(value: str) -> bool:
+    """判断文本是否真的存在未定的候选参数。
+
+    单字“或”同时出现在描述性并列里（“为投掷或挥击留出空间”），
+    直接按候选判定会把已经定稿的构图误杀成“执行参数未确定”，
+    导致首轮生成反复自我修复直至超时、无法产出方案。
+    """
+    text = DESCRIPTIVE_OR.sub("", value)
+    if PARAMETER_OR.search(text):
+        return True
+    # 多字候选、时序候选与显式待定仍按原规则判定。
+    return bool(re.search(
+        r"或者|或是|还是|抑或|二选一|任选|可选|视情况|渐进|切换|待定|未定|待确认|"
+        r"取决于|按当前|依据当前|后续确定|"
+        r"(?:\b(?:or|either|alternatively)\b)|"
+        r"先[^，,。；;]{0,15}(?:后|再)|"
+        r"(?:远景|全景|中景|近景|特写)\s*[/／→至到]|"
+        r"(?<!不)或(?![^，,。；;]{0,10}?[是为供以用让使])",
+        text, re.IGNORECASE))
 
 
 def unresolved_execution(values: Mapping[str, Any], fields: tuple[str, ...]) -> list[str]:
@@ -58,13 +93,20 @@ def unresolved_execution(values: Mapping[str, Any], fields: tuple[str, ...]) -> 
             continue  # 可选人物表现字段未设计，不能伪造一份默认设定。
         if isinstance(value, str):
             value = _decision_text(value)
-        if (not isinstance(value, str) or not value.strip() or ALTERNATIVES.search(value)
+        if (not isinstance(value, str) or not value.strip() or _is_alternative(value)
                 or UNDECIDED.search(value)):
             unresolved.append(name)
             continue
         if name == "shot_size":
-            if (not SHOT_SIZE.search(value)
-                    or len(set(re.findall("远景|全景|中景|近景|特写", value))) > 1):
+            # “近景特写”“中近景”是常见复合表述，指的是同一个紧景别；
+            # 只有被分隔符或并列词切开的两个景别才是真的没定死。
+            # 相邻的两个景别词算作一个候选。
+            tokens, last_end = [], -1
+            for match in re.finditer("远景|全景|中景|近景|特写", value):
+                if match.start() > last_end:
+                    tokens.append(match.group(0))
+                last_end = match.end()
+            if not SHOT_SIZE.search(value) or len(tokens) > 1:
                 unresolved.append(name)
         elif name == "camera_angle":
             # 俯拍/俯视同义，只要一个机位即可。

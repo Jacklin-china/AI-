@@ -1081,7 +1081,8 @@ def test_workspace_input_runs_to_image_without_manual_director_gate(
     assert child.state["conversation_id"] == cid
     assert app.conversation(cid)["interaction_mode"] == "guided"
     assert run["state"]["execution_mode"] == "fast"
-    assert production[:3] == SKILLS[:3]
+    # 旧工作区替身省略人物/风格字段，导演补全一次后才进入摄影阶段。
+    assert production[:4] == [SKILLS[0], SKILLS[1], SKILLS[1], SKILLS[2]]
     assert production[-2:] == ["storyboard", "prompt"]
     assert not [item for item in app.runtime_store.list_approvals()
                 if item.run_id == run["id"] and item.node_id != "director_policy"]

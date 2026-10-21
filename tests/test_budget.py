@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import sqlite3
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 from datetime import UTC, datetime
 from decimal import Decimal
 from pathlib import Path
@@ -14,6 +14,7 @@ import pytest
 from kantoku.config import BudgetError
 from kantoku.core import budget
 from kantoku.core.budget import BudgetReservation
+from kantoku.core.database import database_manager
 
 
 def _settings(path: Path, **overrides: Decimal | int | None) -> SimpleNamespace:
@@ -59,7 +60,7 @@ def test_existing_ledger_gains_generation_metadata_without_losing_rows(
     isolated_database: Path,
 ) -> None:
     isolated_database.parent.mkdir(parents=True, exist_ok=True)
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             "CREATE TABLE ledger (reservation_id TEXT PRIMARY KEY, job TEXT, "
             "project TEXT, episode TEXT, shot_no INTEGER, kind TEXT, est_fen INTEGER, "
@@ -320,7 +321,7 @@ def test_lowered_budget_is_rechecked_before_submission(
 
 def test_yesterday_reservation_cannot_bypass_today_budget(isolated_database: Path) -> None:
     _reserve("yesterday")
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             "UPDATE ledger SET created_at = '2000-01-01 00:00:00' WHERE reservation_id = ?",
             ("yesterday",),
@@ -344,7 +345,7 @@ def test_daily_budget_uses_configured_local_midnight(
         lambda: datetime(2026, 9, 12, 17, tzinfo=UTC),
     )
     _reserve("local-today")
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             "UPDATE ledger SET created_at = '2026-09-12 16:30:00' "
             "WHERE reservation_id = 'local-today'"
@@ -363,7 +364,7 @@ def test_submission_rejects_previous_local_day_near_utc_boundary(
         lambda: datetime(2026, 9, 12, 17, tzinfo=UTC),
     )
     _reserve("previous-local-day")
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             "UPDATE ledger SET created_at = '2026-09-12 15:59:59' "
             "WHERE reservation_id = 'previous-local-day'"

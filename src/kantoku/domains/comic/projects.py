@@ -26,10 +26,14 @@ from .cinematography import require_execution_choices
 from .context_declaration import (
     BIBLE_GROUP_TO_SLOT,
     BIBLE_SOURCE_KEYS,
+    CINEMATOGRAPHY_LEAVES,
+    DIRECTOR_PLAN_LEAVES,
     EDIT_SCOPE_KEYS,
+    INHERIT_KEYS,
 )
 from .director_provenance import project_decision_fields, project_provenance, record_changes
 from .models import (
+    CinematographyPlan,
     ComicAsset,
     ComicContext,
     ComicProjectInput,
@@ -43,6 +47,7 @@ from .models import (
     CreativeIntentBoundary,
     CreativeProject,
     DirectorEvidence,
+    DirectorPlan,
     DirectorSpec,
     DirectorSpecDraft,
     ProjectStatus,
@@ -254,40 +259,73 @@ class ComicProjectStore:
             raise ToolError("漫剧作品与创作理解的关联不一致")
         return ComicProjectSnapshot(project=project, creative_brief=brief)
 
-    def create(self, data: ComicProjectInput) -> ComicProjectSnapshot:
+    def create(
+        self,
+        data: ComicProjectInput,
+        *,
+        connection: sqlite3.Connection | None = None,
+    ) -> ComicProjectSnapshot:
         """一次事务创建作品和 Brief v1；未提供的偏好保持为空，不伪造 AI 理解。"""
+        if connection is None:
+            with self._connect() as opened:
+                opened.execute("BEGIN IMMEDIATE")
+                return self.create(data, connection=opened)
         now = utc_now()
         project_id = f"comic-project-{uuid4().hex}"
         brief_id = f"comic-brief-{uuid4().hex}"
         brief_input = data.brief or CreativeBriefInput(original_request=data.title)
         brief = CreativeBrief(
-            **brief_input.model_dump(), brief_id=brief_id, project_id=project_id,
-            version=1, created_at=now,
+            **brief_input.model_dump(),
+            brief_id=brief_id,
+            project_id=project_id,
+            version=1,
+            created_at=now,
         )
         project = CreativeProject(
-            project_id=project_id, title=data.title, description=data.description,
-            status=ProjectStatus.DRAFT, created_at=now, updated_at=now,
-            current_version=1, brief_id=brief_id, brief_version=1,
+            project_id=project_id,
+            title=data.title,
+            description=data.description,
+            status=ProjectStatus.DRAFT,
+            created_at=now,
+            updated_at=now,
+            current_version=1,
+            brief_id=brief_id,
+            brief_version=1,
         )
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            connection.execute(
-                "INSERT INTO comic_projects "
-                "(project_id,title,description,status,current_version,brief_id,brief_version,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (project_id, project.title, project.description, project.status.value,
-                 1, brief_id, 1, now.isoformat(), now.isoformat()),
-            )
-            self._insert_version(
-                connection, project_id=project_id, entity_type="project",
-                entity_id=project_id, version=1, payload_json=project.model_dump_json(),
-                created_at=now,
-            )
-            self._insert_version(
-                connection, project_id=project_id, entity_type="creative_brief",
-                entity_id=brief_id, version=1, payload_json=brief.model_dump_json(),
-                created_at=now,
-            )
+        connection.execute(
+            "INSERT INTO comic_projects "
+            "(project_id,title,description,status,current_version,brief_id,brief_version,"
+            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                project_id,
+                project.title,
+                project.description,
+                project.status.value,
+                1,
+                brief_id,
+                1,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="project",
+            entity_id=project_id,
+            version=1,
+            payload_json=project.model_dump_json(),
+            created_at=now,
+        )
+        self._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="creative_brief",
+            entity_id=brief_id,
+            version=1,
+            payload_json=brief.model_dump_json(),
+            created_at=now,
+        )
         return ComicProjectSnapshot(project=project, creative_brief=brief)
 
     def get(self, project_id: str, *, version: int | None = None) -> ComicProjectSnapshot:
@@ -489,88 +527,149 @@ class ComicProjectStore:
         }
 
     def save_director(
-        self, project_id: str, draft: DirectorSpecDraft, *,
+        self,
+        project_id: str,
+        draft: DirectorSpecDraft,
+        *,
         expected_project_version: int,
         source: Literal["model", "manual", "restored"] = "manual",
         restored_from_version: int | None = None,
         preserve_provenance: bool = False,
+        connection: sqlite3.Connection | None = None,
     ) -> DirectorSpec:
         """CAS 追加导演修订；Brief 改动会清除当前指针但保留历史。"""
-        with self._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,)
-            ).fetchone()
-            if row is None:
-                raise ToolError("找不到指定漫剧作品")
-            current_version = int(row["current_version"])
-            if current_version != expected_project_version:
-                raise ToolError("作品已由其他操作更新，请刷新后重试")
-            snapshot = self._snapshot(connection, project_id, current_version)
-            project = snapshot.project
-            if source == "manual" and not preserve_provenance:
-                previous = DirectorSpec.model_validate_json(self._version_payload(
-                    connection, project_id, "director_spec", project.director_id,
-                    project.director_version,
-                )) if project.director_id else None
-                if previous:
-                    draft = draft.model_copy(update={"execution_policy": previous.execution_policy})
-                if draft.execution_policy == "single_image":
-                    draft = project_decision_fields(draft, previous)
-                draft = record_changes(
-                    previous, draft, source="manual_edit", evidence=DirectorEvidence(
-                        source_type="manual_edit", reference=f"project:{project_id}",
-                        version=current_version,
-                    ),
+        if connection is None:
+            with self._connect() as opened:
+                opened.execute("BEGIN IMMEDIATE")
+                return self.save_director(
+                    project_id,
+                    draft,
+                    expected_project_version=expected_project_version,
+                    source=source,
+                    restored_from_version=restored_from_version,
+                    preserve_provenance=preserve_provenance,
+                    connection=opened,
                 )
-            else:
-                draft = project_provenance(draft)
-            if draft.schema_version == 2 and draft.execution_policy == "single_image":
-                draft = draft.model_copy(update={
-                    "cinematography": require_execution_choices(draft.cinematography),
-                })
-            missing = [
-                item for item in snapshot.creative_brief.hard_constraints
-                if item not in draft.constraints
+        row = connection.execute(
+            "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,)
+        ).fetchone()
+        if row is None:
+            raise ToolError("找不到指定漫剧作品")
+        current_version = int(row["current_version"])
+        if current_version != expected_project_version:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        snapshot = self._snapshot(connection, project_id, current_version)
+        project = snapshot.project
+        previous = None
+        if source == "manual" and project.director_id:
+            previous = DirectorSpec.model_validate_json(
+                self._version_payload(
+                    connection,
+                    project_id,
+                    "director_spec",
+                    project.director_id,
+                    project.director_version,
+                )
+            )
+            if "reference_context" not in draft.model_fields_set:
+                draft = draft.model_copy(update={"reference_context": previous.reference_context})
+        references = connection.execute(
+            "SELECT version,payload_json FROM comic_entity_versions "
+            "WHERE project_id=? AND entity_type='image_references' "
+            "ORDER BY version DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        if references:
+            bindings = json.loads(references["payload_json"])["bindings"]
+            selected = [
+                {key: item[key] for key in ("image", "roles", "target")}
+                for item in draft.reference_context.get("bindings", [])
             ]
-            if missing:
-                raise ToolError("导演方案不得遗漏创作理解中的硬约束")
-            version_row = connection.execute(
-                "SELECT entity_id,version FROM comic_entity_versions "
-                "WHERE project_id=? AND entity_type='director_spec' "
-                "ORDER BY version DESC LIMIT 1", (project_id,),
-            ).fetchone()
-            spec_id = (
-                str(version_row["entity_id"])
-                if version_row else f"comic-director-{uuid4().hex}"
+            if (bindings or draft.reference_context) and (
+                draft.reference_context.get("reference_version") != int(references["version"])
+                or selected != bindings
+            ):
+                raise ToolError("导演参考图片或用途版本已变化，请重新生成")
+        if source == "manual" and not preserve_provenance:
+            if previous:
+                draft = draft.model_copy(update={"execution_policy": previous.execution_policy})
+            if draft.execution_policy == "single_image":
+                draft = project_decision_fields(draft, previous)
+            draft = record_changes(
+                previous,
+                draft,
+                source="manual_edit",
+                evidence=DirectorEvidence(
+                    source_type="manual_edit",
+                    reference=f"project:{project_id}",
+                    version=current_version,
+                ),
             )
-            next_version = int(version_row["version"]) + 1 if version_row else 1
-            now = utc_now()
-            spec = DirectorSpec(
-                **draft.model_dump(), spec_id=spec_id, project_id=project_id,
-                creative_brief_version=snapshot.creative_brief.version,
-                version=next_version, created_at=now, source=source,
-                restored_from_version=restored_from_version,
+        else:
+            draft = project_provenance(draft)
+        if draft.schema_version == 2 and draft.execution_policy == "single_image":
+            draft = draft.model_copy(
+                update={
+                    "cinematography": require_execution_choices(draft.cinematography),
+                }
             )
-            revised = project.model_copy(update={
-                "director_id": spec_id, "director_version": next_version,
-                "current_version": current_version + 1, "updated_at": now,
-            })
-            connection.execute(
-                "UPDATE comic_projects SET director_id=?,director_version=?,"
-                "current_version=?,updated_at=? WHERE project_id=?",
-                (spec_id, next_version, revised.current_version, now.isoformat(), project_id),
-            )
-            self._insert_version(
-                connection, project_id=project_id, entity_type="director_spec",
-                entity_id=spec_id, version=next_version,
-                payload_json=spec.model_dump_json(), created_at=now,
-            )
-            self._insert_version(
-                connection, project_id=project_id, entity_type="project",
-                entity_id=project_id, version=revised.current_version,
-                payload_json=revised.model_dump_json(), created_at=now,
-            )
+        missing = [
+            item
+            for item in snapshot.creative_brief.hard_constraints
+            if item not in draft.constraints
+        ]
+        if missing:
+            raise ToolError("导演方案不得遗漏创作理解中的硬约束")
+        version_row = connection.execute(
+            "SELECT entity_id,version FROM comic_entity_versions "
+            "WHERE project_id=? AND entity_type='director_spec' "
+            "ORDER BY version DESC LIMIT 1",
+            (project_id,),
+        ).fetchone()
+        spec_id = str(version_row["entity_id"]) if version_row else f"comic-director-{uuid4().hex}"
+        next_version = int(version_row["version"]) + 1 if version_row else 1
+        now = utc_now()
+        spec = DirectorSpec(
+            **draft.model_dump(),
+            spec_id=spec_id,
+            project_id=project_id,
+            creative_brief_version=snapshot.creative_brief.version,
+            version=next_version,
+            created_at=now,
+            source=source,
+            restored_from_version=restored_from_version,
+        )
+        revised = project.model_copy(
+            update={
+                "director_id": spec_id,
+                "director_version": next_version,
+                "current_version": current_version + 1,
+                "updated_at": now,
+            }
+        )
+        connection.execute(
+            "UPDATE comic_projects SET director_id=?,director_version=?,"
+            "current_version=?,updated_at=? WHERE project_id=?",
+            (spec_id, next_version, revised.current_version, now.isoformat(), project_id),
+        )
+        self._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="director_spec",
+            entity_id=spec_id,
+            version=next_version,
+            payload_json=spec.model_dump_json(),
+            created_at=now,
+        )
+        self._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="project",
+            entity_id=project_id,
+            version=revised.current_version,
+            payload_json=revised.model_dump_json(),
+            created_at=now,
+        )
         return spec
 
     def restore_director(
@@ -867,6 +966,55 @@ class ComicContextBuilder:
     """只组合调用方确实选中的导演方案与资产；不读聊天全文。"""
 
     @staticmethod
+    def inheritance_fields(director: dict | None = None) -> set[str]:
+        """The same declared, available fields govern selection and consumption."""
+        allowed = set(INHERIT_KEYS)
+        for group, model in (("director_plan", DirectorPlan),
+                             ("cinematography", CinematographyPlan)):
+            available = model.model_fields if director is None else director.get(group) or {}
+            allowed.update(f"{group}.{name}" for name in model.model_fields if name in available)
+        return allowed
+
+    @staticmethod
+    def conversation_instructions() -> str:
+        """Inject domain semantics into the shared memory interpreter, not Core word lists."""
+        return (
+            "本入口是 Comic 独立方案创作。普通续写先根据语义定位人物和原任务，"
+            "保留未被本轮替换的人物身份、世界设定和艺术风格，分别在 sources.fields 标明"
+            "character_context、world_context、style_context。部分引用只列本轮真正要保留的字段，"
+            "不要把未选择的其他设定一起继承。姿态、表情、情绪和摄影通常属于本轮创作选择；"
+            "只有用户要求沿用时才引用对应 director_plan.* 或 cinematography.* 公开字段。"
+            "用户曾明确指定且仍有效的镜头或颜色约束应保留在当前任务的 active 用户事实中，"
+            "不能因为摄影可变就丢弃用户约束。否定、纠正或撤回旧要求时同步更新事实状态。"
+            "换题建立独立任务，不带入无关旧设定；多个来源可以分别贡献不同字段。"
+            "resource 候选是关联项目的真实资产版本，按目标、描述、类型和上下文判断相关性。"
+            "名称或别名命中不是选择规则，唯一风格资产也不自动沿用；只在用户要求或本轮"
+            "确实引用时选择。显式所选资产优先；资产同名且不能唯一定位时简短澄清。"
+            "sources.fields 必须逐字使用完整合法字段路径，不省略对象前缀，不自创别名。"
+            "每个继承目标只选择一个有依据的来源；不要重复列入同一设定的祖先和后继方案。"
+            "不同目标可以来自不同方案；无法根据本轮要求确定来源时才澄清。合法字段："
+            + json.dumps(sorted(ComicContextBuilder.inheritance_fields()), ensure_ascii=False)
+        )
+
+    @staticmethod
+    def inheritance_conflicts(sources: list[dict]) -> bool:
+        """Overlapping source selections need a user choice, not another creative guess."""
+        claimed = {}
+        for source in sources:
+            if source["kind"] != "run":
+                continue
+            for field in source["fields"]:
+                paths = {field}
+                paths.update(f"director_plan.{leaf}" for leaf in
+                             DIRECTOR_PLAN_LEAVES.get(field, ()))
+                paths.update(f"cinematography.{leaf}" for leaf in
+                             CINEMATOGRAPHY_LEAVES.get(field, ()))
+                if any(path in claimed and claimed[path] != source["id"] for path in paths):
+                    return True
+                claimed.update({path: source["id"] for path in paths})
+        return False
+
+    @staticmethod
     def explicit_context_changes(text: str) -> set[str]:
         """只认可明确换设定的命令，动作补充和否定命令不会释放锁。"""
         changes = set()
@@ -951,6 +1099,11 @@ class ComicContextBuilder:
                 "creative_freedom": brief.creative_freedom,
             },
         }
+        if brief.constraint_contract_version == 2:
+            stable_context["creative_brief"].update({"constraint_contract_version": 2,
+                "semantic_constraints": [item.model_dump(mode="json")
+                                         for item in brief.semantic_constraints
+                                         if item.status == "active"]})
         source_versions = {
             "project": project.current_version,
             "creative_brief": brief.version,

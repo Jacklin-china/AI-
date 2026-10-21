@@ -9,7 +9,9 @@ from __future__ import annotations
 import argparse
 import sys
 import threading
+from contextlib import ExitStack
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "tests"))
@@ -19,21 +21,26 @@ from test_home_quick_domain import production  # noqa: E402
 from test_web_studio import app as app_fixture  # noqa: E402
 
 from kantoku.config import ToolError, logging_setup  # noqa: E402
+from kantoku.config.runtime_paths import get_runtime_paths, isolated_runtime  # noqa: E402
 from kantoku.shells import web_studio  # noqa: E402
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--directory", type=Path, default=ROOT / "data/qa/quick-comic-ui")
+    parser.add_argument("--directory", type=Path, help="旧数据只保留，不再复用")
     args = parser.parse_args()
-    directory = args.directory.resolve()
-    if not directory.is_relative_to((ROOT / "data/qa").resolve()):
-        parser.error("QA data must stay inside data/qa; never use the production database")
-    directory.mkdir(parents=True, exist_ok=True)
-    logging_setup.LOG_DIR = directory / "logs"
+    if args.directory:
+        parser.error("本验收脚本只使用自动隔离目录；旧 QA 数据保留供人工审查")
+    with isolated_runtime(prefix="kantoku-home-"), ExitStack() as cleanup:
+        _run(get_runtime_paths().data, cleanup)
+
+
+def _run(directory: Path, cleanup: ExitStack) -> None:
+    print(f"QA temporary data: {directory}", flush=True)
+    logging_setup.LOG_DIR = get_runtime_paths().logs
     logging_setup.setup_logging("INFO")
     patch = pytest.MonkeyPatch()
-    app = app_fixture.__wrapped__(patch, directory)
+    app = app_fixture.__wrapped__(patch, directory, SimpleNamespace(addfinalizer=cleanup.callback))
     fixture = production.__wrapped__(app, patch)
     next(fixture)
     # Use an isolated build when supplied, otherwise the existing production build.
@@ -75,12 +82,13 @@ def main() -> None:
         pass
     finally:
         stopped.set()
-        server.shutdown()
         server.server_close()
         # Never let a test worker outlive its provider guards.
         app.runner.close()
         fixture.close()
         patch.undo()
+        logging_setup.logger.remove()
+        logging_setup.LOG_DIR = None
 
 
 if __name__ == "__main__":

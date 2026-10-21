@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -10,6 +10,7 @@ import pytest
 from pydantic import ValidationError
 
 from kantoku.config import ToolError
+from kantoku.core.database import database_manager
 from kantoku.memory import Persona
 from kantoku.schemas.qc import ReworkPlan
 from kantoku.schemas.storyboard import Shot
@@ -194,7 +195,7 @@ def test_save_load_is_idempotent_but_rejects_same_version_drift(
     assert (
         prompt_factory.load_recipe("雨夜便利店", 7, prompt_factory.PROMPT_VERSION) == recipe
     )
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM recipe").fetchone()[0] == 1
 
     changed = recipe.model_copy(update={"prompt": recipe.prompt + "\n擅自修改"})
@@ -234,7 +235,7 @@ def test_corrupt_prompt_fingerprint_is_rejected(isolated_database: Path) -> None
         size="1920x1080",
     )
     prompt_factory.save_recipe(recipe)
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute("UPDATE recipe SET prompt = ?", ("tampered",))
         connection.commit()
 
@@ -246,7 +247,7 @@ def test_existing_recipe_table_is_migrated_without_deleting_data(
     isolated_database: Path,
 ) -> None:
     isolated_database.parent.mkdir(parents=True)
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute(
             """
             CREATE TABLE recipe (
@@ -277,7 +278,7 @@ def test_existing_recipe_table_is_migrated_without_deleting_data(
     prompt_factory.save_recipe(recipe)
 
     assert prompt_factory.load_recipe("雨夜便利店", 7, "prompt-v1") == recipe
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(recipe)").fetchall()
         }

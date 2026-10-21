@@ -162,6 +162,9 @@ export interface CoreArtifact {
   metadata: Record<string, unknown>
   location: string | null
   version: number
+  lifecycle_state?: 'active' | 'trashed' | 'purging' | 'purged'
+  lifecycle_version?: number
+  lifecycle_updated_at?: string | null
 }
 
 export interface CoreSkill {

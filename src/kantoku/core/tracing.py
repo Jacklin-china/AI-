@@ -9,7 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from kantoku.config import TracingError, get_settings
-from kantoku.config.settings import ROOT
+from kantoku.config.runtime_paths import resolve_runtime_path
+from kantoku.core.database import database_manager
 
 _CREATE_TRACE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS trace (
@@ -100,9 +101,7 @@ class Trace:
 def _database_path() -> Path:
     """把配置中的相对路径稳定地解析到项目根目录。"""
     configured_path = get_settings().storage.sqlite_path
-    if configured_path.is_absolute():
-        return configured_path
-    return ROOT / configured_path
+    return resolve_runtime_path(configured_path)
 
 
 @contextmanager
@@ -110,8 +109,7 @@ def _connection() -> Iterator[sqlite3.Connection]:
     """提供自动提交、回滚和关闭的 SQLite 连接。"""
     path = _database_path()
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        connection = sqlite3.connect(path)
+        connection = database_manager.connect(path)
     except (OSError, sqlite3.Error) as error:
         raise TracingError(
             "无法打开 trace 数据库",

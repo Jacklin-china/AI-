@@ -83,6 +83,29 @@ def _director() -> DirectorSpecDraft:
     })
 
 
+def test_semantic_directory_uses_pinned_revision_and_exact_selection_keeps_get_compatible(tmp_path):
+    projects, assets, _runtime = _stores(tmp_path / "assets.db")
+    project = _project(projects)
+    character = assets.create(project, _character(), expected_project_version=1)
+    style = assets.create(project, _style(), expected_project_version=2)
+    edited = assets.change(project, character.asset_id, action="edit", draft=_character(
+        outfit="红色长袍"), expected_project_version=3, expected_asset_version=1)
+    assets.change(project, character.asset_id, action="lock", target_version=1,
+                  expected_project_version=4, expected_asset_version=edited.version)
+    catalog = assets.context_candidates(project, task="只用这个角色", project_version=5,
+                                       explicit_ids=[character.asset_id])
+    assert catalog[0]["id"] == f"asset:{project}:{character.asset_id}:1"
+    assert catalog[0]["version"] == 1
+    assert "蓝色长袍" in catalog[0]["description"]
+    assert "红色长袍" not in catalog[0]["description"]
+    assert assets.select_relevant(project, task="阿青", implicit=False) == []
+    selected = assets.select_relevant(project, refs=[ComicAssetRef(asset_id=character.asset_id)],
+                                     implicit=False)
+    assert [asset.asset_id for asset in selected] == [character.asset_id]
+    assert selected[0].version == 1
+    assert style.asset_id in {asset.asset_id for asset in assets.select_relevant(project)}
+
+
 def test_assets_versions_lock_and_context_select_only_relevant(tmp_path: Path) -> None:
     path = tmp_path / "comic.db"
     projects, assets, runtime = _stores(path)

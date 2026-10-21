@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Sequence
 from typing import Literal
@@ -51,39 +52,71 @@ class ComicAssetStore:
         )
 
     def create(
-        self, project_id: str, draft: ComicAssetDraft, *, expected_project_version: int,
+        self,
+        project_id: str,
+        draft: ComicAssetDraft,
+        *,
+        expected_project_version: int,
+        connection: sqlite3.Connection | None = None,
     ) -> ComicAsset:
+        if connection is None:
+            with self.projects._connect() as opened:
+                opened.execute("BEGIN IMMEDIATE")
+                return self.create(
+                    project_id,
+                    draft,
+                    expected_project_version=expected_project_version,
+                    connection=opened,
+                )
         self._validate_references(draft)
-        with self.projects._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            row = connection.execute(
-                "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,),
-            ).fetchone()
-            if row is None:
-                raise ToolError("找不到指定漫剧作品")
-            if int(row["current_version"]) != expected_project_version:
-                raise ToolError("作品已由其他操作更新，请刷新后重试")
-            project_version = self.projects._advance_project(
-                connection, project_id, expected_project_version,
-            )
-            now = utc_now()
-            asset = ComicAsset(
-                **draft.model_dump(), asset_id=f"comic-asset-{uuid4().hex}",
-                project_id=project_id, version=1, project_version=project_version,
-                created_at=now, source="created",
-            )
-            connection.execute(
-                "INSERT INTO comic_assets "
-                "(asset_id,project_id,kind,name,current_version,state,pinned_version,"
-                "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
-                (asset.asset_id, project_id, asset.details.kind, asset.name, 1,
-                 asset.state, None, now.isoformat(), now.isoformat()),
-            )
-            self.projects._insert_version(
-                connection, project_id=project_id, entity_type="comic_asset",
-                entity_id=asset.asset_id, version=1, payload_json=asset.model_dump_json(),
-                created_at=now,
-            )
+        row = connection.execute(
+            "SELECT current_version FROM comic_projects WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        if row is None:
+            raise ToolError("找不到指定漫剧作品")
+        if int(row["current_version"]) != expected_project_version:
+            raise ToolError("作品已由其他操作更新，请刷新后重试")
+        project_version = self.projects._advance_project(
+            connection,
+            project_id,
+            expected_project_version,
+        )
+        now = utc_now()
+        asset = ComicAsset(
+            **draft.model_dump(),
+            asset_id=f"comic-asset-{uuid4().hex}",
+            project_id=project_id,
+            version=1,
+            project_version=project_version,
+            created_at=now,
+            source="created",
+        )
+        connection.execute(
+            "INSERT INTO comic_assets "
+            "(asset_id,project_id,kind,name,current_version,state,pinned_version,"
+            "created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            (
+                asset.asset_id,
+                project_id,
+                asset.details.kind,
+                asset.name,
+                1,
+                asset.state,
+                None,
+                now.isoformat(),
+                now.isoformat(),
+            ),
+        )
+        self.projects._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="comic_asset",
+            entity_id=asset.asset_id,
+            version=1,
+            payload_json=asset.model_dump_json(),
+            created_at=now,
+        )
         return asset
 
     def get(
@@ -142,94 +175,151 @@ class ComicAssetStore:
         )
 
     def change(
-        self, project_id: str, asset_id: str, *, expected_project_version: int,
-        expected_asset_version: int, action: Literal["edit", "restore", "lock", "delete"],
-        draft: ComicAssetDraft | None = None, target_version: int | None = None,
+        self,
+        project_id: str,
+        asset_id: str,
+        *,
+        expected_project_version: int,
+        expected_asset_version: int,
+        action: Literal["edit", "restore", "lock", "delete"],
+        draft: ComicAssetDraft | None = None,
+        target_version: int | None = None,
+        connection: sqlite3.Connection | None = None,
     ) -> ComicAsset:
         """所有编辑、锁定、删除及恢复都追加资产与作品修订。"""
-        with self.projects._connect() as connection:
-            connection.execute("BEGIN IMMEDIATE")
-            current = self._current(connection, project_id, asset_id)
-            row = connection.execute(
-                "SELECT current_version FROM comic_projects WHERE project_id=?", (project_id,),
-            ).fetchone()
-            if (row is None or int(row["current_version"]) != expected_project_version
-                    or current.version != expected_asset_version):
-                raise ToolError("作品或资产已更新，请刷新后重试")
-            if action == "edit":
-                if draft is None or current.state != "active":
-                    raise ToolError("只有有效资产可以编辑")
-                if draft.details.kind != current.details.kind:
-                    raise ToolError("资产类型不可修改")
-                next_draft = draft
-                state = "active"
-                pin = current.pinned_version
-                restored_from = None
-                if next_draft == self._draft(current):
-                    return current
-            elif action == "restore":
-                if target_version is None:
-                    raise ToolError("需要指定恢复版本")
-                historical = ComicAsset.model_validate_json(self.projects._version_payload(
-                    connection, project_id, "comic_asset", asset_id, target_version,
-                ))
+        if connection is None:
+            with self.projects._connect() as opened:
+                opened.execute("BEGIN IMMEDIATE")
+                return self.change(
+                    project_id,
+                    asset_id,
+                    expected_project_version=expected_project_version,
+                    expected_asset_version=expected_asset_version,
+                    action=action,
+                    draft=draft,
+                    target_version=target_version,
+                    connection=opened,
+                )
+        current = self._current(connection, project_id, asset_id)
+        row = connection.execute(
+            "SELECT current_version FROM comic_projects WHERE project_id=?",
+            (project_id,),
+        ).fetchone()
+        if (
+            row is None
+            or int(row["current_version"]) != expected_project_version
+            or current.version != expected_asset_version
+        ):
+            raise ToolError("作品或资产已更新，请刷新后重试")
+        if action == "edit":
+            if draft is None or current.state != "active":
+                raise ToolError("只有有效资产可以编辑")
+            if draft.details.kind != current.details.kind:
+                raise ToolError("资产类型不可修改")
+            next_draft = draft
+            state = "active"
+            pin = current.pinned_version
+            restored_from = None
+            if next_draft == self._draft(current):
+                return current
+        elif action == "restore":
+            if target_version is None:
+                raise ToolError("需要指定恢复版本")
+            historical = ComicAsset.model_validate_json(
+                self.projects._version_payload(
+                    connection,
+                    project_id,
+                    "comic_asset",
+                    asset_id,
+                    target_version,
+                )
+            )
+            if historical.state != "active":
+                raise ToolError("不能恢复已删除的资产版本")
+            next_draft = self._draft(historical)
+            state, pin, restored_from = "active", None, target_version
+        elif action == "lock":
+            if current.state != "active":
+                raise ToolError("已删除资产不能锁定")
+            if target_version is not None:
+                historical = ComicAsset.model_validate_json(
+                    self.projects._version_payload(
+                        connection,
+                        project_id,
+                        "comic_asset",
+                        asset_id,
+                        target_version,
+                    )
+                )
                 if historical.state != "active":
-                    raise ToolError("不能恢复已删除的资产版本")
-                next_draft = self._draft(historical)
-                state, pin, restored_from = "active", None, target_version
-            elif action == "lock":
-                if current.state != "active":
-                    raise ToolError("已删除资产不能锁定")
-                if target_version is not None:
-                    historical = ComicAsset.model_validate_json(self.projects._version_payload(
-                        connection, project_id, "comic_asset", asset_id, target_version,
-                    ))
-                    if historical.state != "active":
-                        raise ToolError("只能锁定有效资产版本")
-                if current.pinned_version == target_version:
-                    return current
-                next_draft = self._draft(current)
-                state, pin, restored_from = "active", target_version, None
-            elif action == "delete":
-                if current.state == "deleted":
-                    return current
-                next_draft = self._draft(current)
-                state, pin, restored_from = "deleted", None, None
-            else:
-                raise ToolError("资产操作不受支持")
-            self._validate_references(next_draft)
-            project_version = self.projects._advance_project(
-                connection, project_id, expected_project_version,
-            )
-            now = utc_now()
-            source = {
-                "edit": "edited", "restore": "restored", "lock": "locked", "delete": "deleted",
-            }[action]
-            revised = ComicAsset(
-                **next_draft.model_dump(), asset_id=asset_id, project_id=project_id,
-                version=current.version + 1, project_version=project_version,
-                created_at=now, state=state, pinned_version=pin, source=source,
-                restored_from_version=restored_from,
-            )
-            result = connection.execute(
-                "UPDATE comic_assets SET name=?,current_version=?,state=?,pinned_version=?,"
-                "updated_at=? WHERE project_id=? AND asset_id=? AND current_version=?",
-                (revised.name, revised.version, state, pin, now.isoformat(), project_id,
-                 asset_id, current.version),
-            )
-            if result.rowcount != 1:
-                raise ToolError("资产已由其他操作更新，请刷新后重试")
-            self.projects._insert_version(
-                connection, project_id=project_id, entity_type="comic_asset",
-                entity_id=asset_id, version=revised.version,
-                payload_json=revised.model_dump_json(), created_at=now,
-            )
+                    raise ToolError("只能锁定有效资产版本")
+            if current.pinned_version == target_version:
+                return current
+            next_draft = self._draft(current)
+            state, pin, restored_from = "active", target_version, None
+        elif action == "delete":
+            if current.state == "deleted":
+                return current
+            next_draft = self._draft(current)
+            state, pin, restored_from = "deleted", None, None
+        else:
+            raise ToolError("资产操作不受支持")
+        self._validate_references(next_draft)
+        project_version = self.projects._advance_project(
+            connection,
+            project_id,
+            expected_project_version,
+        )
+        now = utc_now()
+        source = {
+            "edit": "edited",
+            "restore": "restored",
+            "lock": "locked",
+            "delete": "deleted",
+        }[action]
+        revised = ComicAsset(
+            **next_draft.model_dump(),
+            asset_id=asset_id,
+            project_id=project_id,
+            version=current.version + 1,
+            project_version=project_version,
+            created_at=now,
+            state=state,
+            pinned_version=pin,
+            source=source,
+            restored_from_version=restored_from,
+        )
+        result = connection.execute(
+            "UPDATE comic_assets SET name=?,current_version=?,state=?,pinned_version=?,"
+            "updated_at=? WHERE project_id=? AND asset_id=? AND current_version=?",
+            (
+                revised.name,
+                revised.version,
+                state,
+                pin,
+                now.isoformat(),
+                project_id,
+                asset_id,
+                current.version,
+            ),
+        )
+        if result.rowcount != 1:
+            raise ToolError("资产已由其他操作更新，请刷新后重试")
+        self.projects._insert_version(
+            connection,
+            project_id=project_id,
+            entity_type="comic_asset",
+            entity_id=asset_id,
+            version=revised.version,
+            payload_json=revised.model_dump_json(),
+            created_at=now,
+        )
         return revised
 
     def select_relevant(
         self, project_id: str, *, task: str | None = None,
         refs: Sequence[ComicAssetRef] = (), project_version: int | None = None,
-        limit: int = 8,
+        limit: int = 8, implicit: bool = True,
     ) -> list[ComicAsset]:
         """显式引用优先；其余仅按真实名称/别名召回，不伪称语义检索。"""
         if task is not None and len(task) > 1000:
@@ -260,7 +350,7 @@ class ComicAssetStore:
             if asset is None:
                 raise ToolError("引用的资产不属于当前作品或已删除", detail=ref.asset_id)
             add(asset, version=ref.version, reason="explicit_reference")
-        if task:
+        if implicit and task:
             lowered = task.casefold()
             for asset in available:
                 if len(selected) >= limit:
@@ -269,7 +359,7 @@ class ComicAssetStore:
                 if any(len(name) >= 2 and name.casefold() in lowered for name in names):
                     add(asset, reason="name_or_alias_match")
         styles = [asset for asset in available if asset.details.kind == "style"]
-        if len(styles) == 1 and len(selected) < limit:
+        if implicit and len(styles) == 1 and len(selected) < limit:
             add(styles[0], reason="single_project_style")
         logger.bind(component="comic.assets", project_id=project_id).info(
             "context assets selected project_version={} assets={}",
@@ -282,3 +372,39 @@ class ComicAssetStore:
             ],
         )
         return list(selected.values())
+
+    def context_candidates(self, project_id: str, *, task: str,
+                           project_version: int, explicit_ids: Sequence[str] = ()) -> list[dict]:
+        """A read-only, versioned directory for semantic selection; descriptions are not facts."""
+        snapshot = self.projects.get(project_id, version=project_version)
+        available = self.list(project_id, project_version=project_version)
+        brief = snapshot.creative_brief
+        if brief.parent_brief_version is not None:
+            branch = next(item for item in self.projects.brief_versions(project_id)
+                          if item.version == brief.parent_brief_version + 1)
+            available = [asset for asset in available if asset.asset_id in explicit_ids
+                         or self.get(project_id, asset.asset_id, version=1).created_at
+                         >= branch.created_at]
+        lowered = task.casefold()
+        available.sort(key=lambda asset: (
+            asset.asset_id not in explicit_ids,
+            not any(len(name) >= 2 and name.casefold() in lowered
+                    for name in [asset.name, *asset.aliases]), asset.asset_id))
+        candidates = []
+        for asset in available:
+            resolved = self.get(project_id, asset.asset_id,
+                                version=asset.pinned_version or asset.version)
+            if resolved.project_version > project_version or resolved.state != "active":
+                raise ToolError("资产候选版本不可用于当前作品")
+            description = json.dumps({
+                "aliases": resolved.aliases, "tags": resolved.tags,
+                "details": resolved.details.model_dump(exclude={"kind"}),
+            }, ensure_ascii=False)[:300]
+            candidates.append({
+                "id": f"asset:{project_id}:{resolved.asset_id}:{resolved.version}",
+                "kind": "resource", "version": resolved.version,
+                "type": resolved.details.kind, "label": resolved.name,
+                "description": ("本轮显式选择；" if asset.asset_id in explicit_ids else "")
+                               + description, "read_required": True,
+                "required": asset.asset_id in explicit_ids})
+        return candidates

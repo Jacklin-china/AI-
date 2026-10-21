@@ -16,6 +16,19 @@ export function selectDirectorExecution<T extends { run_id: string }>(
   if (submitting) return executions.find(item => !previousRunIds.includes(item.run_id))
   return executions.find(item => item.run_id === selectedRun) ?? executions[0]
 }
+export function conversationWorkspaceRun<T extends { id: string; workflow: string; state: Record<string, unknown> }>(
+  runs: T[], conversationId: string, preferredRun = '',
+): T | undefined {
+  const owned = runs.filter(run => run.state.conversation_id === conversationId && typeof run.state.project_id === 'string')
+  return owned.find(run => run.id === preferredRun && run.workflow.startsWith('comic.'))
+    ?? owned.find(run => run.workflow.startsWith('comic.director') || (run.workflow === 'comic.production.v1' && run.state.quick_creation))
+    ?? owned.find(run => run.workflow.startsWith('comic.image.') || run.workflow.startsWith('comic.story.'))
+}
+/**
+ * 阻断中的续接任务会读出已确认的历史方案，却携带本轮的审核结论。
+ * 直接展示会让用户看到“第一版方案 + 第二轮审核问题”，与实际状态不符。
+ * 这种情况应回到产出该方案的原始任务，由它展示自身的真实审核结果。
+ */
 export const directorFieldLabels: Record<string, string> = {
   intent_summary: '创作意图', narrative_context: '故事情境', emotional_target: '情绪目标',
   audience_experience: '观众感受', narrative_focus: '叙事重点', hard_constraints: '用户硬约束',
@@ -78,7 +91,9 @@ export function directorConversationSummary(spec: Record<string, unknown> | null
   // One concise entry into the workspace, not a second copy of the director report.
   const mood = typeof understanding.emotional_target === 'string' && understanding.emotional_target.trim()
     ? `\n\n氛围：${understanding.emotional_target}` : ''
-  const state = typeof spec.version === 'number' ? '导演方案草稿已保存，可以进入工作区查看和修改。' : '已整理导演草稿，尚未保存为正式版本。'
+  const state = spec.generation_incomplete === true
+    ? '系统内部检查与修正尚未完成，候选内容已保留。请重新执行内部检查，通过后再确认方案。'
+    : typeof spec.version === 'number' ? '导演方案草稿已保存，可以进入工作区查看和修改。' : '已整理导演草稿，尚未保存为正式版本。'
   return `**我理解你的创意**\n\n${understanding.intent_summary}${mood}\n\n${state}`
 }
 
@@ -130,8 +145,8 @@ export function quickDirectorMessage(content: string): string {
       (_match, space, title, body) => `${space}### ${title}\n\n${readableDirectorValue(body)}`)
   }
 }
+// 自动生成的原话标题已在对话中出现，不再把长需求复制到工具栏。
 export function workspaceProjectTitle(title: string | undefined, request: string | undefined): string {
-  // 自动生成的原话标题已在对话中出现，不再把长需求复制到工具栏。
   return !title || request?.startsWith(title) ? '漫剧作品' : title
 }
 export function canDispatchDirectorInput(state: { busy: boolean; running: boolean; loading: boolean; error: boolean; cancelling: boolean }): boolean {
@@ -151,6 +166,11 @@ export function directorIsStale(
   })
 }
 export function canConfirmDirector(status: string | undefined, spec: Record<string, unknown> | null, stale: boolean, dirty: boolean): boolean {
+  if (spec?.review_required === false) {
+    const validation = spec.validation as { can_confirm?: boolean } | undefined
+    return ['completed', 'waiting'].includes(status ?? '') && spec.schema_version === 2 && !stale && !dirty
+      && validation?.can_confirm === true
+  }
   const review = spec?.critic_result as { verdict?: string; reviewed_spec_hash?: string; findings?: { severity: string; code: string }[] } | undefined
   return ['completed', 'waiting'].includes(status ?? '') && spec?.schema_version === 2 && !stale && !dirty &&
     publicDirectorSections(spec).length === 3 && (spec.cinematography as { status?: string })?.status === 'complete' &&
@@ -170,6 +190,45 @@ export function chronologicalDirectorExecutions<T extends { run_id: string }>(
     records[a.run_id]!.started_at.localeCompare(records[b.run_id]!.started_at))
 }
 
+export function directorConversationExecutions<T extends { run_id: string }>(
+  executions: T[], records: Record<string, { workflow?: string; started_at: string; state: Record<string, unknown> }>,
+): T[] {
+  return chronologicalDirectorExecutions(executions, records).filter(item => {
+    const state = records[item.run_id]!.state
+    // Legacy reviews have no task. Review, retry and node operations belong to history.
+    return state.task_system !== true && !state.previous_run_id
+      && !!directorConversationTask(records[item.run_id]!)
+  })
+}
+export function directorConversationTask(run: { workflow?: string; state: Record<string, unknown> }): string {
+  const task = run.state.task ?? (run.workflow === 'comic.shot.continue'
+    ? (run.state.context_diff as { instruction?: string } | undefined)?.instruction : undefined)
+  return typeof task === 'string' ? task.trim() : ''
+}
+
+/** 归并后的对话气泡；`at` 为排序依据，缺省表示尚未落库的待提交消息。 */
+export interface MergedChatTurn {
+  id: string; role: 'user' | 'assistant'; content: string; artifactId?: string; runId?: string; at: string
+}
+// 持久化消息与 Run 派生消息曾按“先整组、再追加”拼接，导致后一轮显示在前。
+// 两个来源必须归入同一时间轴；派生轮以 run.started_at 参与排序，不再依赖插入位置。
+// 尚无时间戳的待提交消息按对话顺序排在最后，不能插到已有回答之前。
+export function mergeChatTurnsByTime(
+  persisted: MergedChatTurn[], derived: MergedChatTurn[],
+): MergedChatTurn[] {
+  const anchors = new Map([...persisted, ...derived].filter(item => item.role === 'user' && item.runId).map(item => [item.runId!, item.at]))
+  return [...persisted, ...derived].map(item => ({ ...item, at: item.runId ? anchors.get(item.runId) ?? item.at : item.at })).sort((a, b) => {
+    if (!a.at && !b.at) return a.id.localeCompare(b.id)
+    if (!a.at) return 1
+    if (!b.at) return -1
+    if (a.at !== b.at) return a.at.localeCompare(b.at)
+    // 同一 Run 派生出的用户输入与系统回答共享开始时间；
+    // 必须用户在前，否则“正在理解创意”会排到用户提问上方。
+    if (a.role !== b.role) return a.role === 'user' ? -1 : 1
+    return a.id.localeCompare(b.id)
+  })
+}
+
 // 编辑只投影公开决策叶子，绑定身份、用户硬约束和审核结论保持只读。
 export function directorDraftFields(spec: Record<string, unknown> | null): Record<string, string> {
   if (spec?.schema_version !== 2) return {}
@@ -183,6 +242,10 @@ export function directorDraftFields(spec: Record<string, unknown> | null): Recor
 export function discardDirectorNodeDraft(fields: Record<string, string>, stage: string): Record<string, string> {
   const prefix = `${directorStageSections[stage]}.`
   return Object.fromEntries(Object.entries(fields).filter(([key]) => !key.startsWith(prefix)))
+}
+export function directorFeedbackTarget(spec: Record<string, unknown> | null, path: string): string | undefined {
+  if (!(path in directorDraftFields(spec))) return undefined
+  return Object.keys(directorStageSections).find(stage => path.startsWith(`${directorStageSections[stage]}.`))
 }
 export function editableDirectorDraft(spec: Record<string, unknown>, fields: Record<string, string> = {}): Record<string, unknown> {
   const keys = ['schema_version', 'visual_direction', 'storytelling_goal', 'camera_language', 'composition',

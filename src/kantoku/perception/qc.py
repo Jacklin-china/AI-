@@ -12,6 +12,9 @@ from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageParam
 from pydantic import ValidationError
 
 from kantoku.config import SchemaError, ToolError, get_settings
+from kantoku.config.runtime_paths import (
+    atomic_write_text,
+)
 from kantoku.core.llm import vision_chat
 from kantoku.schemas.qc import (
     CreativeDeliverable,
@@ -330,13 +333,9 @@ def save_qc_label(path: Path, label: HumanQcLabel) -> bool:
         payload["image_path"] = stored_path.as_posix()
         serialized.append(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
 
-    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text("\n".join(serialized) + "\n", encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        atomic_write_text(path, "\n".join(serialized) + "\n")
     except (OSError, UnicodeError) as error:
-        temporary.unlink(missing_ok=True)
         raise ToolError("无法保存质检标注集", detail=type(error).__name__) from error
     return True
 

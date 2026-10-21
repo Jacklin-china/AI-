@@ -1,4 +1,4 @@
-export type FastDomain = 'comic' | 'commerce' | 'studio'
+export type FastDomain = 'comic'
 
 /** A persisted domain belongs to the composer only until its first task is sent. */
 export function visibleFastDomain(
@@ -7,5 +7,5 @@ export function visibleFastDomain(
   consumed: boolean,
 ): FastDomain | null {
   if (taskId || consumed) return null
-  return domain === 'comic' || domain === 'commerce' || domain === 'studio' ? domain : null
+  return domain === 'comic' ? domain : null
 }

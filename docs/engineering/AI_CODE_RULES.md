@@ -162,3 +162,5 @@ Fake/Mock 结果必须保留来源标记，不能被升级为真实 IMAGE / VIDE
 现有 `scripts/check_structure.py` 继续作为唯一结构检查入口。治理 Module 0 仅接入 AGENTS/工程手册的必读链接和例外清单，不新增第二套 linter，不修改 guard 或 CI。
 
 已接入修改前阅读入口。待确认的治理任务：将规则接入提交检查；增强既有检查的相对导入解析、跨 Domain 引用、具体 Provider 调用及例外清单；给规则补充正反例；接入实际使用的提交/CI 流程。文档规则、机器检查及人工审阅必须分别说明覆盖程度，不能以 `Structure guard: PASS` 声称架构全部合规。
+
+运行文件改动同时遵守[Runtime Storage 规范](runtime-policy.md)，禁止绕过 RuntimeManager 或 DatabaseManager。

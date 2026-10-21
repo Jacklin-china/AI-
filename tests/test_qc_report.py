@@ -3,11 +3,11 @@
 from __future__ import annotations
 
 import json
-import sqlite3
 from pathlib import Path
 
 import pytest
 
+from kantoku.core.database import database_manager
 from kantoku.perception import report
 
 
@@ -17,7 +17,7 @@ def test_report_uses_first_attempt_final_review_and_actual_cost(
 ) -> None:
     database = tmp_path / "report.sqlite3"
     monkeypatch.setattr(report, "_database_path", lambda: database)
-    connection = sqlite3.connect(database)
+    connection = database_manager.connect(database)
     connection.executescript(report.SCHEMA_PATH.read_text(encoding="utf-8"))
     rows = [
         ("shot1-v1", 1, "settled", 30, 0, "job-1"),
@@ -80,7 +80,7 @@ def test_report_keeps_unbilled_cost_visible(
 ) -> None:
     database = tmp_path / "report.sqlite3"
     monkeypatch.setattr(report, "_database_path", lambda: database)
-    connection = sqlite3.connect(database)
+    connection = database_manager.connect(database)
     connection.executescript(report.SCHEMA_PATH.read_text(encoding="utf-8"))
     connection.execute(
         """

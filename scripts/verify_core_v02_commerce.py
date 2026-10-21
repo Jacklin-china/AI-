@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import tempfile
 from collections.abc import Callable
 from decimal import Decimal
 from pathlib import Path
@@ -23,6 +22,7 @@ from kantoku.capabilities.video import (
     VideoService,
 )
 from kantoku.config import BudgetError
+from kantoku.config.runtime_paths import atomic_write_text, get_runtime_paths, isolated_runtime
 from kantoku.config.settings import ROOT, VideoSettings
 from kantoku.core import budget
 from kantoku.core.approval import ApprovalService
@@ -497,8 +497,8 @@ class Verifier:
 
 def run(output: Path | None = None) -> dict[str, Any]:
     verifier = Verifier()
-    with tempfile.TemporaryDirectory(prefix="kantoku-acceptance-") as raw_directory:
-        directory = Path(raw_directory)
+    with isolated_runtime(prefix="kantoku-acceptance-"):
+        directory = get_runtime_paths().data
         report = {
             "suite": "Core v0.2 + Commerce Workspace v0.1",
             "mode": "real runtime with explicit mock external adapters",
@@ -510,11 +510,8 @@ def run(output: Path | None = None) -> dict[str, Any]:
             "passed": len(verifier.checks),
         }
     if output is not None:
-        output.parent.mkdir(parents=True, exist_ok=True)
-        output.write_text(
-            json.dumps(report, ensure_ascii=False, indent=2, default=str) + "\n",
-            encoding="utf-8",
-        )
+        atomic_write_text(output, json.dumps(report, ensure_ascii=False,
+                                            indent=2, default=str) + "\n")
     return report
 
 

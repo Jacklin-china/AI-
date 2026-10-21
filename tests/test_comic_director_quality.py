@@ -45,6 +45,9 @@ def _responses():
         "subject_environment_relation": "少女与连绵群山形成尺度对比",
         "composition_strategy": "人物位于左三分线，右侧保留山谷空间",
         "color_strategy": DECISIONS["color_relationship"],
+        "style_boundary": "电影级东方幻想写实质感，岩石与布料材质清晰",
+        "character_presence": "东方修仙少女，黑色长发，白色古风长裙，玉簪",
+        "character_pose": "站立远望，身体朝向山谷，双手自然下垂",
         "creative_choices": ["山谷负空间使站立动作成为视觉焦点"],
     })
     parts[SKILLS[2]]["cinematography"].update({
@@ -59,12 +62,17 @@ def _responses():
 
 def _generate(
     app, monkeypatch, *, ambiguity=None, resolve=True, critic_fail=False, interaction="guided",
+    director_fields=None, critic_findings=None, brief_text=REQUEST,
 ):
     project_id = app.comic_projects.create(ComicProjectInput.model_validate({
-        "title": "导演质量契约", "brief": {"original_request": REQUEST},
+        "title": "导演质量契约", "brief": {"original_request": brief_text},
     })).project.project_id
     conversation = app.create_conversation({"interaction_mode": interaction, "domain": "comic"})
     parts = _responses()
+    if brief_text != REQUEST:
+        parts[SKILLS[0]]["creative_decision"].update(
+            intent_summary=brief_text, narrative_context=brief_text)
+    parts[SKILLS[1]]["director_plan"].update(director_fields or {})
     calls = []
     camera_calls = 0
 
@@ -85,10 +93,11 @@ def _generate(
             return json.dumps({"public_summary": "缺少 confidence", "findings": [],
                                "suggested_patches": []}, ensure_ascii=False)
         return json.dumps({"public_summary": "符合当前输入", "confidence": 0.9,
-                           "findings": [], "suggested_patches": []}, ensure_ascii=False)
+                           "findings": critic_findings or [], "suggested_patches": []},
+                          ensure_ascii=False)
 
     monkeypatch.setattr(app, "_comic_director_model", model)
-    result = _execute(app, project_id, "professional", task=REQUEST,
+    result = _execute(app, project_id, "professional", task=brief_text,
                       conversation_id=conversation["id"])
     return project_id, result, calls
 
@@ -164,20 +173,111 @@ def test_multiple_candidates_receive_only_one_decision_refinement(app, monkeypat
         assert result["director_spec"]["cinematography"][field] == DECISIONS[field]
 
 
-def test_still_ambiguous_is_saved_unresolved_without_picking_a_default(app, monkeypatch):
+@pytest.mark.parametrize("missing", ["light_direction", "camera_distance", "material_language"])
+def test_missing_camera_parameters_are_completed_by_director_before_review(
+    app, monkeypatch, missing,
+):
+    _project_id, result, calls = _generate(app, monkeypatch, ambiguity={missing: None})
+    camera_calls = [messages for messages in calls
+                    if '"title": "CinematographyPlan"' in messages[0]["content"]]
+    assert result["status"] == "completed" and len(camera_calls) == 2
+    assert missing in camera_calls[1][-1]["content"]
+    assert result["director_spec"]["cinematography"][missing]
+    assert result["director_spec"]["field_provenance"][f"cinematography.{missing}"][
+        "source_type"] == "model_choice"
+
+
+def test_generated_quality_issue_returns_to_director_and_is_reviewed_again(app, monkeypatch):
+    parts = _responses()
+    calls = []
+    reviews = 0
+
+    def model(messages):
+        nonlocal reviews
+        payload = json.loads(messages[1]["content"])
+        for skill, title in zip(SKILLS[:3], ("CreativeDecision", "DirectorPlan",
+                                            "CinematographyPlan"), strict=True):
+            if f'"title": "{title}"' in messages[0]["content"]:
+                calls.append(skill)
+                data = copy.deepcopy(next(iter(parts[skill].values())))
+                if payload["context"].get("generation_feedback") and skill == SKILLS[1]:
+                    assert payload["context"]["generation_feedback"][0]["level"] == "blocking"
+                    assert "Director Skill Context" in messages[0]["content"]
+                    data["composition_strategy"] = "人物位于右三分线，左侧山谷形成清楚空间关系"
+                return json.dumps(data, ensure_ascii=False)
+        calls.append(SKILLS[3])
+        reviews += 1
+        findings = [] if reviews > 1 else [{
+            "code": "VISUAL_CAUSALITY_MISMATCH", "severity": "error",
+            "field_path": "director_plan.composition_strategy",
+            "evidence": payload["director_spec"]["director_plan"]["composition_strategy"],
+            "expected": "明确人物位置与山谷空间关系", "suggested_action": "补齐构图中的人物位置",
+        }]
+        return json.dumps({"public_summary": "真实质量检查", "confidence": 0.9,
+                           "findings": findings, "suggested_patches": []}, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", model)
+    project = app.comic_projects.create(ComicProjectInput(
+        title="质量修正", brief={"original_request": REQUEST}))
+    cid = app.create_conversation({"domain": "comic", "interaction_mode": "guided"})["id"]
+    result = _execute(app, project.project.project_id, "professional", task=REQUEST,
+                      conversation_id=cid)
+    assert result["status"] == "completed" and reviews == 2
+    assert calls == [*SKILLS[:4], SKILLS[1], SKILLS[2], SKILLS[3]]
+    assert "右三分线" in result["director_spec"]["director_plan"]["composition_strategy"]
+    assert result["director_execution_summary"]["critic_feedback"] == []
+    run = app.runtime_store.get_run(result["run_id"])
+    assert run.state["generation_repair_count"] == 1 and run.state["revision_count"] == 0
+
+
+def test_user_world_conflict_is_explained_without_auto_rewriting_user_edit(app, monkeypatch):
+    project_id, first, calls = _generate(app, monkeypatch)
+    draft = _draft(first["director_spec"])
+    conflict = "改成现代城市街道，但是保持仙侠山巅为同一地点"
+    draft["director_plan"]["subject_environment_relation"] = conflict
+    edited = app.create_comic_director(project_id, {
+        "expected_project_version": 2, "expected_director_version": 1, "draft": draft})
+
+    def critic(messages):
+        assert '"title": "SemanticReview"' in messages[0]["content"]
+        return json.dumps({"public_summary": "地点设定存在冲突", "confidence": 0.9,
+                           "findings": [{"code": "WORLD_CONFLICT", "severity": "error",
+                                         "field_path": "director_plan.subject_environment_relation",
+                                         "evidence": conflict,
+                                         "expected": "同一镜头不能同时把城市街道和山巅作为同一地点",
+                                         "suggested_action": (
+                                             "保留仙侠山巅或选择城市街道并调整世界设定") }],
+                           "suggested_patches": []}, ensure_ascii=False)
+
+    monkeypatch.setattr(app, "_comic_director_model", critic)
+    result = _execute(app, project_id, "professional", review_current=True,
+                      expected_director_version=edited["version"])
+    assert result["status"] == "waiting"
+    feedback = result["director_spec"]["critic_feedback"][0]
+    assert feedback["level"] == "blocking"
+    assert "同一地点" in feedback["reason"] and "相互矛盾" in feedback["impact"]
+    assert "仙侠山巅" in feedback["suggestion"] and "WORLD_CONFLICT" not in json.dumps(feedback)
+    assert result["director_spec"]["director_plan"]["subject_environment_relation"] == conflict
+    assert not app.runtime_store.get_run(result["run_id"]).state.get("generation_repair_count")
+
+
+def test_still_ambiguous_is_retained_as_unconfirmable_draft(
+    app, monkeypatch,
+):
     project_id, result, calls = _generate(
         app, monkeypatch, ambiguity={"camera_angle": "低角度或者平视"}, resolve=False,
     )
-    spec = app.comic_projects.get_director(project_id)
-    assert spec.cinematography.camera_angle == "低角度或者平视"
-    assert spec.cinematography.status == "needs_revision"
-    assert spec.field_provenance["cinematography.camera_angle"].trust_status == "unresolved"
-    assert result["status"] == "waiting" and len(calls) == 4  # 三阶段+一次收敛，无语义审核。
-    assert app.runtime_store.get_run(result["run_id"]).status is ExecutionStatus.WAITING
-    with pytest.raises(ToolError, match="待修订"):
-        app.confirm_comic_director(project_id, {
-            "version": spec.version, "expected_project_version": 2,
-        })
+    run = app.runtime_store.get_run(result["run_id"])
+    assert run.state["director_candidate"]["cinematography"]["camera_angle"] == "低角度或者平视"
+    assert run.state["field_provenance"]["cinematography.camera_angle"][
+        "trust_status"] == "unresolved"
+    assert result["status"] == "waiting" and len(calls) == 6
+    assert run.status is ExecutionStatus.WAITING and run.state["generation_repair_count"] == 1
+    assert result["director_spec"]["draft"]
+    assert not result["director_spec"]["validation"]["can_confirm"]
+    assert result["director_execution_summary"]["critic_feedback"] == []
+    assert result["director_execution_summary"]["stages"][0]["output"]
+    assert app.comic_projects.get(project_id).project.director_id
 
 
 def test_manual_edit_ignores_forged_sources_and_survives_review_and_restore(app, monkeypatch):
@@ -251,16 +351,20 @@ def test_critic_context_has_one_copy_of_decisions_and_deduplicated_sources(app, 
     assert "creative_brief" in critic_payload and "relevant_assets" in critic_payload
 
 
-def test_missing_critic_structure_still_preserves_the_executable_plan(app, monkeypatch):
+def test_missing_critic_structure_preserves_candidate_but_blocks_confirmation(app, monkeypatch):
     project_id, result, calls = _generate(app, monkeypatch, critic_fail=True)
     spec = app.comic_projects.get_director(project_id)
     assert len(calls) == 5 and result["status"] == "waiting"
     assert spec.critic_status == "unavailable" and spec.critic_result is None
     assert spec.cinematography.status == "complete" and spec.field_provenance
     assert app.runtime_store.get_run(result["run_id"]).status is ExecutionStatus.WAITING
-    assert app.confirm_comic_director(project_id, {
-        "version": spec.version, "expected_project_version": 2,
-    })["user_confirmed"]
+    assert app.runtime_store.get_run(result["run_id"]).state["generation_incomplete"] is True
+    with pytest.raises(ToolError, match="内部验证"):
+        app.confirm_comic_director(project_id, {
+            "version": spec.version, "expected_project_version": 2,
+        })
+    assert not app.comic_projects.human_director_confirmed(
+        app.comic_projects.get_director(project_id))
 
 
 def test_assets_are_facts_only_for_exact_corresponding_fields(app):
@@ -358,8 +462,51 @@ def test_negative_exclusions_are_not_unresolved_choices():
     plan = _responses()[SKILLS[1]]["director_plan"]
     plan["style_boundary"] = "写实东方插画，不采用夸张喜剧或赛博霓虹"
     plan["character_pose"] = "双手垂于身侧，不奔跑或跳跃"
+    plan["subject_environment_relation"] = "少女站在夜晚山巅，画面中无其他人物或载具"
+    plan["style_boundary"] += "，不指向任何特定官方设定图或既有版权画面"
     assert unresolved_execution(DirectorPlan.model_validate(plan).model_dump(),
                                 PLAN_EXECUTION_FIELDS) == []
+
+
+def test_real_failure_exclusions_do_not_block_director_confirmation(app, monkeypatch):
+    # 真实失败 run 的公开原文：此前被本地审核误判，尚未进入语义审核。
+    fields = {
+        "subject_environment_relation": (
+            "火麟飞独自站在超兽武装世界荒野断崖制高点的岩台上，时间为黄昏低光时刻，"
+            "身体处于画面中左位置，面向画面右侧急剧跌落的深谷与层层堆叠的风暴云远空，"
+            "脚下只有粗粝裸岩与稀疏枯草，崖缘之外是云海与天光，画面中无其他人或载具。"),
+        "style_boundary": (
+            "写实电影级动画质感，2.5D渲染与厚涂材质结合，岩石保留硬边与颗粒，"
+            "云海使用柔和体积分层，人物造型遵循超兽武装式锐利机械装甲与流畅服装剪裁，"
+            "不指向任何特定官方设定图或既有版权画面。"),
+    }
+    fields.update({
+        "composition_strategy": (
+            "中景，人物位于画面中央略偏左，确保手部印诀不被任何线条或树叶切过。"),
+        "character_expression": "眉目收束，眼神专注沉静，不显露夸张愤怒或痛苦。",
+    })
+    project_id, result, calls = _generate(app, monkeypatch, director_fields=fields)
+    assert result["status"] == "completed" and len(calls) == 4
+    run = app.runtime_store.get_run(result["run_id"])
+    assert not run.state.get("generation_incomplete")
+    assert not run.state.get("generation_repair_count")
+    spec = app.comic_projects.get_director(project_id)
+    for field, value in fields.items():
+        assert getattr(spec.director_plan, field) == value
+    assert app.confirm_comic_director(project_id, {
+        "version": spec.version, "expected_project_version": 2,
+    })["user_confirmed"]
+
+
+@pytest.mark.parametrize("field,value", [
+    ("style_boundary", "无论古风或赛博风均可"),
+    ("subject_environment_relation", "人物站在山巅或城市街道，画面中无其他人物或载具"),
+    ("camera_angle", "不采用仰拍或俯拍"),
+])
+def test_exclusions_never_supply_missing_choices_or_hide_positive_alternatives(field, value):
+    from kantoku.domains.comic.cinematography import unresolved_execution
+
+    assert unresolved_execution({field: value}, (field,)) == [field]
 
 
 def test_critic_patch_replaces_source_and_retains_untouched_facts(app, monkeypatch):

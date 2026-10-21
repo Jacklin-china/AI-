@@ -135,6 +135,7 @@ onBeforeUnmount(() => observer?.disconnect())
   mask-image:linear-gradient(to bottom, black calc(100% - var(--ws-composer-space)), transparent calc(100% - var(--ws-composer-space) + 16px));
 }
 .ws-shell-content :deep(.home-message-scroller) { padding-bottom:var(--ws-composer-space); scroll-padding-bottom:var(--ws-composer-space); }
+.ws-shell-content :deep(.stage-scroll.image-workbench-stage) { padding-bottom:var(--space-4); scroll-padding-bottom:0; mask-image:none; }
 :deep(.message-composer) { border-radius:var(--radius-panel); box-shadow:var(--shadow-card); }
 :deep(.message-composer footer > span) { min-width:0; overflow-wrap:anywhere; }
 :deep(.message-composer button), :deep(select) { border-radius:var(--radius-dialog); }

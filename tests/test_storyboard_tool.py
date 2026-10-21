@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import sqlite3
+from contextlib import closing
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -10,6 +10,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from kantoku.config import SchemaError, ToolError
+from kantoku.core.database import database_manager
 from kantoku.schemas.storyboard import Shot, Storyboard
 from kantoku.tools import storyboard as storyboard_tool
 
@@ -72,7 +73,7 @@ def test_save_storyboard_replaces_episode_as_one_version(isolated_database: Path
     assert loaded is not None
     assert len(loaded.shots) == 20
     assert loaded.shots[0].desc == "新1"
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         assert connection.execute("SELECT COUNT(*) FROM shot").fetchone()[0] == 20
 
 
@@ -108,7 +109,7 @@ def test_generate_storyboard_rejects_empty_or_wrong_count(
 
 def test_load_storyboard_wraps_corrupt_character_json(isolated_database: Path) -> None:
     storyboard_tool.save_storyboard(_board())
-    with sqlite3.connect(isolated_database) as connection:
+    with closing(database_manager.connect(isolated_database)) as connection, connection:
         connection.execute("UPDATE shot SET characters_json = ? WHERE shot_no = 1", ("not-json",))
         connection.commit()
 

@@ -10,6 +10,9 @@ from typing import Self
 from pydantic import BaseModel, ConfigDict, Field, ValidationError, model_validator
 
 from kantoku.config import KantokuError, ToolError
+from kantoku.config.runtime_paths import (
+    atomic_write_text,
+)
 from kantoku.memory import Persona
 from kantoku.schemas.storyboard import Shot, Storyboard
 from kantoku.tools.prompt_factory import PROMPT_VERSION, build_prompt
@@ -200,11 +203,8 @@ def render_report(
 
 def write_report(path: Path, report: str) -> None:
     """原子保存报告，避免中断时留下半份验收记录。"""
-    temporary = path.with_suffix(path.suffix + ".tmp")
     try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary.write_text(report, encoding="utf-8", newline="\n")
-        temporary.replace(path)
+        atomic_write_text(path, report)
     except (OSError, UnicodeError) as error:
         raise ToolError(
             "无法保存评测报告", detail=f"path={path}；error={type(error).__name__}"

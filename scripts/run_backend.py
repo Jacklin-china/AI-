@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
-from kantoku.config.logging_setup import setup_logging
-from kantoku.shells.web_studio import serve
+import sys
+
+from kantoku.__main__ import main
 
 if __name__ == "__main__":
-    setup_logging()
-    raise SystemExit(serve(port=8000, open_browser=False))
+    sys.argv[1:] = ["serve", "--no-browser", *sys.argv[1:]]
+    raise SystemExit(main())
